@@ -1184,5 +1184,83 @@ C4 的 `--section-dispatch' 曾把这种情况归为 error「命令派发失败�
           (should (ebasecamp-ui-test--contains-p
                    (plist-get notice :message) "shared 组不提供 down")))))))
 
+;;; 14. 刷新容错、展开保持与重开重建（C7 覆盖补齐）
+
+(ert-deftest ebasecamp-ui-test-refresh-survives-snapshot-failure ()
+  "snapshot 失败（docker 权限错误）时 refresh 不 signal，state 保持上次计数。
+`ebasecamp-ui-refresh' 未收到记录时先跑 `ebasecamp-status-snapshot'；后者已把
+错误消化进 `ebasecamp-status-last-error' 并保留 `last-records'，因此统计不清零、
+也不把异常抛给轮询回调。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (ebasecamp-ui-open)
+      (let ((before (ebasecamp-ui-refresh)))
+        (should (equal 3 (plist-get (car (plist-get before :groups)) :running))))
+      (cl-letf (((symbol-function 'ebasecamp-docker-ps)
+                 (lambda () (error "permission denied"))))
+        (should (ebasecamp-ui-refresh)))
+      (should (ebasecamp-status-last-error))
+      (let* ((state (etaf-value (ebasecamp-ui-session-state (ebasecamp-ui-session))))
+             (group (car (plist-get state :groups))))
+        (should (equal 3 (plist-get group :running)))
+        (should (equal 4 (plist-get group :total)))))))
+
+(ert-deftest ebasecamp-ui-test-expanded-persists-across-rerender ()
+  "`on-toggle' 写入的 expanded 值在 state 重建后的再次渲染中保持（折叠生效）。
+树的展开状态由会话的 expanded ref 持有：树回调只写该 ref，不参与 items 裁剪，
+所以折叠后子节点不渲染、但 state 里的配置项仍然完整。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (ebasecamp-ui-open)
+      (let* ((session (ebasecamp-ui-session))
+             (expanded (lambda ()
+                         (etaf-value (ebasecamp-ui-session-expanded session)))))
+        (should (equal '("group/mysql") (funcall expanded)))
+        (should (ebasecamp-ui-test--contains-p
+                 (ebasecamp-ui-test--buffer-text) "dev →"))
+        (etaf-set-value (ebasecamp-ui-session-expanded session) nil)
+        (ebasecamp-ui-refresh (ebasecamp-status-last-records) t)
+        (should-not (funcall expanded))
+        (let ((text (ebasecamp-ui-test--buffer-text)))
+          (should (ebasecamp-ui-test--contains-p text "mysql"))
+          (should-not (ebasecamp-ui-test--contains-p text "dev →")))
+        (should (equal '("dev" "prod")
+                       (mapcar (lambda (config) (plist-get config :name))
+                               (plist-get
+                                (car (plist-get
+                                      (etaf-value
+                                       (ebasecamp-ui-session-state session))
+                                      :groups))
+                                :configs))))))))
+
+(ert-deftest ebasecamp-ui-test-reopen-rebuilds-session ()
+  "close 后再次 open 重建会话：新会话对象、选择/提示/确认归零、buffer 重挂载。
+`ebasecamp-ui-close' 把 `ebasecamp-ui--session' 置 nil 并 kill buffer，因此再次
+open 走全新会话（不残留上一次的选中集合、提示与确认状态）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (ebasecamp-ui-open)
+      (let ((first (ebasecamp-ui-session)))
+        (ebasecamp-ui--select-key first "group/mysql")
+        (ebasecamp-ui--toggle-selected first "mysql/mysql" t)
+        (ebasecamp-ui--set-notice first 'info "提示" "内容")
+        (ebasecamp-ui-close)
+        (should-not ebasecamp-ui--session)
+        (ebasecamp-ui-open)
+        (let ((second (ebasecamp-ui-session)))
+          (should-not (eq first second))
+          (should (get-buffer ebasecamp-ui-buffer-name))
+          (should (ebasecamp-status-running-p))
+          (should-not (etaf-value (ebasecamp-ui-session-selected-group second)))
+          (should-not (ebasecamp-ui-selected-keys))
+          (should-not (etaf-value (ebasecamp-ui-session-notice second)))
+          (should-not (etaf-value (ebasecamp-ui-session-confirm second)))
+          (should (equal '("group/mysql")
+                         (etaf-value
+                          (ebasecamp-ui-session-expanded second)))))))))
+
 (provide 'ebasecamp-ui-tests)
 ;;; ebasecamp-ui-tests.el ends here
