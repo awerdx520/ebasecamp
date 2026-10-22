@@ -174,6 +174,7 @@
 - [ ] E1 承接原计划 T5.2：写 `docs/architecture.org`、`docs/user-guide.org`、`docs/compose-generation.org`、`docs/troubleshooting.org`，全部按 v0.2 新模型描述
       （依赖：C7）验收：四份文档存在；compose-generation 的映射表与实现一致；troubleshooting 覆盖权限/端口冲突/config -q 失败/版本不符/「命令不存在」排查
       注意：`docs/architecture.org:147,149,185` 与 `Readme.org:180` 仍引用已删除的 `ebasecamp-ui-run-action` / `ebasecamp-ui-current-project`，E1/E2 必须同步修正
+      （进度 2026-10-23）`docs/architecture.org` 与 `docs/user-guide.org` 完成：两份均按 v0.2 组为中心模型全面重写/新建，已删除符号的引用同步清除；user-guide 的清单示例（groups.el + projects/myapp.el + projects/other.el）经 `ebasecamp-config-load` 实测 `:errors` 为 nil、组与配置可读、物化产物带 `:service-overrides`。`docs/compose-generation.org` 与 `docs/troubleshooting.org` 待写 → E1 **暂不勾选**
 - [ ] E2 `Readme.org`：清单示例换成组内 configs 写法，命令表补「加载不到包」排查；示例用具体命令实测：`emacs -Q --batch -L . -L lisp -L $(HOME)/thomas-emacs/.local/straight/build-31.1/etaf -L $(HOME)/thomas-emacs/.local/straight/build-31.1/etaf-ui -L $(HOME)/thomas-emacs/.local/straight/build-31.1/ebox -L $(HOME)/thomas-emacs/.local/straight/build-31.1/ecss -l /tmp/readme-manifest.el --eval '(progn (prin1 (length (ebasecamp-model-groups))) (terpri))'`
       （依赖：E1）验收：命令退出码 0 且输出的组数符合示例
 - [ ] E3 `CHANGELOG.md` 追加 0.2.0：模型新增 `:configs`、界面改为组为中心、旧写法兼容、加载修复说明
