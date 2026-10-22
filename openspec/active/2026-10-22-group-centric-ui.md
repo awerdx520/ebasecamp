@@ -2,11 +2,11 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 批次 C 进行中（C0–C6 完成）
+- 阶段：Phase 3（Implement）· 批次 C 进行中（C0–C6 完成）· 批次 E 进行中（E1 完成，E2 待做）
 - 已确认：方案 V3 ✅（用户 2026-10-22）、计划 ✅（用户 2026-10-22 确认；plan-reviewer 三轮审查通过）
-- 已完成：批次 A（加载修复）、批次 B（模型 + 物化 + 加载集成）、批次 D（导入/导出往返，含 D4 env_file 与 D5 渲染判据两个阻断缺陷修复）、C0（组为中心的会话与视图骨架）、C1/C2（`ebasecamp-data-group-instances` 组配置实例装配）、C3（段渲染：每份配置一个 `etaf-panel` + 服务表）、C4（段内派发：段内按钮按该段自己的 project 派发到 `ebasecamp-command-run`）、C5（底栏导入/导出/销毁 + 派发路径统一 + 旧项目视图接口迁移）、C6（删除 ETAF Data 适配层，`ebasecamp-data` 收敛为纯装配层）
+- 已完成：批次 A（加载修复）、批次 B（模型 + 物化 + 加载集成）、批次 D（导入/导出往返，含 D4 env_file 与 D5 渲染判据两个阻断缺陷修复）、C0（组为中心的会话与视图骨架）、C1/C2（`ebasecamp-data-group-instances` 组配置实例装配）、C3（段渲染：每份配置一个 `etaf-panel` + 服务表）、C4（段内派发：段内按钮按该段自己的 project 派发到 `ebasecamp-command-run`）、C5（底栏导入/导出/销毁 + 派发路径统一 + 旧项目视图接口迁移）、C6（删除 ETAF Data 适配层，`ebasecamp-data` 收敛为纯装配层）、E1（文档批次：`architecture.org` / `user-guide.org` / `compose-generation.org` 重写、`troubleshooting.org` 新建，共 1389 行）
 - 测试基线：293 tests 全绿（C6 后 293，删 9 增 2；C5 后 300；C4 后 299）
-- 下一步：C7 界面测试与真实目检（重写 `test/ebasecamp-ui-tests.el` + 用户新 Emacs 目检）
+- 下一步：E2（`Readme.org`：清单示例换组内 configs 写法 + 命令表补「加载不到包」排查，示例命令须实测）；C7（界面测试重写 + 用户目检）仍未完成，与 E2 并行推进
 - 待用户：A4 重启 Emacs 后 `M-x ebasecamp` 目检
 
 
@@ -171,10 +171,11 @@
 
 ### 批次 E：文档与收尾
 
-- [ ] E1 承接原计划 T5.2：写 `docs/architecture.org`、`docs/user-guide.org`、`docs/compose-generation.org`、`docs/troubleshooting.org`，全部按 v0.2 新模型描述
+- [x] E1 承接原计划 T5.2：写 `docs/architecture.org`、`docs/user-guide.org`、`docs/compose-generation.org`、`docs/troubleshooting.org`，全部按 v0.2 新模型描述
       （依赖：C7）验收：四份文档存在；compose-generation 的映射表与实现一致；troubleshooting 覆盖权限/端口冲突/config -q 失败/版本不符/「命令不存在」排查
       注意：`docs/architecture.org:147,149,185` 与 `Readme.org:180` 仍引用已删除的 `ebasecamp-ui-run-action` / `ebasecamp-ui-current-project`，E1/E2 必须同步修正
-      （进度 2026-10-23）`docs/architecture.org` 与 `docs/user-guide.org` 完成：两份均按 v0.2 组为中心模型全面重写/新建，已删除符号的引用同步清除；user-guide 的清单示例（groups.el + projects/myapp.el + projects/other.el）经 `ebasecamp-config-load` 实测 `:errors` 为 nil、组与配置可读、物化产物带 `:service-overrides`。`docs/compose-generation.org` 与 `docs/troubleshooting.org` 待写 → E1 **暂不勾选**
+      （进度 2026-10-23）`docs/architecture.org` 与 `docs/user-guide.org` 完成：两份均按 v0.2 组为中心模型全面重写/新建，已删除符号的引用同步清除；user-guide 的清单示例（groups.el + projects/myapp.el + projects/other.el）经 `ebasecamp-config-load` 实测 `:errors` 为 nil、组与配置可读、物化产物带 `:service-overrides`
+      （完成 2026-10-23，E1 后半）四份文档齐备：`architecture.org` 248 行、`user-guide.org` 424 行、`compose-generation.org` 304 行（按 v0.2 复核重写）、`troubleshooting.org` 413 行（新建）。要点：① compose-generation 的导入映射表逐字段对齐 `ebasecamp-import.el` 当前实现（含 D4 的 `env_file` 字符串列表、D5 收紧后的映射/序列判定、`ports` 可表达/不可表达分界），落盘示例由 `ebasecamp-import--manifest-content` 对 `test/fixtures/compose-config-noint.json` 生成（非手写），YAML 片段与导出头注释均经真实渲染核对；② troubleshooting 十条均按「现象/原因/排查命令/修法」四段式，覆盖命令不存在、空态、六类加载错误、docker 权限、端口冲突三态（duplicate/busy/unknown）、`config -q` 双判据、D4 前旧清单的 `env_file must be a string`、Compose 版本警告、状态不刷新、同组多配置选择共享；③ 文档引用的 52 个 `ebasecamp-*` 符号经 `emacs -Q --batch` 加载后逐个 `fboundp`/`boundp`/`featurep` 核查，无引用已删符号（3 条 MISSING 均为 grep 正则截断产物）；④ `org-element-parse-buffer` 解析两份文档无错（compose-generation 26 headline / 8 表 / 5 src，troubleshooting 51 headline / 4 表 / 25 src）；⑤ 复核中发现 *新缺陷*：同一服务同时有可表达端口与非空 `:extra` ports 桶（或 bind 卷 + tmpfs 卷）时渲染出重复的 `ports:` / `volumes:` 键，`docker compose config -q` 报 `mapping key "ports" already defined`（退出码 1，只含其中一种时正常）—— 已在两份文档的「已知限制」与 `config -q` 排障表中如实记录，待开 tech-debt 条目
 - [ ] E2 `Readme.org`：清单示例换成组内 configs 写法，命令表补「加载不到包」排查；示例用具体命令实测：`emacs -Q --batch -L . -L lisp -L $(HOME)/thomas-emacs/.local/straight/build-31.1/etaf -L $(HOME)/thomas-emacs/.local/straight/build-31.1/etaf-ui -L $(HOME)/thomas-emacs/.local/straight/build-31.1/ebox -L $(HOME)/thomas-emacs/.local/straight/build-31.1/ecss -l /tmp/readme-manifest.el --eval '(progn (prin1 (length (ebasecamp-model-groups))) (terpri))'`
       （依赖：E1）验收：命令退出码 0 且输出的组数符合示例
 - [ ] E3 `CHANGELOG.md` 追加 0.2.0：模型新增 `:configs`、界面改为组为中心、旧写法兼容、加载修复说明

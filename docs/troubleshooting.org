@@ -1,0 +1,413 @@
+#+title: ebasecamp 故障排查
+#+author: Thomas
+#+options: toc:t
+
+按症状查的排障手册。每条四段： *现象* → *原因* → *排查命令* → *修法* 。命令都可直接复制；凡涉及本机代理环境（=http_proxy= 已设、=no_proxy= 未设）的探活命令，=curl= 一律带 =--noproxy '*'= ，否则会被代理接管返回假 503。
+
+* 1. =M-x ebasecamp= 报「命令不存在」
+
+** 现象
+
+=M-x ebasecamp= 提示 =Wrong type argument= 或直接不在补全列表里；=M-: (fboundp 'ebasecamp)= 返回 =nil= 。界面打不开，其余功能也无从谈起。
+
+** 原因
+
+命令本身没有注册进当前 Emacs。常见三种：
+
+1. *包根本没装* —— =load-path= 里没有 ebasecamp，也没走 straight。
+2. *straight 装的是旧副本* —— recipe 指向上游仓库，或改了代码没重建 build 目录；运行中的 Emacs 仍加载旧 =.elc= 。
+3. *daemon 启动早于 build 完成* —— straight 的 build 目录在 daemon 起来之后才生成，该 daemon 的 =load-path= 里没有它。
+4. 附带一个开发期陷阱：=straight= 的 =:files= 漏了 =lisp/*.el= ，=ebasecamp.el= 在仓库根目录能加载，=require 'ebasecamp-ui= 却找不到模块。
+
+** 排查命令
+
+在 *当前这个 Emacs* 里逐条求值：
+
+#+begin_src elisp
+(fboundp 'ebasecamp)        ; 期望 t
+(featurep 'ebasecamp)       ; 期望 t（已加载）
+(locate-library "ebasecamp") ; 期望指向仓库或 straight build 目录
+(member "lisp" load-path)   ; 手工 load-path 时可见
+#+end_src
+
+在 shell 里验证「代码本身有没有问题」（不涉及任何用户配置）：
+
+#+begin_src text
+cd /home/thomas/WorkSpace/ebasecamp
+emacs -Q --batch -L . -L lisp \
+  -L ~/thomas-emacs/.local/straight/build-31.1/etaf \
+  -L ~/thomas-emacs/.local/straight/build-31.1/etaf-ui \
+  -L ~/thomas-emacs/.local/straight/build-31.1/ebox \
+  -L ~/thomas-emacs/.local/straight/build-31.1/ecss \
+  -l ebasecamp.el --eval '(princ (fboundp (quote ebasecamp)))'
+#+end_src
+
+期望输出 =t=。这一条通过而 Emacs 里仍打不开 → 问题在安装（第 2、3 条原因），代码是好的。
+
+检查 straight 的产物（版本目录按实际 Emacs 版本替换）：
+
+#+begin_src text
+ls ~/thomas-emacs/.local/straight/build-31.1/ebasecamp/ | head
+ls ~/thomas-emacs/.local/straight/build-31.1/ebasecamp/lisp/ 2>/dev/null | head
+#+end_src
+
+=build-<版本>/ebasecamp/= 存在但没有 =lisp/= 子目录 → 命中原因 4。
+
+** 修法
+
+- *开发期走本地仓库* （推荐，recipe 见 [[file:user-guide.org][用户指南]] 的安装节）：
+
+#+begin_src elisp
+(straight-use-package
+ '(ebasecamp :type git
+             :local-repo "/home/thomas/WorkSpace/ebasecamp"
+             :files ("*.el" "lisp/*.el")))
+#+end_src
+
+  改完 recipe 后 *必须* 删掉旧的 build 目录（以及 =:repo= 时期的 =repos/= 副本，否则 straight 仍用旧 clone），再重启 Emacs 让它重建：
+
+#+begin_src text
+rm -rf ~/thomas-emacs/.local/straight/build-31.1/ebasecamp
+rm -rf ~/thomas-emacs/.local/straight/repos/ebasecamp
+#+end_src
+
+- *只改了代码* ：=M-x straight-rebuild-package RET ebasecamp= ，然后重启 Emacs（daemon 也要重启 —— 重启方式由你自己的配置决定，插件不提供入口）。
+- *不装包管理器* ：
+
+#+begin_src elisp
+(add-to-list 'load-path "~/WorkSpace/ebasecamp")
+(add-to-list 'load-path "~/WorkSpace/ebasecamp/lisp")
+(require 'ebasecamp)
+#+end_src
+
+- *stale =.elc= 陷阱* （开发期常见）：仓库里残留旧 =.elc= 时，=load= 会优先加载它，你改的 =.el= 不生效。清掉再试：
+
+#+begin_src text
+cd /home/thomas/WorkSpace/ebasecamp && make clean
+#+end_src
+
+  batch 脚本里要读最新源码则首行加 =(setq load-prefer-newer t)=。
+
+* 2. 界面能打开但空白，只有一句空态提示
+
+** 现象
+
+=*ebasecamp*= buffer 打开后只有「还没有 ebasecamp 清单 / 在 ~/.config/ebasecamp/ 下定义 groups.el 与 projects/*.el 后重新打开」，没有组树。
+
+** 原因
+
+1. 清单目录不存在 —— =ebasecamp-config-load= 返回 =:bootstrap-needed= t，此时 *不创建目录* 、=:errors= 为空，界面按「无任何组」渲染空态。
+2. 目录存在但 =groups.el= 为空 / 只有注释，或 =projects/*.el= 里没有项目。
+3. 清单文件有加载错误 —— 文件里的定义被丢弃（回滚），组表因此为空或残缺。
+
+** 排查命令
+
+#+begin_src elisp
+(let ((status (ebasecamp-config-load)))
+  (list :bootstrap-needed (plist-get status :bootstrap-needed)
+        :groups (length (plist-get status :groups))
+        :projects (length (plist-get status :projects))
+        :errors (mapcar (lambda (e) (plist-get e :message))
+                        (plist-get status :errors))))
+#+end_src
+
+#+begin_src text
+ls -l ~/.config/ebasecamp/
+ls -l ~/.config/ebasecamp/projects/
+wc -l ~/.config/ebasecamp/groups.el
+#+end_src
+
+** 修法
+
+- =:bootstrap-needed= 为 t → 生成示例清单再打开界面：
+
+#+begin_src text
+M-x ebasecamp-create-sample-config
+M-x ebasecamp
+#+end_src
+
+  目录里已有清单而该命令拒绝执行，说明是原因 2/3，不要用 =C-u= 覆盖。
+- =:groups= 为 0 且 =:errors= 非空 → 按第 3 条逐条修；修完 =M-x ebasecamp-reload= （它会重新加载并刷新表格，用 =message= 报组/项目/错误数）。
+- 清单为空但目录在 → 手工补 =groups.el= 与 =projects/<name>.el= ，写法见 [[file:user-guide.org][用户指南]]。
+
+* 3. 清单加载报错
+
+** 现象
+
+=M-x ebasecamp-reload= 的 echo area 出现「已加载 N 个组、M 个项目，K 个错误」；界面缺组或缺段。错误项结构统一为 =(:file PATH :condition CONDITION-DATA :message STRING)=，顺序固定为 *文件加载 → 项目引用校验 → 物化* 。
+
+** 原因
+
+加载过程分三段，错误来源按段划分：单文件加载（Elisp 语法错、名字非法等，整文件回滚）、定义期校验（项目对组的引用）、物化期（组内 =:configs= 并入项目）。六类最常见：
+
+| # | 消息形如 | 触发写法 | 出处 |
+|---+----------+----------+------|
+| 1 | =项目 myapp（…/projects/myapp.el）重复引用组 mysql= | 旧写法 =:groups= 里同一个组出现两次 | =ebasecamp-config-duplicate-group-ref= |
+| 2 | =… 配置缺少 :project= | =:configs ((c1 :services …))= 没写 =:project= | =ebasecamp-model--config-from-spec= |
+| 3 | =… 配置不允许 :scope（只允许 :project 与 :services）= | 在 =:configs= 里给配置写了 =:scope= | 同上（D9） |
+| 4 | =配置 c1/g1 引用了未定义的项目 nowhere= | 配置的 =:project= 指向不存在的项目 | =link-configs= 的 =:undefined-project= |
+| 5 | =shared 组 mysql 至多 1 份配置（实际 2 份）= | shared 组写了多份 =:configs= | =link-configs= 的 =:shared-multiple-configs= （E3） |
+| 6 | =配置 c1/g1 覆盖了不存在的服务 db= | 配置的 =:services= 覆盖了组里没有的服务名 | =link-configs= 的 =:unknown-service= |
+
+补充两类同源错误：=项目 myapp（…）引用了未定义的组 ghost= （组没定义，属定义期）与 =项目 myapp 重复引用组 mysql（来源：配置 c2）= （旧 =:groups= 与配置指向同一组，属物化期，D2：同项目同组只允许 1 个引用）。
+
+** 排查命令
+
+#+begin_src elisp
+(dolist (e (plist-get (ebasecamp-config-load) :errors))
+  (princ (format "%s :: %S\n" (plist-get e :message) (plist-get e :condition))))
+#+end_src
+
+=:file= 是有用线索：定义期错误指向出错的项目文件，物化期错误 *恒指向* =<清单目录>/groups.el= （配置只能写在那里）。
+
+** 修法
+
+- 1 / 补充第 2 类：同一项目同一组只保留 *一个* 引用 —— 要么删掉重复的 =(组名)= ，要么把它改成组内 =:configs= 的新写法（两种来源混用会撞）。
+- 2 / 3 / 5 / 6：改 =groups.el= 里的 =:configs= 段落，补齐 =:project= 、删掉 =:scope= 、shared 组只留 1 份配置、覆盖的服务名必须在组 =:services= 里存在。
+- 4：把配置的 =:project= 指向已定义项目，或先补上 =projects/<name>.el= 。
+- 改完 =M-x ebasecamp-reload= ；批量核对可直接用上一条命令，=:errors= 应为 =nil=。
+
+* 4. docker 权限错误（=permission denied=）
+
+** 现象
+
+刷新或启停时 echo area / notice 报错，消息含 =permission denied= 与提示「将用户加入 docker 组或修正 socket 权限」；状态表全部显示 stopped（其实容器在跑）。对应条件 =ebasecamp-docker-permission= （=ebasecamp-docker-classify-error= 按 stderr 大小写不敏感匹配判定）。
+
+** 原因
+
+当前用户无权访问 Docker socket（=/var/run/docker.sock= 属 =docker= 组，而当前用户不在组内），或 socket 权限被改坏。
+
+** 排查命令
+
+#+begin_src text
+id -nG                      # 输出里是否有 docker
+ls -l /var/run/docker.sock  # 期望 srw-rw---- root docker
+docker ps --format '{{.Names}}'   # 直接复现权限错误
+#+end_src
+
+** 修法
+
+把用户加入 =docker= 组后 *重新登录*（组变更对已存在的会话不生效，WSL 里通常要重开终端甚至 =wsl --shutdown= ）：
+
+#+begin_src text
+sudo usermod -aG docker "$USER"   # 需要你自己在终端执行（需要密码）
+#+end_src
+
+临时验证可用 =sudo docker ps= 确认是权限而非守护进程问题。不走 =systemd= 自启的环境要确认 =docker= 守护进程本身起来了：=docker info= 能连上才谈权限。
+
+* 5. 端口冲突（=duplicate= / =busy= / =unknown=）
+
+** 现象
+
+点「启动」后按钮被拦下或出现黄色提示；=ebasecamp-command-port-conflicts= 返回的冲突项里 =:kind= 是三者之一：
+
+| =:kind= | 含义 | 是否阻塞启动 |
+|---------+------+--------------|
+| =duplicate= | *清单内* 选中集合里两个服务发布了同一个宿主端口 | 阻塞 |
+| =busy= | 该宿主端口已被 *别的进程* 占用（探测 bind 失败，=EADDRINUSE=） | 阻塞 |
+| =unknown= | 端口探测本身不可用（权限等原因），无法判断 | *不阻塞* ，只提示「端口探测不可用，已跳过」 |
+
+** 原因
+
+- =duplicate= ：清单写法问题 —— 两个服务 =:ports= 里出现同一 published 端口（常见于从 compose 导入后同组多实例）。
+- =busy= ：宿主已有进程监听该端口（含 *Windows 侧* 进程 —— WSL mirrored 网络与 Windows 共享端口空间，WSL 里 =ss= 看不到占用者也会报 =EADDRINUSE= ）。
+- =unknown= ：探测走 =make-network-process= 对 =0.0.0.0:<port>= 做 bind（=:server t=）；错误消息含 =address already in use= / =in use= 归一为 =busy= ， *其他* 错误（权限、地址族不可用等）原样再 signal，由调用方降级为 =unknown= 。
+
+** 排查命令
+
+#+begin_src text
+ss -lntH "sport = :PORT"          # WSL 侧谁在监听（把 PORT 换成实际端口）
+netstat.exe -ano | grep :PORT     # 上一条为空但 bind 仍失败 → 查 Windows 侧
+#+end_src
+
+定位清单里的重复端口：
+
+#+begin_src elisp
+(let ((ports (make-hash-table :test #'eql)))
+  (dolist (g (ebasecamp-model-groups))
+    (dolist (s (ebasecamp-group-services g))
+      (dolist (p (ebasecamp-service-ports s))
+        (push (format "%s/%s" (ebasecamp-group-name g) (ebasecamp-service-name s))
+              (gethash (car p) ports)))))
+  (maphash (lambda (port svcs)
+             (when (> (length svcs) 1) (princ (format "%s -> %S\n" port svcs))))
+           ports))
+#+end_src
+
+** 修法
+
+- =duplicate= ：改清单里其中一个服务的 =:ports= （发布端口改成不同值），或用项目的 =:service-overrides= 覆盖端口；注意相同宿主端口 *不能* 同时在两套环境里发布。
+- =busy= ：停掉占用者（=ss -lntp= 需要权限才能看到进程名，可先 =sudo ss -lntp= —— 仍需你自己执行），或换发布端口。
+- =unknown= ：不阻塞，但要有心理准备：启动可能因端口占用失败，报错会来自 =docker compose= 而非插件。修好探测前提（如加入 docker 组、确认 loopback 可用）后重试。
+
+* 6. =config -q= 校验失败（生成物 / 导出物落不了盘）
+
+** 现象
+
+导出时 echo area 报「… 未通过 compose 校验（退出码 N）：<stderr>」，目标文件不存在；或缓存生成物被 =docker compose= 判为非法。
+
+** 原因
+
+=ebasecamp-docker-check-compose= 的判据是 *双条件* ：退出码为 0 *且* stderr 不含 =level=error= 行。只看退出码不够 —— 未定义变量之类只产生 =level=warning= ，而某些错误 compose 仍以 0 退出。失败最常见于清单写错（=:extra= 塞了非法字段、端口形态不对）而不是渲染器本身。
+
+** 排查命令
+
+#+begin_src text
+docker compose -f ~/.cache/ebasecamp/<project>/compose.yaml config -q
+docker compose -f ~/.cache/ebasecamp/<project>/compose.yaml config | head -40
+#+end_src
+
+第二条会 *插值并展开* =${VAR}= （可能把密钥明文打到终端）：只在本地、必要时用，输出别贴进 issue。要看未经插值的原文则加三个 =--no-*= flag（见 [[file:compose-generation.org][compose 生成]]）。
+
+常见 stderr 与含义：
+
+| stderr 片段 | 含义 / 修法 |
+|-------------+-------------|
+| =services.X.env_file must be a string= | 清单里 =env_file= 存成了 plist 形态 → 见第 7 条 |
+| =services.X.ports must be a array= | =:extra= 里的端口对象被当成映射渲染（tech-debt #21，D5 已修；若复现说明清单里塞了 keyword plist） |
+| =mapping key "ports" already defined= / =… "volumes" already defined= | 同一服务 *同时* 有可表达字段与非空 =:extra= 桶（如既有 =:ports= 又有绑定宿主 IP 的端口，或既有 bind 卷又有 tmpfs）：渲染出两个同名键，YAML 解析直接失败。现状无解 —— 改清单让该服务只保留一种形态（把不可表达端口挪到别的服务/别的组），或先记 issue |
+| =service "X" refers to undefined network Y= | 服务引用了未声明网络；渲染器本会声明，说明 =:extra= 里手写了网络的错形态 |
+| =undefined volume= / =undefined service= | 命名卷或 =depends_on= 指向不存在对象（多来自 =:extra= 透传） |
+| =env file … not found= | =env_file= 相对路径按 *compose 文件所在目录* 解析，文件不在那里 |
+| =additional property … is not allowed= | 清单 =:extra= 里写了非 compose schema 的字段（tech-debt #8） |
+
+** 修法
+
+按 stderr 指到的服务改清单，然后 =M-x ebasecamp-reload= 重新生成。定位是「清单错」还是「渲染错」的通用手法：
+
+#+begin_src elisp
+(princ (ebasecamp-compose-render (ebasecamp-model-project 'demo)))
+#+end_src
+
+渲染文本里出现 =(host_ip . …)= 这类 S-表达式当键、或服务下出现两个同名键 → 是渲染层问题（记 issue）；否则是清单写法问题。
+
+* 7. 导出报 =env_file must be a string=（D4 之前导入的旧清单）
+
+** 现象
+
+导出把目标文件卡在校验阶段，stderr 为 =services.<X>.env_file must be a string= 。清单加载本身没有 =:errors= ，界面正常。
+
+** 原因
+
+v0.2 之前（D4 之前）的导入把 =env_file= 存成 volumes 语义的 *( (:source "./db.env" :type env) )* plist 列表。渲染层把「元素为 plist 的列表」当映射展开，产出 =source:= / =":type"= 之类的垃圾键，compose 校验直接拒绝（D3 实测）。D4 起改为 *相对路径字符串列表* 。
+
+** 排查命令
+
+#+begin_src text
+grep -n 'env_file' ~/.config/ebasecamp/projects/<name>.el
+#+end_src
+
+| 形态 | 判定 |
+|------+------|
+| =("env_file" "./db.env")= | 正确（字符串列表） |
+| =("env_file" ((:source "./db.env" :type env)))= | 旧形态，需要修 |
+
+** 修法
+
+首选 *重新导入* （幂等，会覆盖该项目清单文件、重新生成 v0.2 组内配置写法）：
+
+#+begin_src text
+M-x ebasecamp-import-file RET <项目 compose 文件>
+#+end_src
+
+不愿重导时手工改那一行，把 =((:source "X" :type env))= 换成 =("X")= （多个文件则是多个字符串，保持原顺序），然后 =M-x ebasecamp-reload= 后重试导出。
+
+* 8. Compose 版本不符的警告
+
+** 现象
+
+界面/echo area 出现「检测到 Docker Compose X.Y.Z；本插件按 Compose 5.x 验证，其他主版本行为可能不同」，或「无法执行 =docker compose version=」「无法从输出解析版本号」。
+
+** 原因
+
+=ebasecamp-docker-version-check= 只认主版本 5（本插件在 Compose 5.6.0 上验证）。主版本不是 5 时返回 =:ok= nil + 警告；命令失败或输出里找不到三段版本号时同样降级为警告。 *这是警告不是错误* ，不阻塞任何操作。
+
+** 排查命令
+
+#+begin_src text
+docker compose version
+#+end_src
+
+#+begin_src elisp
+(ebasecamp-docker-version-check)   ; (:compose-version "5.6.0" :ok t :warning nil)
+#+end_src
+
+** 修法
+
+- 版本 5.x → 忽略（=:ok= t，无警告）。
+- 其他主版本 → 可继续用，但要预期 =config --format json= 的键集漂移：导入后核对 =:extra= 是否塞进了本该映射的字段；导出失败时先按第 6 条看 stderr。
+- =:compose-version= 为 nil → 插件（=docker-compose= v1 或未装）缺失，装 Compose v2/v5 插件版并把 =docker compose= 放上 =PATH=。
+
+* 9. 界面状态不刷新（容器在跑但显示 stopped）
+
+** 现象
+
+启动后状态列长时间停在 stopped / 空；或状态列一直是旧值。缓存生成物与操作本身正常。
+
+** 原因
+
+1. 轮询只在界面 *挂载期间* 运行：=etaf-on-mounted= 启 =ebasecamp-status-start= ，=etaf-on-unmounted= 停 =ebasecamp-status-stop= 。buffer 没显示（被 bury 且没恢复）时不会刷新。
+2. 轮询间隔是 =ebasecamp-status-refresh-interval= （默认 3 秒），最多滞后一个间隔。
+3. 刷新失败被 *静默消化* ：=ebasecamp-status-snapshot= 捕获错误、把 =last-records= 保留为上一次成功值，只把错误存进 =ebasecamp-status-last-error= —— 于是界面看起来「停在旧值」。最常见原因是 docker 权限（第 4 条）。
+4. 状态只采集带 =ebasecamp.managed=true= 标签的容器（=docker ps -a --filter label=…= ）；手工 =docker run= 起的容器永远不会出现在表里。
+
+** 排查命令
+
+#+begin_src elisp
+(ebasecamp-status-running-p)        ; 轮询是否在跑
+ebasecamp-status-refresh-interval   ; 当前间隔
+(ebasecamp-status-last-error)       ; 最近一次刷新失败的错误对象
+(length (ebasecamp-status-last-records))
+#+end_src
+
+#+begin_src text
+docker ps -a --no-trunc --filter label=ebasecamp.managed=true \
+  --format '{{.Names}}\t{{.State}}\t{{.Label "ebasecamp.project"}}\t{{.Label "ebasecamp.group"}}'
+#+end_src
+
+** 修法
+
+- =running-p= 为 nil → buffer 未被挂载；重新 =M-x ebasecamp=（或切回 =*ebasecamp*= buffer）让它挂载。
+- =last-error= 非 nil → 按错误内容走第 4 条（权限）或其他 docker 故障；修好后下一轮轮询会自动恢复，也可 =M-x ebasecamp-reload= 立即重来。
+- 容器列表有该容器但界面没显示 → 缺 =ebasecamp.*= 标签：容器不是插件起的（手工 =docker run= / 旧版本残留），插件按标签归属，不猜容器名。
+- 觉得 3 秒太慢：=M-x customize-variable RET ebasecamp-status-refresh-interval= （每次轮询起一个 docker 进程，别设太小）。
+
+* 10. 同一个组的两份配置看不出差异
+
+** 现象
+
+一个组有两份 =:configs= （分别指向两个项目），右栏两段看起来只差项目名与覆盖值；更奇怪的是： *在其中一段勾选某服务，另一段的同名服务也变勾选* 。
+
+** 原因
+
+这是第一期的 *有意* 语义，不是 bug：
+
+1. *选中状态的 key 是「组名/服务名」* （=ebasecamp-ui--instance-key= ），容器 ID 与项目名都不参与 —— 好处是容器重启后勾选不丢；代价是同一组在不同项目实例下服务同名时 *跨段共享* 选中状态。
+2. *容器标签没有配置维度* （只有 =ebasecamp.managed/project/group/service/scope= ），因此不能按「配置」区分容器；同一项目同一组也只允许 1 个引用（D2）。
+3. 两段的真正差异只可能来自：配置的 =:services= 覆盖（端口 / 环境变量 / 卷等）、以及 =:scope= 与项目不同带来的 compose 项目名差异（=ebc-<project>= ）。
+
+** 排查命令
+
+#+begin_src elisp
+;; 看两份配置的实例装配结果（含覆盖后的记录与状态）
+(ebasecamp-data-group-instances 'mysql)
+#+end_src
+
+#+begin_src text
+;; 看渲染差异（两份配置各渲一次，比较 name: 与字段）
+docker compose -f ~/.cache/ebasecamp/<project-a>/compose.yaml config -q
+docker compose -f ~/.cache/ebasecamp/<project-b>/compose.yaml config -q
+#+end_src
+
+** 修法
+
+- 只是想「两个项目各跑一套同样服务」（per-project 两份配置）：现状正确 —— 容器集合按项目隔离，勾选状态共享只影响 *勾选这个视觉* ，不影响启动目标（段内按钮按该段自己的项目派发）。
+- 需要在同一项目里跑 *同一组的两套实例* （不同端口）： *当前不支持* —— 容器标签无配置维度、服务名会撞，加载期会因「同项目同组双引用」报错。绕法是为第二套实例 *复制一个组* （不同组名，各自一份配置）。
+- 这些限制已记录在 =openspec/tech-debt.md= 与计划「非目标」节，不要当缺陷报。
+
+* 相关文档
+
+- [[file:compose-generation.org][compose 生成与导入导出规则]]
+- [[file:architecture.org][架构与分层]]
+- [[file:user-guide.org][用户指南]]
+- [[file:../AGENTS.md][AGENTS.md 不变量清单]]
