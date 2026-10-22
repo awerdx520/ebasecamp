@@ -2,11 +2,11 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 批次 0 完成
+- 阶段：Phase 3（Implement）· 批次 1 进行中
 - 已确认：方案 V2 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）
-- 已完成：批次 0（T0.1–T0.5）
-- 下一步：批次 1（T1.1 model 层，先写 ERT 测试）
-- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag
+- 已完成：批次 0（T0.1–T0.5）、T1.1（model 层）
+- 下一步：T1.2 config 层（先写 ERT 测试）
+- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist 形式
 
 ## 目标
 
@@ -35,14 +35,14 @@
 ```elisp
 (cl-defstruct ebasecamp-service name image command entrypoint environment
   labels ports volumes healthcheck depends-on networks working-dir user
-  restart bind extra)
+  restart extra)
 (cl-defstruct ebasecamp-group name title scope services)
 (cl-defstruct ebasecamp-project name title root groups shared-network export-file)
 ```
 
 - `ports` 元素：`(PUBLISHED . TARGET)`，均为整数
 - `environment`/`labels` 为 alist，值中的 `${VAR}` **原样保留**
-- `volumes` 元素：`(NAME . CONTAINER-PATH)`；`bind` 为 `t` 时 NAME 是宿主路径
+- `volumes` 元素：plist `(:source S :target T :type volume|bind [:read-only t])`
 - 未识别字段进 `extra`，导出时原样回写
 
 ## 导入映射规则（T4.1 的前置 spec）
@@ -89,7 +89,7 @@ docker compose -f <file> config --no-interpolate --no-env-resolution --no-path-r
 
 ### 批次 1：M1 数据层与 compose 生成
 
-- [ ] T1.1 `lisp/ebasecamp-model.el`：三个 struct、`ebasecamp-define-group`/`-project` 宏、字段校验、项目覆盖合并
+- [x] T1.1 `lisp/ebasecamp-model.el`：三个 struct、`ebasecamp-define-group`/`-project` 宏、字段校验、项目覆盖合并
       （依赖：无）验收：ERT 覆盖 合法定义、未知字段拒绝、scope 非法值拒绝、覆盖合并结果
 - [ ] T1.2 `lisp/ebasecamp-config.el`：从 `ebasecamp-config-directory` 加载 `groups.el` 与 `projects/*.el`；目录不存在时**不自动创建**，返回空清单并置 `bootstrap-needed` 标记；语法错/重复组名收集为错误列表不中断
       （依赖：T1.1）验收：ERT 覆盖 目录缺失、语法错、重复组名、加载顺序、bootstrap 标记
