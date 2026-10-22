@@ -4,8 +4,8 @@
 
 - 阶段：Phase 3（Implement）· 批次 C 进行中（C0–C6 完成）· 批次 E 进行中（E1 完成，E2 待做）
 - 已确认：方案 V3 ✅（用户 2026-10-22）、计划 ✅（用户 2026-10-22 确认；plan-reviewer 三轮审查通过）
-- 已完成：批次 A（加载修复）、批次 B（模型 + 物化 + 加载集成）、批次 D（导入/导出往返，含 D4 env_file 与 D5 渲染判据两个阻断缺陷修复）、C0（组为中心的会话与视图骨架）、C1/C2（`ebasecamp-data-group-instances` 组配置实例装配）、C3（段渲染：每份配置一个 `etaf-panel` + 服务表）、C4（段内派发：段内按钮按该段自己的 project 派发到 `ebasecamp-command-run`）、C5（底栏导入/导出/销毁 + 派发路径统一 + 旧项目视图接口迁移）、C6（删除 ETAF Data 适配层，`ebasecamp-data` 收敛为纯装配层）、E1（文档批次：`architecture.org` / `user-guide.org` / `compose-generation.org` 重写、`troubleshooting.org` 新建，共 1389 行）
-- 测试基线：293 tests 全绿（C6 后 293，删 9 增 2；C5 后 300；C4 后 299）
+- 已完成：批次 A（加载修复）、批次 B（模型 + 物化 + 加载集成）、批次 D（导入/导出往返，含 D4 env_file、D5 渲染判据、D6 同名桶合并三个阻断缺陷修复）、C0（组为中心的会话与视图骨架）、C1/C2（`ebasecamp-data-group-instances` 组配置实例装配）、C3（段渲染：每份配置一个 `etaf-panel` + 服务表）、C4（段内派发：段内按钮按该段自己的 project 派发到 `ebasecamp-command-run`）、C5（底栏导入/导出/销毁 + 派发路径统一 + 旧项目视图接口迁移）、C6（删除 ETAF Data 适配层，`ebasecamp-data` 收敛为纯装配层）、E1（文档批次：`architecture.org` / `user-guide.org` / `compose-generation.org` 重写、`troubleshooting.org` 新建，共 1389 行）
+- 测试基线：299 tests 全绿（D6 后 299，含 6 项新增；C6 后 293；C5 后 300；C4 后 299）
 - 下一步：E2（`Readme.org`：清单示例换组内 configs 写法 + 命令表补「加载不到包」排查，示例命令须实测）；C7（界面测试重写 + 用户目检）仍未完成，与 E2 并行推进
 - 待用户：A4 重启 Emacs 后 `M-x ebasecamp` 目检
 
@@ -142,6 +142,10 @@
       （依赖：D3 实测 + D4）验收：新增 ERT 先红后绿；含绑定宿主 IP 端口的项目可导出、ports 段为合法长语法（`-\n  host_ip: …`）；`docker compose config -q` 退出码 0；现有 labels / environment / healthcheck / volumes / networks 渲染用例保持绿
       （完成：`lisp/ebasecamp-compose.el` 仅改判据一处（含 docstring 说明「键必须是字符串」）；`((alist))` 这类「元素为 alist 的列表」改走序列分支 → `-\n  host_ip: 127.0.0.1\n  published: "18097"\n  target: 80`（compose 长语法，`config -q` 通过）。判定表核查全部渲染路径：environment / labels（string alist → 映射，前后一致）、healthcheck（plist 走 `--healthcheck-body`，不经 `--yaml-value`，前后一致）、ports（service-body 先格式化为 `"p:t"` 字符串列表 → 序列，一致）、volumes 挂载串 / networks / depends_on（字符串列表 → 序列，一致）、`:extra` 标量值与嵌套 alist（→ 映射，一致）；**输出变化仅限**「元素为 alist 的列表」：`ports` / `volumes` 对象列表（原来渲染成 `(host_ip . 127.0.0.1):` 垃圾键，现为合法序列）与同类 list-of-alists 载荷（如 `logging: [{driver: json-file}]`，原来同样产出垃圾键）。测试：新增 3 项（`ebasecamp-compose-test-mapping-p-rejects-plist-list`、`ebasecamp-compose-test-yaml-renders-port-object-list-as-sequence`、`ebasecamp-export-test-render-host-ip-port-passes-config-q`）；红阶段实测 278 项中 3 项 FAILED（渲染实测输出 `((host_ip . 127.0.0.1) …): null`），转绿后 `make check` 278/278 全绿（check-parens OK 22 files、compile 零 warning）。真实 docker 闭环见 D3 完成说明）
 
+
+- [x] D6 修渲染层同名桶合并（计划外新增，技术债 #23 阻断级）：`ebasecamp-compose--service-body` 把 `:extra` 的 `"ports"` / `"volumes"` 桶与显式 `:ports` / `:volumes` 合并为单一序列
+      （依赖：E1 复核实测 + D5）验收：新增 ERT 先红后绿；`ports:` / `volumes:` 键各只出现 1 次且两类项都在；其余 `:extra` 键渲染不变；两者都空时不输出该键；导出经打桩校验可落盘
+      （完成：`lisp/ebasecamp-compose.el` 的 `--service-body` 改为 `let*`，新增 `extra-ports` / `extra-volumes`（`(cdr (assoc "ports"/"volumes" extra))`）、`rest-extra`（`cl-remove-if` 剔除这两个同名键）、`merged-ports`（显式项格式化为 `"P:T"` 字符串 + extra 对象项）与 `merged-volumes`（`volume-entries` 的挂载串 + extra 对象项）；`when merged-ports` / `when merged-volumes` 各只 push 一个键，末尾改用 `rest-extra` 展开。先验证 `--yaml-value` 对「序列里混字符串与 alist」的输出正确（字符串 → `- scalar`、alist → `-` 换行后映射，实测批次探针输出符合预期）。测试：新增 6 项（`renders-single-ports-key-when-mixed`、`renders-single-volumes-key-when-mixed`、`extra-without-ports-volumes-unchanged`、`no-ports-no-volumes-still-omits-keys`、`export-mixed-ports-passes-check`、`fixture-roundtrip-mixed-ports`）；红阶段实测 299 项中 5 项 FAILED（第 4 项为守护项，本就应绿），转绿后 `make check` 299/299 全绿（check-parens OK 22 files、compile 零 warning）。真实 docker 闭环（Compose 5.6.0）：`/tmp/ebc-d6-*/project/compose.yaml` 的 `web` 同时有 `"18096:80"` 与 `"127.0.0.1:19096:9090/udp"`、`db` 同时有命名卷与 tmpfs → 导入 → 加载零错误 → 导出到项目根 `<root>/docker-compose.ebasecamp.yaml` → `docker compose config -q` 退出码 0、stderr 空；导出物 `ports:` / `volumes:` 各 1 个键（原文见 `docs/compose-generation.org` 的「混合项合并为单一键」节）；`/tmp` 已清理、`docker ps -a --filter label=ebasecamp.managed=true` 为空）
 
 ### 批次 C：界面重写
 

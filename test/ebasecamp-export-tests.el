@@ -32,12 +32,19 @@
 (require 'ebasecamp-compose)
 (require 'ebasecamp-config)
 (require 'ebasecamp-docker)
+(require 'ebasecamp-import)
 (require 'ebasecamp-export)
 
 ;;; 测试脚手架
 
 (defconst ebasecamp-export-test--project-name 'shop
   "测试用项目名。")
+
+(defconst ebasecamp-export-test--fixtures-directory
+  (expand-file-name
+   "fixtures/"
+   (file-name-directory (or load-file-name buffer-file-name)))
+  "本测试所用 fixture 目录的绝对路径。")
 
 (defun ebasecamp-export-test--read (file)
   "读取文件 FILE，返回完整内容字符串。"
@@ -460,6 +467,97 @@ BODY 内 `checked-file' 为最后一次校验收到的文件路径。"
         (should (string-match-p "^\\s-+host_ip: 127\\.0\\.0\\.1$" text))
         (should (string-match-p "^\\s-+target: 80$" text))
         (should-not (string-match-p "(host_ip" text))))))
+
+;;; 10. 同名桶合并（tech-debt #23 / D6）
+
+(defun ebasecamp-export-test--line-count (line text)
+  "返回 TEXT 中与 LINE 完全相同的行数（按行精确比较）。"
+  (let ((count 0))
+    (dolist (candidate (split-string text "\n"))
+      (when (equal line candidate)
+        (setq count (1+ count))))
+    count))
+
+(defun ebasecamp-export-test--mixed-world (root)
+  "在 ROOT 下注册「可表达端口 + `:extra' ports 桶」并存的清单，返回项目对象。
+端口对象取导入层真实形态：可表达项进 `:ports'（`(8080 . 80)'），udp 项以
+原始对象列表进 `:extra' 的 \"ports\" 桶。"
+  (ebasecamp-model-reset)
+  (ebasecamp-model--register-group
+   'web
+   (list :title "Web"
+         :scope 'per-project
+         :services
+         `((web
+            :image "nginx:1.27"
+            :ports ((8080 . 80))
+            :extra (("ports" (("host_ip" . "127.0.0.1")
+                              ("mode" . "ingress")
+                              ("protocol" . "udp")
+                              ("published" . "9090")
+                              ("target" . 9090))))))))
+  (ebasecamp-model--register-project
+   'site
+   (list :title "Site" :root root
+         :groups '((web :scope per-project)))))
+
+(ert-deftest ebasecamp-export-test-mixed-ports-passes-check ()
+  "可表达端口与 `:extra' ports 桶并存时可导出：ports 键只出现 1 次。
+打桩 `ebasecamp-docker-check-compose'（真实 docker 见 batch 闭环）。"
+  (ebasecamp-export-test--with-root
+    (ebasecamp-export-test--with-fake-check ebasecamp-export-test--ok-result
+      (let* ((project (ebasecamp-export-test--mixed-world root-dir))
+             (path (ebasecamp-export-project project))
+             (text (ebasecamp-export-test--read path)))
+        (should (file-exists-p path))
+        (should-not (file-exists-p checked-file))
+        (should (= 1 (ebasecamp-export-test--line-count "    ports:" text)))
+        (should (string-match-p (regexp-quote "- \"8080:80\"") text))
+        (should (string-match-p "^\\s-+published: \"9090\"$" text))
+        (should-not (string-match-p "(host_ip" text))))))
+
+(ert-deftest ebasecamp-export-test-fixture-roundtrip-mixed-ports ()
+  "实测 fixture（8080:80 + udp 9090）导入 → 加载 → 导出：ports 只 1 个键。
+compose 读取由 `ebasecamp-docker--run-sync-function' 伪造为 fixture JSON，
+因此本用例不依赖 docker 守护进程。"
+  (let* ((config-dir (make-temp-file "ebc-d6-config-" t))
+         (root-dir (make-temp-file "ebc-d6-root-" t))
+         (compose-dir (make-temp-file "ebc-d6-compose-" t))
+         (compose-file (expand-file-name "compose.yaml" compose-dir))
+         (fixture (expand-file-name "compose-config-noint.json"
+                                    ebasecamp-export-test--fixtures-directory))
+         (ebasecamp-config-directory config-dir)
+         (ebasecamp-docker--run-sync-function
+          (lambda (_args _timeout)
+            (list :exit 0
+                  :stdout (with-temp-buffer
+                            (insert-file-contents fixture)
+                            (buffer-string))
+                  :stderr ""))))
+    (unwind-protect
+        (progn
+          (with-temp-file compose-file (insert "services: {}\n"))
+          (let ((_manifest (ebasecamp-import-apply compose-file "probe-app"
+                                                  :force t :root root-dir))
+                (status nil)
+                (project nil)
+                (path nil))
+            (setq status (ebasecamp-config-load config-dir))
+            (should (null (plist-get status :errors)))
+            (setq project (ebasecamp-model-project 'probe-app))
+            (cl-letf (((symbol-function 'ebasecamp-docker-check-compose)
+                       (lambda (_file) '(:ok t :exit 0 :stderr "" :warnings nil))))
+              (setq path (ebasecamp-export-project project :force t)))
+            (should (stringp path))
+            (should (file-exists-p path))
+            (let ((text (ebasecamp-export-test--read path)))
+              (should (= 1 (ebasecamp-export-test--line-count "    ports:" text)))
+              (should (string-match-p (regexp-quote "- \"8080:80\"") text))
+              (should (string-match-p "^\\s-+protocol: udp$" text))
+              (should (string-match-p "^\\s-+target: 9090$" text)))))
+      (ebasecamp-model-reset)
+      (dolist (dir (list config-dir root-dir compose-dir))
+        (ignore-errors (delete-directory dir t))))))
 
 (provide 'ebasecamp-export-tests)
 ;;; ebasecamp-export-tests.el ends here

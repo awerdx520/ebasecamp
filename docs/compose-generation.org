@@ -99,7 +99,7 @@ compose 的 =env_file= 合法形态是「字符串 / 字符串列表 / ={path, r
 
 ** :extra 的组装顺序
 
-=:extra= 由四段拼成，顺序固定：① 未识别字段（字母序）；② ="ports"= 桶；③ ="volumes"= 桶；④ ="env_file"= 桶（为空时省略）。导出时 =:extra= 原样展开到服务体末尾。
+=:extra= 由四段拼成，顺序固定：① 未识别字段（字母序）；② ="ports"= 桶；③ ="volumes"= 桶；④ ="env_file"= 桶（为空时省略）。导出时 =:extra= 的 *其余* 键原样展开到服务体末尾；="ports"= / ="volumes"= 两个桶与显式 =:ports= / =:volumes= 字段 *合并* 成单一序列后只渲染一个键（见「YAML 渲染规则 → 混合项合并」，tech-debt #23 / D6）。
 
 ** 建议项目名
 
@@ -213,6 +213,32 @@ compose 的 =env_file= 合法形态是「字符串 / 字符串列表 / ={path, r
 
 单个服务体的字段顺序固定：=image= → =entrypoint= / =command= → =working_dir= / =user= / =restart= → =environment= → =labels= → =ports= → =volumes= → =networks= → =depends_on= → =healthcheck= → =:extra= 展开。2 空格缩进、block style。
 
+=ports= / =volumes= 是 *合并后的单一序列* ：显式字段的简单项在前（=:ports= 的 ="8080:80"= 字符串、=:volumes= 的 ="src:tgt[:ro]"= 字符串），=:extra= 同名桶的复杂对象项（alist）在后。两者都不为空时仍只渲染 *一个* =ports:= / =volumes:= 键。
+
+** 混合项合并为单一键（D6 修复）
+
+=:extra= 是合法的手写入口，用户可以写 =:extra (("ports" ((...))))= ，导入层也会把不可表达端口 / tmpfs 卷放进同名桶。渲染时它们与显式字段 *同名* ，因此 =ebasecamp-compose--service-body= 先取出这两个桶并从 =:extra= 其余键中剔除，再把序列拼成「简单项 + 复杂对象项」，只渲染一个键：
+
+下面 *摘录自同一份真实导出物* 的两个服务片段（D6 闭环：=web= 同时有 ="18096:80"= 与 ="127.0.0.1:19096:9090/udp"= ，=db= 同时有命名卷与 tmpfs）：
+
+#+begin_src yaml
+    ports:
+      - "18096:80"
+      -
+        host_ip: 127.0.0.1
+        mode: ingress
+        protocol: udp
+        published: "19096"
+        target: 9090
+    volumes:
+      - "ebasecamp-per-project-d6app-data:/var/lib"
+      -
+        target: /tmp
+        type: tmpfs
+#+end_src
+
+该导出物经 =docker compose -f <导出> config -q= 校验：退出码 0、stderr 空。
+
 ** 映射 vs 序列的判定（D5 收紧后）
 
 渲染器没有 YAML 类型信息，只有一个判据 =ebasecamp-compose--mapping-p= ：
@@ -238,7 +264,7 @@ compose 的 =env_file= 合法形态是「字符串 / 字符串列表 / ={path, r
 
 3. 若判据放宽到只看 =(consp (car value))= ，上述载荷会被当映射展开，产出 =(host_ip . 127.0.0.1):= 这类垃圾键、=config -q= 报 =services.<x>.ports must be a array= （tech-debt #21，D5 已修）。因此 *清单里 alist 的键必须全是字符串* ；塞 keyword plist 进 =:extra= 会让判据失效。
 
-*已知副作用* ：=:extra= 的 ="ports"= / ="volumes"= 桶与 =:ports= / =:volumes= 字段 *同时非空* 时，服务体里会出现两个同名键，YAML 解析器直接拒绝（实测 =mapping key "ports" already defined= ，退出码 1）。见「已知限制」。
+*已知副作用（已修复，D6 / tech-debt #23）* ：=:extra= 的 ="ports"= / ="volumes"= 桶与 =:ports= / =:volumes= 字段 *同时非空* 时，旧实现会在服务体里写出两个同名键，YAML 解析器直接拒绝（实测 =mapping key "ports" already defined= ，退出码 1）。现在这两个桶与显式字段 *合并为单一序列* 后只渲染一个键（见本节末「混合项合并」），其余 =:extra= 键照旧展开。
 
 ** flow 序列 vs block 序列
 
@@ -288,7 +314,7 @@ compose 的 =env_file= 合法形态是「字符串 / 字符串列表 / ={path, r
 | =env_file= 对象形态的 =required= / =format= 在导入时丢弃（只留 =path= ） | 需要 =required: false= （文件缺失不报错）或 =format: raw= 的 compose，往返后语义回到默认值 | tech-debt #22（未修） |
 | =:extra= 原样透传，不做 schema 校验 | 清单里写非法 compose 字段（如 =description= ）会让生成的 =config -q= 失败；错误指向生成物而非清单 | tech-debt #8 |
 | 端口只表达「tcp + 绑定全部接口 + 有 published」 | udp、端口区间、特定宿主 IP 的端口只能经 =:extra= 透传，界面里也看不到这些端口 | tech-debt #21 遗留 |
-| *同一服务同时有可表达端口与不可表达端口* （或 bind 卷与 tmpfs 卷）时渲染出 *重复的服务键* | =:ports= 与非空的 =:extra= ="ports"= 桶各写一个 =ports:= 行，compose 解析即失败（实测 =mapping key "ports" already defined= ，退出码 1）；只含其中一种时正常 | 未记录，属待开条目 |
+| *同一服务同时有可表达端口与不可表达端口* （或 bind 卷与 tmpfs 卷）时曾渲染出 *重复的服务键* | *已修复（D6）* ：=:extra= 的同名桶与显式 =:ports= / =:volumes= 合并为单一序列，只渲染一个键（=docker compose config -q= 退出码 0 实测）；只含其中一种时行为不变 | tech-debt #23（已修） |
 | =healthcheck= 只保留五项 | 其他子字段（如 =start_interval= ）往返后丢失 | tech-debt #3 |
 | 导出物 *带* =ebasecamp.*= 标签 | 这是 *不变量 2 的正确行为* ：部署机上用 =docker ps --filter label=ebasecamp.managed=true= 仍能识别容器；不是缺陷 | AGENTS.md 不变量 2 |
 | 导出物 *不可迁移* | =env_file= 与 bind 卷的相对路径按 *导出文件所在目录* 解析；把 =:export-file= 指到项目根之外，导出物里的 =./db.env= 必然找不到，校验阶段就会被拦（=env file … not found=） | 由 compose 语义决定，无计划 |

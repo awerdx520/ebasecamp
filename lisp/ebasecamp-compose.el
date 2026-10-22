@@ -359,22 +359,42 @@ ALLOWED 非 nil 时只保留其成员：按 scope 渲染时生成物只含本次
 CONTEXT 为 plist，提供 :project、:group、:scope、:shared-network；
 VOLUME-ENTRIES 为 `ebasecamp-compose--volume-entries' 的结果。
 ALLOWED-DEPENDS 为 nil 时保留全部 depends-on；非 nil 时只保留其中的名字
-（见 `ebasecamp-compose--filtered-depends-on'），剔除后为空则不输出该键。"
-  (let ((lines nil)
-        (pad (make-string 4 ?\s))
-        (nested 6)
-        (image (ebasecamp-service-image service))
-        (entrypoint (ebasecamp-service-entrypoint service))
-        (command (ebasecamp-service-command service))
-        (scalars (list (cons "working_dir" (ebasecamp-service-working-dir service))
-                       (cons "user" (ebasecamp-service-user service))
-                       (cons "restart" (ebasecamp-service-restart service))))
-        (environment (ebasecamp-service-environment service))
-        (ports (ebasecamp-service-ports service))
-        (depends-on (ebasecamp-compose--filtered-depends-on
-                     (ebasecamp-service-depends-on service) allowed-depends))
-        (healthcheck (ebasecamp-service-healthcheck service))
-        (extra (ebasecamp-service-extra service)))
+（见 `ebasecamp-compose--filtered-depends-on'），剔除后为空则不输出该键。
+
+`:extra' 里的 \"ports\" / \"volumes\" 桶与显式 `:ports' / `:volumes' 字段
+同名：二者必须合并成 *单一* 序列（简单项在前、复杂对象项在后）后只渲染一个
+键，否则 YAML 会同时出现两个同名键、解析器直接拒绝（`mapping key \"ports\"
+already defined'，tech-debt #23 / D6）。合并只影响这两个键，其余 `:extra`
+键照旧在服务体末尾展开。"
+  (let* ((lines nil)
+         (pad (make-string 4 ?\s))
+         (nested 6)
+         (image (ebasecamp-service-image service))
+         (entrypoint (ebasecamp-service-entrypoint service))
+         (command (ebasecamp-service-command service))
+         (scalars (list (cons "working_dir" (ebasecamp-service-working-dir service))
+                        (cons "user" (ebasecamp-service-user service))
+                        (cons "restart" (ebasecamp-service-restart service))))
+         (environment (ebasecamp-service-environment service))
+         (ports (ebasecamp-service-ports service))
+         (depends-on (ebasecamp-compose--filtered-depends-on
+                      (ebasecamp-service-depends-on service) allowed-depends))
+         (healthcheck (ebasecamp-service-healthcheck service))
+         (extra (ebasecamp-service-extra service))
+         ;; `:extra' 的同名桶（原始对象列表）与其余键分开处理
+         (extra-ports (cdr (assoc "ports" extra)))
+         (extra-volumes (cdr (assoc "volumes" extra)))
+         (rest-extra (cl-remove-if
+                      (lambda (pair)
+                        (member (car pair) '("ports" "volumes")))
+                      extra))
+         ;; 简单项（字符串）在前，复杂对象项（alist）在后
+         (merged-ports (append (mapcar (lambda (pair)
+                                         (format "%d:%d" (car pair) (cdr pair)))
+                                       ports)
+                               extra-ports))
+         (merged-volumes (append (mapcar #'cdr volume-entries)
+                                 extra-volumes)))
     ;; 镜像引用属已知安全值，按原样裸写
     (push (concat pad "image: " image) lines)
     (dolist (pair (list (cons "entrypoint" entrypoint)
@@ -399,19 +419,13 @@ ALLOWED-DEPENDS 为 nil 时保留全部 depends-on；非 nil 时只保留其中�
                    (ebasecamp-compose--service-labels service context)
                    nested))
           lines)
-    (when ports
+    (when merged-ports
       (push (concat pad "ports:\n"
-                    (ebasecamp-compose--yaml-sequence
-                     (mapcar (lambda (pair)
-                               (format "%d:%d" (car pair) (cdr pair)))
-                             ports)
-                     nested))
+                    (ebasecamp-compose--yaml-sequence merged-ports nested))
             lines))
-    (when volume-entries
+    (when merged-volumes
       (push (concat pad "volumes:\n"
-                    (ebasecamp-compose--yaml-sequence
-                     (mapcar #'cdr volume-entries)
-                     nested))
+                    (ebasecamp-compose--yaml-sequence merged-volumes nested))
             lines))
     (let ((networks (ebasecamp-compose--service-networks service context)))
       (when networks
@@ -426,8 +440,8 @@ ALLOWED-DEPENDS 为 nil 时保留全部 depends-on；非 nil 时只保留其中�
       (push (concat pad "healthcheck:\n"
                     (ebasecamp-compose--healthcheck-body healthcheck nested))
             lines))
-    (when extra
-      (push (ebasecamp-compose--yaml-map extra 4) lines))
+    (when rest-extra
+      (push (ebasecamp-compose--yaml-map rest-extra 4) lines))
     (mapconcat #'identity (nreverse lines) "\n")))
 
 ;;; 段组装

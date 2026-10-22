@@ -480,4 +480,90 @@ mysql 属 shared 组而 api、migrate 属 per-project 组，两批落在不同 c
       (should-not (string-match-p "(host_ip" yaml))
       (should-not (string-match-p "127\\.0\\.0\\.1):" yaml)))))
 
+;;; 16. 同名桶合并（tech-debt #23 / D6）
+
+(defun ebasecamp-compose-test--line-count (line text)
+  "返回 TEXT 中与 LINE 完全相同的行数（按行精确比较，避免子串误计）。"
+  (let ((count 0))
+    (dolist (candidate (split-string text "\n"))
+      (when (equal line candidate)
+        (setq count (1+ count))))
+    count))
+
+(defun ebasecamp-compose-test--mixed-ports-and-volumes ()
+  "构造「可表达 + 不可表达」端口与卷并存的项目，返回项目对象。
+端口与卷对象取自导入层真实形态（D3 实测）：不可表达项以原始对象列表落在
+服务 `:extra' 的 \"ports\" / \"volumes\" 桶里；另带一个无关 `:extra' 键
+`shm_size' 用于验证其余键照旧展开。"
+  (ebasecamp-define-group web
+    :services
+    ((web :image "nginx:1.27"
+          :ports ((8080 . 80))
+          :volumes ((:source "./src" :target "/app/src" :type bind))
+          :extra (("shm_size" . "128m")
+                  ;; 可表达 8080:80 之外的 udp 端口对象
+                  ("ports" (("host_ip" . "127.0.0.1")
+                            ("mode" . "ingress")
+                            ("protocol" . "udp")
+                            ("published" . "9090")
+                            ("target" . 9090)))
+                  ;; bind 卷之外的 tmpfs 卷对象
+                  ("volumes" (("type" . "tmpfs")
+                              ("target" . "/tmp")))))))
+  (ebasecamp-define-project site :root "/tmp/ebc-site" :groups ((web)))
+  (ebasecamp-model-project 'site))
+
+(ert-deftest ebasecamp-compose-test-renders-single-ports-key-when-mixed ()
+  "显式 `:ports' 与 `:extra' 的 ports 桶并存时只渲染一个 ports 键。
+简单项（\"8080:80\" 字符串）在前、复杂对象项（alist）在后，各自形状完整。"
+  (ebasecamp-compose-test--clean
+    (let* ((project (ebasecamp-compose-test--mixed-ports-and-volumes))
+           (yaml (ebasecamp-compose-render project)))
+      (should (= 1 (ebasecamp-compose-test--line-count "    ports:" yaml)))
+      (should (string-match-p
+               (concat "    ports:\n"
+                       "      - \"8080:80\"\n"
+                       "      -\\s-*\n"
+                       "        host_ip: 127\\.0\\.0\\.1\n"
+                       "        mode: ingress\n"
+                       "        protocol: udp\n"
+                       "        published: \"9090\"\n"
+                       "        target: 9090\n")
+               yaml))
+      ;; 不得再出现把 alist 当键展开的垃圾键
+      (should-not (string-match-p "(host_ip" yaml)))))
+
+(ert-deftest ebasecamp-compose-test-renders-single-volumes-key-when-mixed ()
+  "bind 卷与 `:extra' 的 tmpfs 卷并存时只渲染一个 volumes 键，两项都在。"
+  (ebasecamp-compose-test--clean
+    (let* ((project (ebasecamp-compose-test--mixed-ports-and-volumes))
+           (yaml (ebasecamp-compose-render project)))
+      (should (= 1 (ebasecamp-compose-test--line-count "    volumes:" yaml)))
+      (should (string-match-p
+               (concat "    volumes:\n"
+                       "      - \"./src:/app/src\"\n"
+                       "      -\\s-*\n"
+                       "        type: tmpfs\n"
+                       "        target: /tmp\n")
+               yaml))
+      ;; 顶层 volumes 段只声明命名卷：本清单无命名卷，故不该出现
+      (should (= 0 (ebasecamp-compose-test--line-count "volumes:" yaml))))))
+
+(ert-deftest ebasecamp-compose-test-extra-without-ports-volumes-unchanged ()
+  "其余 `:extra' 键照旧渲染，位置仍为服务体末尾。"
+  (ebasecamp-compose-test--clean
+    (let* ((project (ebasecamp-compose-test--mixed-ports-and-volumes))
+           (yaml (ebasecamp-compose-render project)))
+      (should (= 1 (ebasecamp-compose-test--line-count "    shm_size: 128m" yaml)))
+      ;; 服务体最后一行仍是 extra 展开出来的 shm_size（其后即顶层 networks 段）
+      (should (string-match-p "    shm_size: 128m\nnetworks:" yaml)))))
+
+(ert-deftest ebasecamp-compose-test-no-ports-no-volumes-still-omits-keys ()
+  "既无显式端口/卷、也无同名 extra 桶时不渲染 ports / volumes 键。"
+  (ebasecamp-compose-test--clean
+    (let* ((project (ebasecamp-compose-test--no-network))
+           (yaml (ebasecamp-compose-render project)))
+      (should (= 0 (ebasecamp-compose-test--line-count "    ports:" yaml)))
+      (should (= 0 (ebasecamp-compose-test--line-count "    volumes:" yaml))))))
+
 ;;; ebasecamp-compose-tests.el ends here

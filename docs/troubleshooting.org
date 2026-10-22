@@ -265,7 +265,7 @@ docker compose -f ~/.cache/ebasecamp/<project>/compose.yaml config | head -40
 |-------------+-------------|
 | =services.X.env_file must be a string= | 清单里 =env_file= 存成了 plist 形态 → 见第 7 条 |
 | =services.X.ports must be a array= | =:extra= 里的端口对象被当成映射渲染（tech-debt #21，D5 已修；若复现说明清单里塞了 keyword plist） |
-| =mapping key "ports" already defined= / =… "volumes" already defined= | 同一服务 *同时* 有可表达字段与非空 =:extra= 桶（如既有 =:ports= 又有绑定宿主 IP 的端口，或既有 bind 卷又有 tmpfs）：渲染出两个同名键，YAML 解析直接失败。现状无解 —— 改清单让该服务只保留一种形态（把不可表达端口挪到别的服务/别的组），或先记 issue |
+| =mapping key "ports" already defined= / =… "volumes" already defined= | *已修复（D6）* ：=:extra= 的同名桶与显式 =:ports= / =:volumes= 已合并为单一序列。若再见，说明清单里 *同时* 有重复来源 —— 检查该服务是否既写了 =:ports= / =:volumes= 又在 =:extra= 里手写了 ="ports"= / ="volumes"= （正常渲染不会再产出重复键；旧版插件生成的清单无此问题） |
 | =service "X" refers to undefined network Y= | 服务引用了未声明网络；渲染器本会声明，说明 =:extra= 里手写了网络的错形态 |
 | =undefined volume= / =undefined service= | 命名卷或 =depends_on= 指向不存在对象（多来自 =:extra= 透传） |
 | =env file … not found= | =env_file= 相对路径按 *compose 文件所在目录* 解析，文件不在那里 |
