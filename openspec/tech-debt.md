@@ -9,3 +9,5 @@
 | 5 | `docker ps --format '{{json .}}'` 默认截断长字段、`Labels` 为逗号串 | 解析易丢关键标签 | 强制 `--no-trunc`；labels 按 `ebasecamp.*` / `com.docker.compose.*` 已知前缀解析 |
 | 6 | `--no-interpolate` 输出的模型比常规 `config` 缺省更多字段（实测无 `command: null`、`entrypoint: null`、`ipam: {}`），且 `env_file` 条目形态随参数变化（无 `--no-interpolate` 时仅 `path`，有时含 `required: true`） | 导入解析若把「字段缺失 / 形态差异」当语义差异会误判 | 导入层按「字段可缺省、`env_file` 按路径列表归一」实现；ERT 用实测输出作 fixture |
 | 7 | 清单加载失败时用「reset + 重放已成功文件」回滚（O(n²) 次 load） | 清单文件多时首次加载变慢 | 规模超过 ~50 文件前评估在 model 层补 snapshot/restore |
+| 8 | `extra` 字段原样透传到 compose，清单层不校验键名 | 非法 compose 字段会导致 `config -q` 失败（实测 `services.x.description` 非 schema） | 在 `docs/user-guide.org` 明确「extra 只放合法 compose 字段」；M4 可加字段白名单校验 |
+| 9 | 自定义网络的 external 语义无法表达；跨组同名服务静默保留首个 | 用户无法引用已存在的外部网络；同名服务不会报错而是被静默丢弃 | M4 在 model 层加 `:external` 标记与服务名冲突校验 |
