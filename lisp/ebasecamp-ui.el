@@ -498,11 +498,6 @@ SOFT 是其余（如 `unknown'，只提示）。纯函数。"
         (format "%s/%s" (nth 1 parts) (nth 2 parts))
       key)))
 
-(defun ebasecamp-ui--command-keys (keys)
-  "把界面选中 key 列表 KEYS 转成命令层 key 列表（逐项 `ebasecamp-ui--command-key'）。
-纯函数。"
-  (mapcar #'ebasecamp-ui--command-key keys))
-
 ;;; 树项 / 列
 
 (defun ebasecamp-ui--ratio-label (running total)
