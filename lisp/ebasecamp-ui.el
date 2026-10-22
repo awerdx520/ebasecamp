@@ -7,57 +7,61 @@
 
 ;;; Commentary:
 
-;; 主界面：在一个 etaf 缓冲区里展示「项目 → 组 → 服务」三层的只读视图。
+;; 主界面（**组为中心的骨架**，C0）：在一个 etaf 缓冲区里展示「组 → 配置」
+;; 两级的只读视图。组来自清单（`ebasecamp-model-groups'），因此**不依赖**
+;; 项目是否存在；配置来自组的 configs 槽（`ebasecamp-model-group-configs'）。
 ;;
 ;; 布局（一个 Host 树）：
 ;;
 ;;   根 column
-;;   ├─ row（顶栏）: etaf-tabs（项目）+ etaf-button（刷新）
+;;   ├─ row（顶栏）: etaf-label "ebasecamp" + 统计 label + etaf-button "刷新"
 ;;   ├─ etaf-divider
-;;   ├─ row（主体）
-;;   │  ├─ box → etaf-tree（当前项目的组，扁平结构，叶子即组）
-;;   │  └─ box → etaf-data-grid（服务表：服务 / 镜像 / 状态 / 端口 / 健康）
-;;   ├─ etaf-divider
-;;   ├─ row（操作条）: 启动选中 / 停止选中 / 重启选中 / 销毁环境
-;;   │                 （下一行）导入 compose / 导出 compose
-;;   ├─ etaf-alert（notice；无提示时退化为一行 etaf-label 操作提示）
-;;   └─ etaf-dialog（销毁环境确认；`:open' 绑在会话的 confirm ref 上）
+;;   ├─ etaf-splitter（horizontal，ratio 0.32）
+;;   │  ├─ slot first  → etaf-tree（组 → 配置 两级）
+;;   │  └─ slot second → column（占位："选择左侧的组"）
+;;   └─ etaf-divider
 ;;
-;; 清单为空时整棵树替换为 `etaf-empty'；当前项目无组时表格显示
-;; `:empty-label'。
+;; 无任何组时整棵树替换为 `etaf-empty'（引导用户去
+;; `ebasecamp-config-directory' 定义清单）。
 ;;
 ;; 状态与生命周期：
 ;;
-;; - 会话对象（`ebasecamp-ui-session'）持有 Data controller 与若干 `etaf-ref'：
-;;   当前项目（`project-ref'）、选中 key 列表（`selected-ref'）、生命周期命令
-;;   执行中标记（`busy'）、操作提示（`notice'，值为 nil 或
+;; - 会话对象（`ebasecamp-ui-session'）持有若干 `etaf-ref'：
+;;   渲染数据（`state'，见 `ebasecamp-ui--build-state'）、选中的组名
+;;   （`selected-group'，symbol 或 nil）、树的展开 key 列表（`expanded'）、
+;;   生命周期命令执行中标记（`busy'，C4 用）、操作提示（`notice'，值为 nil 或
 ;;   `(:kind error|warning|success|info :title STR :message STR :detail STR-or-nil)'）、
-;;   销毁确认框开关（`confirm'），以及提示自动清除定时器（`notice-timer'）。
-;;   会话在 `ebasecamp-ui-open' 中创建，`ebasecamp-ui-close' 中销毁；
-;; - 提示的呈现：notice 非 nil 时渲染 `etaf-alert'（`:variant' 由 `:kind' 映射、
-;;   `:dismissible' 的关闭按钮清空 notice），`:detail' 以换行拼接进 message；
+;;   销毁确认框开关（`confirm'，C5 用）、待确认动作（`confirm-action'），以及
+;;   提示自动清除定时器（`notice-timer'）。会话在 `ebasecamp-ui-open' 中创建，
+;;   `ebasecamp-ui-close' 中销毁；
+;; - 渲染数据是**单一 plist**：`ebasecamp-ui-refresh' 重新采集状态、重建
+;;   state 并写回 ref，视图只需读 ref 就整体重渲染（不需要 render-tick）；
+;; - `etaf-on-mounted' → `ebasecamp-status-start'，回调里调
+;;   `ebasecamp-ui-refresh'（传入 `ebasecamp-status-last-records'，避免轮询
+;;   一次刷新跑两次 `docker ps'）；
+;; - `etaf-on-unmounted' → `ebasecamp-status-stop' + 取消提示定时器；
+;; - 树的选择：`:on-select' 把组名写进 `selected-group'，`:on-toggle' 把新的
+;;   key 列表写进 `expanded'（展开状态由会话持有，重渲染后保持）；
+;; - 提示的呈现：`ebasecamp-ui--notice-view' 把 notice 渲染成 `etaf-alert'
+;;   （`:detail' 以换行拼接进 message，`:dismissible' 的关闭按钮清空 notice）；
 ;;   成功 / 信息类提示在 `ebasecamp-ui-notice-timeout' 秒后自动清除，定时器
 ;;   存进会话，`ebasecamp-ui-close' 与写新 notice 时都会先取消它（防泄漏）。
 ;;   这里不用 `etaf-toast'：其实测要求 `:anchor' 必填（必须是带 `:id' 的
 ;;   Host），且 batch 下只画出标题、正文不可见，无法覆盖需要展示 stderr 的
 ;;   场景；
-;; - `etaf-on-mounted' → `ebasecamp-status-start'，回调里**只**调
-;;   `etaf-data-load'（不调 `ebasecamp-data-refresh'，否则一次刷新会跑两次
-;;   `docker ps'）；
-;; - `etaf-on-unmounted' → `ebasecamp-status-stop' + `etaf-data-stop'；
-;; - 项目切换：写 `project-ref'，再 `etaf-data-set-query' + `etaf-data-load'；
 ;; - 勾选服务只维护状态（`selected-ref'），操作条经 `ebasecamp-ui-selected-keys'
-;;   消费它，经 `ebasecamp-ui-run-action' 派发到命令层；
+;;   消费它，经 `ebasecamp-ui-run-action' 派发到命令层（本轮的骨架**不渲染**
+;;   操作条、notice、确认框：底栏与段内派发留到 C5，届时 selected-ref 会被
+;;   按配置 / 服务的选择模型替换）；
 ;; - `busy' 为真时操作条全部 `:disabled'，`ebasecamp-ui-run-action' 也直接
 ;;   拒绝（双保险：UI 不渲染可点按钮，函数层不被误调）。
 ;;
-;; 渲染期读 ref（`etaf-value'）会建立渲染依赖：写 ref 即可让按钮的
-;; `:disabled'、notice 文案、确认框开关同步更新，因此**不需要**额外的
-;; render-tick 机制。注意 `etaf-button' 的 `:disabled' 只接受布尔值（传 ref
+;; 渲染期读 ref（`etaf-value'）会建立渲染依赖：写 ref 即可让统计文案、树项、
+;; 展开状态同步更新。注意 `etaf-button' 的 `:disabled' 只接受布尔值（传 ref
 ;; 对象会 signal `etaf-renderer-error'），必须在渲染时读取其值。
 ;;
-;; 数据来源：`ebasecamp-data-project-records' 给出「清单 ∪ 状态」记录，
-;; 因此清单里有定义但未启动的服务也会出现在表里（state 为 "stopped"）。
+;; 本轮**不做** running / total 统计（C2 / C3）：state 里只有静态清单信息，
+;; 采集到的状态记录留在 `ebasecamp-status-last-records' 供后续批次消费。
 ;;
 ;; 本模块不拼任何 docker 命令（那是 `ebasecamp-docker' / `ebasecamp-command'
 ;; 的职责），只消费 `ebasecamp-status'、`ebasecamp-data' 与
@@ -82,25 +86,25 @@
   :type 'string
   :group 'ebasecamp)
 
-(defcustom ebasecamp-ui-group-pane-width (quote (ch 20))
-  "组列表面板的宽度（etaf 长度表达式）。"
-  :type 'sexp
-  :group 'ebasecamp)
-
 (defcustom ebasecamp-ui-notice-timeout 3
   "成功 / 信息类提示自动清除的秒数。
 错误类提示不自动清除（需要用户阅读 stderr），只能手动关闭。"
   :type 'number
   :group 'ebasecamp)
 
+(defconst ebasecamp-ui--split-ratio 0.32
+  "左侧组树的宽度占比（`etaf-splitter' 的 `:ratio'）。")
+
 ;;; 会话
 
 (cl-defstruct (ebasecamp-ui-session (:constructor ebasecamp-ui--session-create))
   "一次界面会话的可变状态。
-CONTROLLER 为 Data controller；PROJECT-REF / SELECTED-REF / BUSY / NOTICE /
-CONFIRM 均为 `etaf-ref'；CONFIRM-ACTION 为等待确认的动作 symbol（无则 nil）；
-NOTICE-TIMER 为临时的提示自动清除定时器（无则 nil，必须随会话一起取消）。"
-  controller project-ref selected-ref busy notice confirm confirm-action
+STATE 为整棵树的渲染数据（plist，见 `ebasecamp-ui--build-state'）；
+SELECTED-GROUP 为当前选中的组名（symbol 或 nil）；EXPANDED 为 `etaf-tree'
+的展开 key 列表；SELECTED-REF / BUSY / NOTICE / CONFIRM 均为 `etaf-ref'；
+CONFIRM-ACTION 为等待确认的动作 symbol（无则 nil）；NOTICE-TIMER 为临时的
+提示自动清除定时器（无则 nil，必须随会话一起取消）。"
+  state selected-group expanded selected-ref busy notice confirm confirm-action
   notice-timer)
 
 (defvar ebasecamp-ui--session nil
@@ -121,22 +125,24 @@ NOTICE-TIMER 为临时的提示自动清除定时器（无则 nil，必须随会
        (message "ebasecamp: 加载清单失败：%S" err))))
   nil)
 
+(defun ebasecamp-ui--default-expanded ()
+  "返回默认展开的树 key 列表：清单里的全部组（默认全部展开）。"
+  (mapcar (lambda (group)
+            (ebasecamp-ui--group-key (symbol-name (ebasecamp-group-name group))))
+          (ebasecamp-model-groups)))
+
 (defun ebasecamp-ui--new-session ()
-  "创建并返回新的界面会话（controller + 项目 / 选中 / busy / notice / confirm ref）。"
-  (let* ((projects (mapcar #'ebasecamp-project-name
-                           (ebasecamp-model-projects)))
-         (controller (ebasecamp-data-controller))
-         (project (car projects)))
-    (when project
-      (etaf-data-set-query controller (symbol-name project)))
-    (ebasecamp-ui--session-create
-     :controller controller
-     :project-ref (etaf-ref project :name 'ebasecamp-ui-project)
-     :selected-ref (etaf-ref nil :name 'ebasecamp-ui-selected)
-     :busy (etaf-ref nil :name 'ebasecamp-ui-busy)
-     :notice (etaf-ref nil :name 'ebasecamp-ui-notice)
-     :confirm (etaf-ref nil :name 'ebasecamp-ui-confirm)
-     :confirm-action nil)))
+  "创建并返回新的界面会话（state / selected-group / expanded 及各 ref）。"
+  (ebasecamp-ui--session-create
+   :state (etaf-ref (ebasecamp-ui--build-state) :name 'ebasecamp-ui-state)
+   :selected-group (etaf-ref nil :name 'ebasecamp-ui-selected-group)
+   :expanded (etaf-ref (ebasecamp-ui--default-expanded)
+                       :name 'ebasecamp-ui-expanded)
+   :selected-ref (etaf-ref nil :name 'ebasecamp-ui-selected)
+   :busy (etaf-ref nil :name 'ebasecamp-ui-busy)
+   :notice (etaf-ref nil :name 'ebasecamp-ui-notice)
+   :confirm (etaf-ref nil :name 'ebasecamp-ui-confirm)
+   :confirm-action nil))
 
 (defun ebasecamp-ui-session ()
   "返回当前会话；不存在时创建。
@@ -144,6 +150,56 @@ NOTICE-TIMER 为临时的提示自动清除定时器（无则 nil，必须随会
 `ebasecamp-ui-refresh' 在 buffer 已被外部 kill 后仍可用。"
   (or ebasecamp-ui--session
       (setq ebasecamp-ui--session (ebasecamp-ui--new-session))))
+
+;;; 渲染数据（state）
+
+(defun ebasecamp-ui--config-state (group config)
+  "把 GROUP 的一份配置 CONFIG（(NAME . PLIST)）转成 state 的配置项 plist。
+字段：`:name' 配置名、`:project' 项目名、`:project-title' 项目标题（项目未
+定义时为 nil）、`:scope' 组 scope（配置的 scope 恒等于组定义，D9）。纯函数。"
+  (let* ((project-name (ebasecamp-model-config-project (cdr config)))
+         (project (and project-name (ebasecamp-model-project project-name))))
+    (list :name (symbol-name (car config))
+          :project (and project-name (symbol-name project-name))
+          :project-title (and project (ebasecamp-project-title project))
+          :scope (symbol-name (ebasecamp-group-scope group)))))
+
+(defun ebasecamp-ui--group-state (group)
+  "把组对象 GROUP 转成 state 的组项 plist。
+字段：`:name' 组名、`:title' 组标题、`:scope' scope、`:config-count' 配置
+份数、`:configs' 配置项列表（见 `ebasecamp-ui--config-state'）。纯函数。"
+  (let ((configs (ebasecamp-model-group-configs group)))
+    (list :name (symbol-name (ebasecamp-group-name group))
+          :title (ebasecamp-group-title group)
+          :scope (symbol-name (ebasecamp-group-scope group))
+          :config-count (length configs)
+          :configs (mapcar (lambda (config)
+                             (ebasecamp-ui--config-state group config))
+                           configs))))
+
+(defun ebasecamp-ui--build-state (&optional selected-group)
+  "构建整棵树的渲染数据（plist）。纯函数（只读模型注册表）。
+SELECTED-GROUP 为选中组名（symbol 或 nil），写进 `:selected'（字符串）。
+结构：
+  (:summary \"3 组 · 5 配置\"
+   :groups ((:name \"mysql\" :title \"MySQL\" :scope \"per-project\"
+             :config-count 2
+             :configs ((:name \"dev\" :project \"myapp\"
+                        :project-title \"示例项目\" :scope \"per-project\")
+                       …))
+            …)
+   :selected \"mysql\" :empty-p nil)
+组来自 `ebasecamp-model-groups'（**不依赖**项目是否存在）；配置来自
+`ebasecamp-model-group-configs'。无任何组时 `:empty-p' 为 t，视图显示引导
+空态。不含 running / total 统计（C2 / C3 才引入状态数据）。"
+  (let* ((groups (mapcar #'ebasecamp-ui--group-state (ebasecamp-model-groups)))
+         (configs (apply #'+ 0 (mapcar (lambda (group)
+                                         (plist-get group :config-count))
+                                       groups))))
+    (list :summary (format "%d 组 · %d 配置" (length groups) configs)
+          :groups groups
+          :selected (and selected-group (symbol-name selected-group))
+          :empty-p (null groups))))
 
 ;;; 状态与文案映射
 
@@ -225,9 +281,21 @@ nil → \"-\"；healthy → OK；unhealthy → BAD；starting → STARTING；其
           (etaf-value (ebasecamp-ui-session-selected-ref session))))))
 
 (defun ebasecamp-ui-current-project ()
-  "返回当前项目名（symbol）；无项目或未打开界面时返回 nil。"
-  (let ((session ebasecamp-ui--session))
-    (and session (etaf-value (ebasecamp-ui-session-project-ref session)))))
+  "返回当前「项目」名（symbol）；无法判定时返回 nil。
+组为中心的骨架没有「当前项目」概念，本函数仅作为**导入 / 导出入口的兼容层**
+保留（`ebasecamp-ui-import-compose' / `ebasecamp-ui-export-compose' 本轮不动，
+C5 会改为按选中组 / 配置显式选择目标）：
+1. 会话不存在时返回 nil；
+2. 否则优先取选中组首份配置的 `:project'（组内没有配置时跳过）；
+3. 仍无结果时回退到清单里的第一个项目（等价于旧实现「默认第一个项目」）。"
+  (when-let* ((session ebasecamp-ui--session))
+    (let* ((selected (etaf-value (ebasecamp-ui-session-selected-group session)))
+           (configs (and selected
+                         (ebasecamp-model-group selected)
+                         (ebasecamp-model-group-configs selected))))
+      (or (and configs (ebasecamp-model-config-project (cdr (car configs))))
+          (let ((projects (ebasecamp-model-projects)))
+            (and projects (ebasecamp-project-name (car projects))))))))
 
 ;;; 操作提示（notice）
 
@@ -370,51 +438,55 @@ SOFT 是其余（如 `unknown'，只提示）。纯函数。"
 纯函数。"
   (mapcar #'ebasecamp-ui--command-key keys))
 
-;;; 项目 / 组 / 列
+;;; 树项 / 列
 
-(defun ebasecamp-ui--tab-items (projects)
-  "把项目对象列表 PROJECTS 转成 `etaf-tabs' 的 :items。
-key 与 label 都用项目名，保证唯一。"
-  (mapcar (lambda (project)
-            (let ((name (symbol-name (ebasecamp-project-name project))))
-              (list :key (ebasecamp-project-name project) :label name)))
-          projects))
+(defun ebasecamp-ui--group-caption (group)
+  "返回组项的显示文案：标题 + 配置份数（如 \"mysql  (2)\"）。纯函数。
+GROUP 为 state 的组项 plist。"
+  (format "%s  (%d)" (plist-get group :title)
+          (plist-get group :config-count)))
 
-(defun ebasecamp-ui--project-running (aggregates group-name)
-  "从聚合项 AGGREGATES 中取 GROUP-NAME 的 running 数（无则 0）。"
-  (let ((entry (cl-find group-name aggregates
-                        :key (lambda (item)
-                               (ebasecamp-data--name-string
-                                (plist-get item :group)))
-                        :test #'equal)))
-    (or (and entry (plist-get entry :running)) 0)))
+(defun ebasecamp-ui--config-caption (config)
+  "返回配置项的显示文案：配置名 + 关联项目（如 \"dev  → 示例项目\"）。纯函数。
+CONFIG 为 state 的配置项 plist；项目标题缺失时回退到项目名。"
+  (format "%s  → %s" (plist-get config :name)
+          (or (plist-get config :project-title)
+              (plist-get config :project)
+              "")))
 
-(defun ebasecamp-ui--group-items (project-name records)
-  "返回 PROJECT-NAME 的分组树项（扁平结构，叶子即组）。
-RECORDS 为该项目当前的服务记录（`ebasecamp-data' 的「清单 ∪ 状态」），
-running 数来自 `ebasecamp-status-aggregate'，total 数来自清单（清单是唯一
-事实源）。无项目时返回 nil。"
-  (when-let* ((project (and project-name
-                            (ebasecamp-model-project project-name))))
-    (let* ((name (ebasecamp-data--name-string project-name))
-           (aggregates (ebasecamp-status-aggregate
-                        (cl-remove-if-not
-                         (lambda (record)
-                           (equal (ebasecamp-data--name-string
-                                   (plist-get record :project))
-                                  name))
-                         records)))
-           (items nil))
-      (dolist (group-ref (ebasecamp-project-groups project))
-        (let* ((group-name (ebasecamp-data--name-string
-                            (plist-get group-ref :group)))
-               (total (length (ebasecamp-model-resolve-services
-                               project group-ref)))
-               (running (ebasecamp-ui--project-running aggregates group-name)))
-          (push (list :key group-name
-                      :label (format "%s  (%d/%d)" group-name running total))
-                items)))
-      (nreverse items))))
+(defun ebasecamp-ui--group-key (group-name)
+  "返回组节点的树 key（字符串 \"group/组名\"）。
+`etaf-tree' 要求全局唯一的**标量** key，因此组与配置用不同前缀区分。纯函数。"
+  (format "group/%s" group-name))
+
+(defun ebasecamp-ui--config-key (group-name config-name)
+  "返回配置节点的树 key（字符串 \"config/组名/配置名\"）。纯函数。"
+  (format "config/%s/%s" group-name config-name))
+
+(defun ebasecamp-ui--tree-key-group (key)
+  "把树 key KEY（\"group/GROUP\" 或 \"config/GROUP/CONFIG\"）归一为组名 symbol。
+无法判定时返回 nil。纯函数。"
+  (when (and (stringp key) (string-match-p "/" key))
+    (let ((name (nth 1 (split-string key "/"))))
+      (and name (not (string-empty-p name)) (intern name)))))
+
+(defun ebasecamp-ui--tree-items (state)
+  "把渲染数据 STATE 转成 `etaf-tree' 的 `:items'（组 → 配置 两级）。
+组项带 `:children'（该组的全部配置），配置是叶子。组名全来自清单，因此
+没有项目时也能列出。纯函数。"
+  (mapcar
+   (lambda (group)
+     (let ((group-name (plist-get group :name)))
+       (list :key (ebasecamp-ui--group-key group-name)
+             :label (ebasecamp-ui--group-caption group)
+             :children
+             (mapcar (lambda (config)
+                       (list :key (ebasecamp-ui--config-key
+                                   group-name
+                                   (plist-get config :name))
+                             :label (ebasecamp-ui--config-caption config)))
+                     (plist-get group :configs)))))
+   (plist-get state :groups)))
 
 (defun ebasecamp-ui--select-cell (session record)
   "选中列的单元格：checkbox 写回 SESSION 的选中列表。"
@@ -679,46 +751,66 @@ SESSION 的 busy 为真时按钮禁用（渲染期读 ref，写 ref 即触发重
         (etaf-button :label "确认销毁" :variant 'primary
                      :on-press (lambda () (ebasecamp-ui-confirm))))))))
 
-;;; 交互
+;;; 交互与视图（组为中心的骨架）
 
-(defun ebasecamp-ui--select-project (session key)
-  "把当前项目切到 KEY（项目名 symbol），清空选中项，并重载表格数据。
-选中 key 带项目前缀，跨项目残留会让命令层拿到不属于当前项目的 key（报
-「未引用组」），因此切换项目必须清空选中。"
-  (etaf-set-value (ebasecamp-ui-session-project-ref session) key)
-  (etaf-set-value (ebasecamp-ui-session-selected-ref session) nil)
-  (let ((controller (ebasecamp-ui-session-controller session)))
-    (etaf-data-set-query controller (symbol-name key))
-    (etaf-data-load controller)))
+(defun ebasecamp-ui--select-key (session key)
+  "把树节点的选择写进 SESSION：KEY 归一为所属组名，同时重建 state。
+配置节点的 key 是 \"config/组名/配置名\"，选中配置等同于选中它所属的组
+（段内（配置 / 服务）的选择留到 C5）。"
+  (let ((group (ebasecamp-ui--tree-key-group key)))
+    (etaf-set-value (ebasecamp-ui-session-selected-group session) group)
+    (etaf-set-value (ebasecamp-ui-session-state session)
+                    (ebasecamp-ui--build-state group))))
+
+(defun ebasecamp-ui--tree-view (session)
+  "返回左侧组树（组 → 配置 两级）。
+`:items' 取自会话的 state（渲染期读取，state 改写即重建树）；
+`:expanded' 绑会话的 expanded ref，`:on-toggle' 把新的 key 列表写回同一
+ref（展开状态由会话持有，重渲染后保持）；`:on-select' 写 selected-group。"
+  (etaf-view
+   (etaf-tree
+    :items (ebasecamp-ui--tree-items
+            (etaf-value (ebasecamp-ui-session-state session)))
+    :expanded (ebasecamp-ui-session-expanded session)
+    :on-toggle (lambda (next)
+                 (etaf-set-value (ebasecamp-ui-session-expanded session) next))
+    :on-select (lambda (key) (ebasecamp-ui--select-key session key)))))
+
+(defun ebasecamp-ui--detail-placeholder ()
+  "返回右侧面板的占位视图。段渲染（配置 / 服务 / 状态）留到 C1 / C2。"
+  (etaf-view
+   (column :width 'stretch :height 'stretch :cross-align 'start
+           :padding '((lh 1) (ch 2)) :item-gap '(lh 1)
+     (etaf-label :text "选择左侧的组" :variant 'muted))))
 
 (defun ebasecamp-ui-view ()
   "返回 ebasecamp 主界面的视图（`etaf-view' 规范化后的对象）。"
   (etaf-view (ebasecamp-ui-app)))
 
 (etaf-define-component ebasecamp-ui-app ()
-  "渲染 ebasecamp 只读主界面（顶栏 tabs + 刷新、组列表、服务表、底栏提示）。"
+  "渲染 ebasecamp 组为中心的骨架：顶栏（标题 + 统计 + 刷新）、组树、右侧占位。"
   :setup
   (let ((session (ebasecamp-ui-session)))
     (etaf-on-mounted
      (lambda ()
        (ebasecamp-status-start
         (lambda ()
-          (etaf-data-load (ebasecamp-ui-session-controller session))))))
+          ;; 轮询刚跑过 `docker ps'：把结果连同「已提供」标记传下去，
+          ;; 避免一次刷新采集两次（空表也算已采集）。
+          (ebasecamp-ui-refresh (ebasecamp-status-last-records) t)))))
     (etaf-on-unmounted
      (lambda ()
        (ebasecamp-status-stop)
-       (etaf-data-stop (ebasecamp-ui-session-controller session))))
+       (ebasecamp-ui--cancel-notice-timer session)))
     nil)
   :render
   (let* ((session (ebasecamp-ui-session))
-         (projects (ebasecamp-model-projects))
-         (current (ebasecamp-ui-current-project))
-         (controller (ebasecamp-ui-session-controller session))
-         ;; 读 items 使本组件成为 Data 的依赖：每次 load 后组列表的
-         ;; "(running/total)" 随之刷新（status 记录本身不是 reactive 源）。
-         (records (etaf-value (etaf-data-items controller)))
-         (groups (ebasecamp-ui--group-items current records)))
-    (if (null projects)
+         (state (etaf-value (ebasecamp-ui-session-state session))))
+    ;; 读 selected-group / expanded 建立渲染依赖：选择或展开变化即重渲染
+    ;; （树自身也读 expanded，这里显式读是为了让骨架整体对两者敏感）。
+    (etaf-value (ebasecamp-ui-session-selected-group session))
+    (etaf-value (ebasecamp-ui-session-expanded session))
+    (if (plist-get state :empty-p)
         (etaf-view
          (box :width 'stretch :padding '((lh 2) (px 3)) :bgcolor "#F8F5EE"
               (etaf-empty
@@ -731,32 +823,21 @@ SESSION 的 busy 为真时按钮禁用（渲染期读 ref，写 ref 即触发重
                :color "#252A2E" :padding '((lh 1) (px 2))
                :item-gap '(lh 1)
          (row :width 'stretch :cross-align 'center :item-gap '(ch 2)
-           (box :flex-grow 1
-             (etaf-tabs :items (ebasecamp-ui--tab-items projects)
-                        :active current
-                        :on-change (lambda (key)
-                                     (ebasecamp-ui--select-project session key))))
+           (etaf-label :text "ebasecamp" :variant 'strong)
+           (etaf-label :text (plist-get state :summary) :variant 'muted)
+           (box :flex-grow 1)
            (etaf-button :label "刷新" :variant 'secondary
                         :ref 'ebasecamp-ui-refresh
                         :on-press (lambda () (ebasecamp-ui-refresh))))
          (etaf-divider)
-         (row :width 'stretch :cross-align 'start :item-gap '(ch 2)
-           (box :width ebasecamp-ui-group-pane-width :flex-shrink 0
-             (etaf-tree :if groups
-                        :items groups
-                        :expanded nil))
-           (box :flex-grow 1 :flex-shrink 1 :flex-basis '(ch 48)
-             (etaf-data-grid
-              :controller controller
-              :columns (ebasecamp-ui--columns session)
-              :row-key #'ebasecamp-data--item-key
-              :loading-label "正在加载…"
-              :error-label "读取容器状态失败"
-              :empty-label "该项目还没有服务")))
-         (etaf-divider)
-         (expr (ebasecamp-ui--action-bar session))
-         (expr (ebasecamp-ui--notice-view session))
-         (expr (ebasecamp-ui--confirm-dialog session)))))))
+         (etaf-splitter
+          :orientation 'horizontal
+          :ratio ebasecamp-ui--split-ratio
+          (slot :name 'first
+            (expr (ebasecamp-ui--tree-view session)))
+          (slot :name 'second
+            (expr (ebasecamp-ui--detail-placeholder))))
+         (etaf-divider))))))
 
 ;;; 导入 / 导出入口
 
@@ -893,16 +974,31 @@ t，使事件回调上下文也能弹出该询问）。"
       (pop-to-buffer buffer))
     buffer))
 
-(defun ebasecamp-ui-refresh ()
-  "手动刷新：采一次容器状态快照并让表格重新加载。返回加载结果（可能为 nil）。"
+(defun ebasecamp-ui-refresh (&optional records supplied-p)
+  "重新采集容器状态、重建渲染数据并写回会话，返回新的 state plist。
+RECORDS 为已采集的状态记录（轮询回调传入；SUPPLIED-P 为真表示调用方明确
+提供了记录，即使其值为 nil（例如 `docker ps' 返回空表）也不再重复采集，
+避免一次刷新跑两次 `docker ps'）。未提供时调用
+`ebasecamp-status-snapshot'（失败不 signal，错误留在
+`ebasecamp-status-last-error'，旧记录保留）。骨架的 state 暂不消费 RECORDS
+（running / total 统计是 C2 / C3 的事），但采集必须发生：轮询与命令完成后的
+刷新都靠它更新 `ebasecamp-status-last-records'。"
   (interactive)
   (let ((session ebasecamp-ui--session))
     (when session
-      (ebasecamp-data-refresh (ebasecamp-ui-session-controller session)))))
+      (unless supplied-p
+        (ebasecamp-status-snapshot))
+      ;; RECORDS 本轮不参与 state 构建（running / total 是 C2 / C3 的事），
+      ;; 显式消费它以满足「无未使用变量」的编译约束。
+      (ignore records)
+      (let* ((selected (etaf-value (ebasecamp-ui-session-selected-group session)))
+             (state (ebasecamp-ui--build-state selected)))
+        (etaf-set-value (ebasecamp-ui-session-state session) state)
+        state))))
 
 (defun ebasecamp-ui-close ()
-  "关闭主界面：卸载运行时（触发 unmounted 收尾）、停轮询、取消提示定时器、
-销毁会话与 buffer。返回 nil。"
+  "关闭主界面：卸载运行时（触发 unmounted 收尾）、kill buffer、停轮询、
+取消提示定时器、销毁会话。返回 nil。"
   (interactive)
   (when-let* ((buffer (get-buffer ebasecamp-ui-buffer-name)))
     (when-let* ((runtime (etaf-runtime-for-buffer buffer)))
@@ -911,7 +1007,6 @@ t，使事件回调上下文也能弹出该询问）。"
   (ebasecamp-status-stop)
   (when-let* ((session ebasecamp-ui--session))
     (ebasecamp-ui--cancel-notice-timer session)
-    (etaf-data-stop (ebasecamp-ui-session-controller session))
     (setq ebasecamp-ui--session nil))
   nil)
 

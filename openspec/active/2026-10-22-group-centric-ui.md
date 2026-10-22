@@ -2,12 +2,12 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 批次 B 完成（B1–B6）+ **批次 D 全部完成**（D1–D5，含计划外 D4 / D5）
+- 阶段：Phase 3（Implement）· 批次 C 进行中（C0 完成）
 - 已确认：方案 V3 ✅（用户 2026-10-22）、计划 ✅（用户 2026-10-22 确认；plan-reviewer 三轮审查通过）
-- 已完成：A0–A3、A5；批次 B 全部（B1 模型测试 → B2 `:configs` 解析与访问器 → B3 物化 + 交叉校验 → B4 旧写法兼容 → B5 加载流程集成 → B6 全量回归）；D1 失败测试 → D2 落盘改「组内 `:configs`」→ D3 实测暴露 `env_file` 往返断链 → D4 修导入层（`env_file` 归一为相对路径字符串列表）→ D5 修渲染层（`--mapping-p` 判据收紧）+ D3 真实 docker 闭环通过
-- 测试基线：278 tests（275 + D5 新增 3 项），`make check` 退出码 0、零 warning
-- 下一步：批次 C（界面重写，入口 C0）；A4 用户重启 Emacs 后目检
-- 兼容性注意：D2 把「同一项目重复引用同一组」从 v0.1 的静默允许改为加载报错（错误类型 `ebasecamp-config-duplicate-group-ref`，`:file` 指向项目文件）；D4 把 `env_file` 的清单形态从 `((:source PATH :type env) …)` 改为 `("./x.env")`，**已导入的旧清单需重新导入**（旧形态导出必然失败）
+- 已完成：批次 A（加载修复）、批次 B（模型 + 物化 + 加载集成）、批次 D（导入/导出往返，含 D4 env_file 与 D5 渲染判据两个阻断缺陷修复）、C0（组为中心的会话与视图骨架）
+- 测试基线：278 tests 全绿
+- 下一步：C1/C2（`ebasecamp-data-group-instances` 数据装配）→ C3 段渲染 → C4 段内派发 → C5 底栏 → C6 删数据适配 → C7 测试与目检
+- 待用户：A4 重启 Emacs 后 `M-x ebasecamp` 目检
 
 
 ## 目标
@@ -145,8 +145,9 @@
 
 ### 批次 C：界面重写
 
-- [ ] C0 重写会话与视图骨架：重写 `ebasecamp-ui` 的 session（`state` ref、`selected-group` ref、`busy`、`notice`、`confirm`）；顶栏 + `etaf-splitter` + 左栏 `etaf-tree`（组 → 配置两级）+ 右栏占位 `column`；`ebasecamp-ui-refresh` 改为「快照状态 → 重算 state → 写 ref」。此时 `ebasecamp-data` 的 ETAF 适配仍在但已无调用点，不影响编译
+- [x] C0 重写会话与视图骨架：重写 `ebasecamp-ui` 的 session（`state` ref、`selected-group` ref、`busy`、`notice`、`confirm`）；顶栏 + `etaf-splitter` + 左栏 `etaf-tree`（组 → 配置两级）+ 右栏占位 `column`；`ebasecamp-ui-refresh` 改为「快照状态 → 重算 state → 写 ref」。此时 `ebasecamp-data` 的 ETAF 适配仍在但已无调用点，不影响编译
       （依赖：D3）验收：`make check` 全绿；batch 中 `etaf-mount` 到临时 buffer，`buffer-substring-no-properties` 含全部组名与配置名
+      （完成：session 槽位改为 `state` / `selected-group` / `expanded` / `busy` / `notice` / `confirm` / `confirm-action` / `notice-timer`（+ 保留 `selected-ref` 供未改动的 `ebasecamp-ui--run-action` 使用）；删除 `controller` 与 `project-ref`，连带删除 `ebasecamp-ui--select-project`、`--group-items`、`--project-running`、`--tab-items`；新增 `ebasecamp-ui--build-state`（组 / 配置 / scope / config-count / summary / empty-p，不做 running 统计）、`--tree-items`、`--tree-key-group`、`--select-key`、`--tree-view`、`--detail-placeholder`；视图 = 顶栏（`ebasecamp` + 统计 + 刷新）+ divider + `etaf-splitter`（ratio 0.32，slot first = `etaf-tree`，slot second = 占位）+ divider；`ebasecamp-ui-refresh` = 采集（可用 `:supplied-p` 跳过，避免轮询重复 `docker ps`）+ 重建 state + 写 ref；`ebasecamp-ui-close` 不再调 `etaf-data-stop`。测试：删除 5 项旧视图用例、改写 2 项、新增 5 项；`make check` 退出码 0，278/278 全绿（check-parens OK 22 files、compile 零 warning）。batch 实测 buffer 文本含 `MySQL  (2)` / `dev  → 示例项目` / `刷新` / `选择左侧的组`）
 - [ ] C1 先写失败测试：`test/ebasecamp-data-tests.el` 新增 `ebasecamp-data-group-instances` 用例 —— 组有 2 份配置返回 2 个实例、组无配置返回空列表、shared 组单实例且 scope 为 shared、每实例的服务记录与 `ebasecamp-data-project-records` 同源、shared 实例的状态按 scope+group 匹配（构造两个不同 `:project` 的 shared 状态记录，断言都能命中）
       （依赖：C0）验收：新增用例先红
 - [ ] C2 实现数据装配：新增 `ebasecamp-data-group-instances (group)`，返回 `((:config 名 :project 项目名 :scope S :records (...)) ...)`；shared 按 D8 匹配
