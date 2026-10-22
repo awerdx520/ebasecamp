@@ -2,11 +2,12 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 批次 2 进行中
+- 阶段：Phase 3（Implement）· 批次 2 完成
 - 已确认：方案 V2 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）
-- 已完成：批次 0、批次 1（T1.1–T1.6）、批次 2（T2.1 status / T2.2 data / T2.3 etaf 主界面）
-- 下一步：T2.4 包入口与首次引导
-- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist；批次 1 修复 stale .elc 陷阱；T2.3 修正 data 层为「清单 ∪ 状态」语义并让 check-parens 覆盖 test/*.el
+- 已完成：批次 0、批次 1（T1.1–T1.6）、批次 2（T2.1–T2.5）
+- 下一步：批次 3（T3.1 生命周期命令，先写 ERT 测试）
+- 待用户确认：真实 Emacs 中目检 `M-x ebasecamp` 界面（T2.3 验收项）
+- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist；批次 1 修复 stale .elc 陷阱；T2.3 修正 data 层为「清单 ∪ 状态」语义、check-parens 覆盖 test/*.el、加载态改用 data-grid label、toast 推迟至 T3.4
 
 ## 目标
 
@@ -106,13 +107,13 @@ docker compose -f <file> config --no-interpolate --no-env-resolution --no-path-r
 
 - [x] T2.1 `lisp/ebasecamp-status.el`：3s 轮询（`ebasecamp-status-refresh-interval` defcustom）、状态归一化为 `(project group service state health ports)`、仅在 UI 挂载时启停定时器
       （依赖：T1.4）验收：ERT 覆盖状态聚合与定时器生命周期（mock docker 层）
-- [x] T2.2 `lisp/ebasecamp-data.el`：把状态层适配为 ETAF Data 层 —— `etaf-data-source` 的 `:load` 返回状态快照，`etaf-data-controller` 由 UI 持有，轮询后 `etaf-data-reload`，卸载时 `etaf-data-stop`
+- [x] T2.2 `lisp/ebasecamp-data.el`：把状态层适配为 ETAF Data 层 —— `etaf-data-source` 的 `:load` 返回状态快照，`etaf-data-controller` 由 UI 持有，轮询后 `etaf-data-load`，卸载时 `etaf-data-stop`
       （依赖：T2.1）验收：ERT 覆盖 load 返回结构、reload 语义、stop 清理
-- [x] T2.3 `lisp/ebasecamp-ui.el`：etaf 主界面 —— 项目 `etaf-tabs`；组用**扁平** `etaf-tree`（叶子即组，聚合状态）；服务 `etaf-data-grid`（`etaf-checkbox` 多选、`etaf-badge` 状态、`etaf-empty` 空态、`etaf-skeleton` 加载态）；toast 由 UI 持有 `:open` ref 与 `:anchor`（Host `:id`），超时由 `etaf-next-tick`/定时器关闭
+- [x] T2.3 `lisp/ebasecamp-ui.el`：etaf 主界面 —— 项目 `etaf-tabs`；组用**扁平** `etaf-tree`（叶子即组，聚合状态）；服务 `etaf-data-grid`（`etaf-checkbox` 多选、`etaf-badge` 状态、`etaf-empty` 空态；加载态用 `etaf-data-grid` 的 `:loading-label`）；写操作反馈（toast）推迟到 T3.4 错误链路一并实现
       （依赖：T2.2）验收：batch 中 `etaf-mount` 到临时 buffer 后断言 `buffer-string` 含预期项目名/服务名/状态文案（可机械验证），并在真实 Emacs 中人工目检一次
-- [ ] T2.4 `ebasecamp.el`：包入口、`defcustom` 组（`ebasecamp-config-directory`、`ebasecamp-cache-directory`、`ebasecamp-status-refresh-interval`）、autoload `ebasecamp`；配置目录缺失时 UI 显示引导空态 + `ebasecamp-create-sample-config` 命令
+- [x] T2.4 `ebasecamp.el`：包入口、`defcustom` 组（`ebasecamp-config-directory`、`ebasecamp-cache-directory`、`ebasecamp-status-refresh-interval`）、autoload `ebasecamp`；配置目录缺失时 UI 显示引导空态 + `ebasecamp-create-sample-config` 命令
       （依赖：T2.3）验收：`make compile` 零 warning；目录缺失场景 ERT 断言引导文案；`ebasecamp-create-sample-config` 在临时目录实际生成可被 T1.2 加载的示例清单
-- [ ] T2.5 L3：真实容器（alpine）只读展示，UI 状态与 `docker ps` 一致；结束后无残留
+- [x] T2.5 L3：真实容器（alpine）只读展示，UI 状态与 `docker ps` 一致；结束后无残留
       （依赖：T2.4）验收：实际对比容器列表与 UI 行数/状态
 
 ### 批次 3：M2 生命周期
