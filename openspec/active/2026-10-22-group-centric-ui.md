@@ -2,11 +2,11 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 批次 C 进行中（C0 完成）
+- 阶段：Phase 3（Implement）· 批次 C 进行中（C0–C2 完成）
 - 已确认：方案 V3 ✅（用户 2026-10-22）、计划 ✅（用户 2026-10-22 确认；plan-reviewer 三轮审查通过）
-- 已完成：批次 A（加载修复）、批次 B（模型 + 物化 + 加载集成）、批次 D（导入/导出往返，含 D4 env_file 与 D5 渲染判据两个阻断缺陷修复）、C0（组为中心的会话与视图骨架）
-- 测试基线：278 tests 全绿
-- 下一步：C1/C2（`ebasecamp-data-group-instances` 数据装配）→ C3 段渲染 → C4 段内派发 → C5 底栏 → C6 删数据适配 → C7 测试与目检
+- 已完成：批次 A（加载修复）、批次 B（模型 + 物化 + 加载集成）、批次 D（导入/导出往返，含 D4 env_file 与 D5 渲染判据两个阻断缺陷修复）、C0（组为中心的会话与视图骨架）、C1/C2（`ebasecamp-data-group-instances` 组配置实例装配）
+- 测试基线：285 tests 全绿（C0 后 278，C1 新增 7 项）
+- 下一步：C3 段渲染（每份配置一个 `etaf-panel` + 服务 `etaf-table`）→ C4 段内派发 → C5 底栏 → C6 删数据适配 → C7 测试与目检
 - 待用户：A4 重启 Emacs 后 `M-x ebasecamp` 目检
 
 
@@ -148,10 +148,12 @@
 - [x] C0 重写会话与视图骨架：重写 `ebasecamp-ui` 的 session（`state` ref、`selected-group` ref、`busy`、`notice`、`confirm`）；顶栏 + `etaf-splitter` + 左栏 `etaf-tree`（组 → 配置两级）+ 右栏占位 `column`；`ebasecamp-ui-refresh` 改为「快照状态 → 重算 state → 写 ref」。此时 `ebasecamp-data` 的 ETAF 适配仍在但已无调用点，不影响编译
       （依赖：D3）验收：`make check` 全绿；batch 中 `etaf-mount` 到临时 buffer，`buffer-substring-no-properties` 含全部组名与配置名
       （完成：session 槽位改为 `state` / `selected-group` / `expanded` / `busy` / `notice` / `confirm` / `confirm-action` / `notice-timer`（+ 保留 `selected-ref` 供未改动的 `ebasecamp-ui--run-action` 使用）；删除 `controller` 与 `project-ref`，连带删除 `ebasecamp-ui--select-project`、`--group-items`、`--project-running`、`--tab-items`；新增 `ebasecamp-ui--build-state`（组 / 配置 / scope / config-count / summary / empty-p，不做 running 统计）、`--tree-items`、`--tree-key-group`、`--select-key`、`--tree-view`、`--detail-placeholder`；视图 = 顶栏（`ebasecamp` + 统计 + 刷新）+ divider + `etaf-splitter`（ratio 0.32，slot first = `etaf-tree`，slot second = 占位）+ divider；`ebasecamp-ui-refresh` = 采集（可用 `:supplied-p` 跳过，避免轮询重复 `docker ps`）+ 重建 state + 写 ref；`ebasecamp-ui-close` 不再调 `etaf-data-stop`。测试：删除 5 项旧视图用例、改写 2 项、新增 5 项；`make check` 退出码 0，278/278 全绿（check-parens OK 22 files、compile 零 warning）。batch 实测 buffer 文本含 `MySQL  (2)` / `dev  → 示例项目` / `刷新` / `选择左侧的组`）
-- [ ] C1 先写失败测试：`test/ebasecamp-data-tests.el` 新增 `ebasecamp-data-group-instances` 用例 —— 组有 2 份配置返回 2 个实例、组无配置返回空列表、shared 组单实例且 scope 为 shared、每实例的服务记录与 `ebasecamp-data-project-records` 同源、shared 实例的状态按 scope+group 匹配（构造两个不同 `:project` 的 shared 状态记录，断言都能命中）
+- [x] C1 先写失败测试：`test/ebasecamp-data-tests.el` 新增 `ebasecamp-data-group-instances` 用例 —— 组有 2 份配置返回 2 个实例、组无配置返回空列表、shared 组单实例且 scope 为 shared、每实例的服务记录与 `ebasecamp-data-project-records` 同源、shared 实例的状态按 scope+group 匹配（构造两个不同 `:project` 的 shared 状态记录，断言都能命中）
       （依赖：C0）验收：新增用例先红
-- [ ] C2 实现数据装配：新增 `ebasecamp-data-group-instances (group)`，返回 `((:config 名 :project 项目名 :scope S :records (...)) ...)`；shared 按 D8 匹配
+      （完成：新增 7 项 —— `two-configs`（2 配置 → 2 实例，顺序与 `:project-title` 正确）、`no-configs`（组无配置与组不存在均 nil）、`shared-ignores-project`（shared 组配置指向 myapp，running 状态记录的 `:project` 是 other 仍命中；同组另一条 project 为 myapp 的 sentinel 记录命中 exited；对照组 `project-records` 的 redis 仍为 stopped，锁定 D8）、`per-project-filters-by-project`（同名组在 myapp/other 各有记录，各实例只看到自己项目）、`records-match-project-records`（实例 `:records` 与 `project-records` 同组子集逐条 `equal`）、`uses-overrides`（`6380:6379` 覆盖生效）、`defensive-without-link`（配置指向未注册项目且未调 link-configs 时不 signal，记录取组默认定义）。红阶段实测：285 项中 7 项 FAILED（恰为全部新增项）。另加辅助函数 `ebasecamp-data-test--record-of`）
+- [x] C2 实现数据装配：新增 `ebasecamp-data-group-instances (group)`，返回 `((:config 名 :project 项目名 :scope S :records (...)) ...)`；shared 按 D8 匹配
       （依赖：C1）验收：C1 转绿；纯函数、无 IO
+      （完成：返回项含 `:config` / `:project` / `:project-title` / `:scope` / `:records`，实例按配置定义顺序、记录按服务名升序；新增私有辅助 6 个 —— `--resolve-group`（对象/symbol/字符串 → 组对象）、`--config-ref`（优先项目 groups 槽里同组第一项，即含覆盖的物化 ref；未物化回退 `(:group G :scope S)`）、`--instance-indexes`（双索引：shared 键 `group/service` 只收 `:scope "shared"` 的记录，project 键 `project/group/service`）、`--instance-status`（按 scope 分流，D8）、`--instance-services`（项目未注册时用组默认定义副本）、`--instance-records`（单实例装配）。实测发现并修复一处缺陷：`--service-record` 不归一化 `:group`，把组名 symbol 直接传入会让记录 `:group` 为 symbol（与 `project-records` 的字符串形态不同源，`equal` 比较失败），改为先经 `--name-string` 归一。`make check` 退出码 0，285/285 全绿（check-parens OK 22 files、compile 零 warning）；batch 实测 `status-records-unchanged=t`（不修改 `ebasecamp-status--last-records`）、二次调用 `idempotent=t`、组无配置/组不存在均返回 nil）
 - [ ] C3 段渲染：每份配置一个 `etaf-panel`（header 槽手搓 row：配置名 → 项目 + scope 徽标 + running/total + 三个按钮）+ `etaf-table` 服务行（首列 checkbox）
       （依赖：C2）验收：batch 断言 段头文案、服务行数、状态文案；无配置组显示「尚未关联任何项目」
 - [ ] C4 段内派发：勾选服务 → 段内按钮 → `ebasecamp-command-run action project keys`；busy 期间该段按钮 `:disabled`；失败走既有 notice（stderr 首行 + 详情）
@@ -206,6 +208,13 @@
 - **L3**：真实容器冒烟（alpine；启动 → 状态回读 → 停止 → down 清理），结束后 `docker ps -a --filter label=ebasecamp.managed=true` 为空
 - **UI**：batch 中 `etaf-mount` + `buffer-substring-no-properties` 断言（禁止 `prin1`/直接打印带属性字符串，已知会把 Emacs 拖入死循环）+ 用户真实目检一次
 - 每批次结束更新本文件「## 当前状态」区块
+
+## 兼容性注意
+
+本版有两处**破坏性变更**，升级 v0.1 清单时按此逐条核对：
+
+1. **D2 · 同一项目重复引用同一组现在报错**：v0.1 里旧 `:groups` 重复引用同一组是**静默允许**的（`ebasecamp-command--selection` 与 `ebasecamp-compose-render` 都「取首个」，第二份的 `:service-overrides` 被静默丢弃）；v0.2 起**加载即报错** `ebasecamp-config-duplicate-group-ref`。修法：删掉重复项，把差异并入唯一那一项的 `:services` 覆盖。
+2. **D4 · `env_file` 清单形态变更**：由 `((:source PATH :type env))`（volumes 语义）改为**路径字符串列表**（如 `("./api.env")`）。**D4 之前导入的清单需重新导入**，否则导出仍会失败（渲染层把旧形态写成非法 `env_file`，`docker compose config -q` 报 `services.<name>.env_file must be a string`）。
 
 ## 注意事项
 

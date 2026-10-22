@@ -167,6 +167,146 @@ nil。每条记录字段见模块 Commentary；清单中有定义但 docker 中�
                     records)))))
       (sort records #'ebasecamp-data--record-lessp))))
 
+;;; 组配置实例装配
+
+;; 「组 → 配置 → 项目实例」是 v0.2 界面的渲染单位：组是全局第一等对象，
+;; 一份配置关联一个项目。`ebasecamp-data-group-instances' 把二者翻译成 UI
+;; 可直接消费的实例列表，每份配置一项，记录仍走 `--service-record'，因此与
+;; `ebasecamp-data-project-records' 同构同源。
+
+(defun ebasecamp-data--resolve-group (group)
+  "把 GROUP（对象 / symbol / 字符串）解析为 ebasecamp-group 对象。
+无法解析时返回 nil。"
+  (cond
+   ((null group) nil)
+   ((ebasecamp-group-p group) group)
+   ((symbolp group) (ebasecamp-model-group group))
+   ((stringp group) (ebasecamp-model-group (intern group)))
+   (t nil)))
+
+(defun ebasecamp-data--config-ref (project group-name scope)
+  "返回配置物化后的组引用（纯函数）。
+优先取 PROJECT 的 groups 槽里 `:group' 等于 GROUP-NAME 的第一项 —— 那是
+`ebasecamp-model-link-configs' 物化的结果，含该配置的 `:service-overrides'。
+PROJECT 为 nil（配置指向的项目不存在）或该项目尚未物化时，回退为
+`(:group GROUP-NAME :scope SCOPE)'，使只读展示不因缺少物化而 signal。"
+  (or (and project
+           (cl-find group-name (ebasecamp-project-groups project)
+                    :key (lambda (group-ref) (plist-get group-ref :group))
+                    :test #'eq))
+      (list :group group-name :scope scope)))
+
+(defun ebasecamp-data--instance-indexes ()
+  "返回状态索引对 (SHARED . PROJECT)，供组配置实例装配使用。
+SHARED 的键为 \"group/service\"，只收 `:scope' 为 \"shared\" 的记录 ——
+shared 容器的 `ebasecamp.project' 标签记的是**发起项目**而非本配置的项目
+（D8），因此匹配时必须忽略项目；PROJECT 的键为 \"project/group/service\"。
+只读 `ebasecamp-status-last-records'，不触发采集。同一键多次出现时后者覆盖
+（与 `ebasecamp-data--status-index' 一致）。"
+  (let ((shared (make-hash-table :test #'equal))
+        (project (make-hash-table :test #'equal)))
+    (dolist (record (ebasecamp-status-last-records))
+      (let ((project-name (ebasecamp-data--name-string
+                           (plist-get record :project)))
+            (group-name (ebasecamp-data--name-string
+                         (plist-get record :group)))
+            (service-name (ebasecamp-data--name-string
+                           (plist-get record :service)))
+            (scope (ebasecamp-data--name-string (plist-get record :scope))))
+        (when (equal scope "shared")
+          (puthash (format "%s/%s" group-name service-name) record shared))
+        (puthash (format "%s/%s/%s" project-name group-name service-name)
+                 record project)))
+    (cons shared project)))
+
+(defun ebasecamp-data--instance-status (indexes project-name group-name scope
+                                               service-name)
+  "按 D8 规则取服务记录的状态记录（可能为 nil，纯函数）。
+SCOPE 为 \"shared\" 时只按 GROUP-NAME + SERVICE-NAME 命中并忽略 PROJECT-NAME；
+其余按 PROJECT-NAME + GROUP-NAME + SERVICE-NAME 命中。"
+  (if (equal scope "shared")
+      (gethash (format "%s/%s" group-name service-name) (car indexes))
+    (gethash (format "%s/%s/%s" project-name group-name service-name)
+             (cdr indexes))))
+
+(defun ebasecamp-data--instance-services (group project group-ref)
+  "返回实例的服务对象列表（纯函数）。
+PROJECT 已注册时交给 `ebasecamp-model-resolve-services' 合并 GROUP-REF 的
+服务覆盖；PROJECT 为 nil（配置指向的项目不存在）时回退到 GROUP 的默认定义
+副本，保证只读展示不崩。"
+  (if project
+      (ebasecamp-model-resolve-services project group-ref)
+    (mapcar #'copy-ebasecamp-service (ebasecamp-group-services group))))
+
+(defun ebasecamp-data--instance-records (group project config-plist indexes)
+  "装配单份配置实例的服务记录列表（清单 ∪ 状态，纯函数）。
+GROUP 为 ebasecamp-group 对象，PROJECT 为配置指向的项目对象（可为 nil，
+表示项目未注册），CONFIG-PLIST 为配置 plist，INDEXES 见
+`ebasecamp-data--instance-indexes'。记录按服务名升序。"
+  (let* ((group-symbol (ebasecamp-group-name group))
+         (group-name (ebasecamp-data--name-string group-symbol))
+         (group-scope (ebasecamp-group-scope group))
+         (scope (ebasecamp-data--name-string group-scope))
+         (project-name (ebasecamp-data--name-string
+                        (ebasecamp-model-config-project config-plist)))
+         (group-ref (ebasecamp-data--config-ref project group-symbol
+                                               group-scope))
+         (records nil))
+    (dolist (service (ebasecamp-data--instance-services group project group-ref))
+      (let ((service-name (ebasecamp-data--name-string
+                           (ebasecamp-service-name service))))
+        (push (ebasecamp-data--service-record
+               project-name group-name scope
+               (ebasecamp-data--instance-status indexes project-name
+                                                group-name scope service-name)
+               service)
+              records)))
+    (sort records #'ebasecamp-data--record-lessp)))
+
+(defun ebasecamp-data-group-instances (group)
+  "返回 GROUP 的配置实例列表，每份配置一项（纯函数，无 IO）。
+GROUP 可为 ebasecamp-group 对象、symbol 或字符串组名；组不存在或组无配置时
+返回 nil。每项形如
+
+  (:config 配置名 :project 项目名 :project-title 项目 title
+   :scope scope :records (记录 ...))
+
+其中 `:config' 为配置名（字符串，按定义顺序），`:project' 为配置的
+`:project'（字符串），`:project-title' 为项目 title（项目未注册时为 nil），
+`:scope' 为组定义的 scope（D9：配置不覆盖 scope），`:records' 与
+`ebasecamp-data-project-records' 同构：清单服务 ∪ 状态，字段为
+\(:project :group :service :scope :image :desired-ports :state :health :id
+ :names :ports)，按服务名升序。
+
+服务取自已物化的组引用（优先用 PROJECT 的 groups 槽里同组那一项的
+`:service-overrides'），项目未物化时回退到组默认定义。
+
+状态匹配（D8）：`:scope' 为 \"shared\" 时按 `:group' + `:scope' 匹配并忽略
+`:project'（shared 容器标签记的是发起项目，可能不是本配置的项目）；否则
+`:project' 与 `:group' 都相等才命中。状态只读
+`ebasecamp-status-last-records'，不触发采集；未命中时 `:state' 为
+\"stopped\"。"
+  (when-let* ((group-object (ebasecamp-data--resolve-group group))
+              (configs (ebasecamp-model-group-configs group-object)))
+    (let ((indexes (ebasecamp-data--instance-indexes))
+          (scope (ebasecamp-data--name-string
+                  (ebasecamp-group-scope group-object)))
+          (instances nil))
+      (dolist (config configs)
+        (let* ((config-plist (cdr config))
+               (project-symbol (ebasecamp-model-config-project config-plist))
+               (project (and project-symbol
+                             (ebasecamp-model-project project-symbol))))
+          (push (list :config (ebasecamp-data--name-string (car config))
+                      :project (ebasecamp-data--name-string project-symbol)
+                      :project-title (and project
+                                          (ebasecamp-project-title project))
+                      :scope scope
+                      :records (ebasecamp-data--instance-records
+                                group-object project config-plist indexes))
+                instances)))
+      (nreverse instances))))
+
 (defun ebasecamp-data--all-records ()
   "返回所有项目记录的拼接，项目按名字典序排列。纯函数。"
   (let ((names (sort (delq nil (mapcar

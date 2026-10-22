@@ -104,6 +104,12 @@ PROJECT / GROUP / SERVICE 为标签值，STATE / HEALTH 为容器状态，ID 为
                     (plist-get record :service)))
           records))
 
+(defun ebasecamp-data-test--record-of (records service)
+  "返回 RECORDS 中服务名为 SERVICE 的那条记录；找不到时返回 nil。"
+  (cl-find service records
+           :key (lambda (record) (plist-get record :service))
+           :test #'equal))
+
 ;;; 1. source 对象
 
 (ert-deftest ebasecamp-data-test-source-shape ()
@@ -340,6 +346,194 @@ PROJECT / GROUP / SERVICE 为标签值，STATE / HEALTH 为容器状态，ID 为
         (should (equal (funcall item-key first) (funcall item-key first)))
         (should-not (equal (funcall item-key first)
                            (funcall item-key second)))))))
+
+;;; 9. 组配置实例装配
+
+;; `ebasecamp-data-group-instances' 把「组 → 配置」翻译成 UI 可渲染的
+;; 「组 → 配置实例」：每份配置一项，每项的 `:records' 与
+;; `ebasecamp-data-project-records' 同构同源（都走 `--service-record'）。
+;;
+;; 状态匹配分两种（D8）：shared 组按 `:scope "shared"' + `:group' 匹配，
+;; **忽略** `:project'（容器标签记的是发起项目，不是本配置的项目）；
+;; 其余按 `:project' + `:group' 匹配。
+
+(ert-deftest ebasecamp-data-test-group-instances-two-configs ()
+  "组有 2 份配置指向 2 个项目 → 2 个实例，顺序与定义一致。"
+  (ebasecamp-data-test--with-manifest
+    (ebasecamp-define-project prod :title "生产项目")
+    (ebasecamp-define-group db
+      :services ((pg :image "postgres:16" :ports ((5432 . 5432))))
+      :configs ((dev :project myapp) (prod :project prod)))
+    (ebasecamp-model-link-configs)
+    (ebasecamp-data-test--with-status nil
+      (let ((instances (ebasecamp-data-group-instances 'db)))
+        (should (= 2 (length instances)))
+        (should (equal '("dev" "prod")
+                       (mapcar (lambda (instance)
+                                 (plist-get instance :config))
+                               instances)))
+        (should (equal '("myapp" "prod")
+                       (mapcar (lambda (instance)
+                                 (plist-get instance :project))
+                               instances)))
+        (should (equal '("myapp" "生产项目")
+                       (mapcar (lambda (instance)
+                                 (plist-get instance :project-title))
+                               instances)))
+        (should (equal '("per-project" "per-project")
+                       (mapcar (lambda (instance)
+                                 (plist-get instance :scope))
+                               instances)))
+        (dolist (instance instances)
+          (let ((records (plist-get instance :records)))
+            (should (equal '("pg") (ebasecamp-data-test--services records)))
+            (should (equal "stopped"
+                           (plist-get (ebasecamp-data-test--record-of
+                                       records "pg")
+                                      :state)))))))))
+
+(ert-deftest ebasecamp-data-test-group-instances-no-configs ()
+  "组无配置 → nil；组不存在 → nil。"
+  (ebasecamp-data-test--with-manifest
+    (ebasecamp-data-test--with-status nil
+      (should (null (ebasecamp-data-group-instances 'mysql)))
+      (should (null (ebasecamp-data-group-instances
+                     (ebasecamp-model-group 'mysql))))
+      (should (null (ebasecamp-data-group-instances 'no-such-group))))))
+
+(ert-deftest ebasecamp-data-test-group-instances-shared-ignores-project ()
+  "shared 组：状态记录的 `:project' 与配置项目不同也能命中（D8）。"
+  (ebasecamp-data-test--with-manifest
+    (ebasecamp-define-group cache
+      :scope shared
+      :services ((redis :image "redis:7" :ports ((6379 . 6379)))
+                 (sentinel :image "redis:7"))
+      :configs ((main :project myapp)))
+    (ebasecamp-model-link-configs)
+    (ebasecamp-data-test--with-status
+        (list (ebasecamp-data-test--container "other" "cache" "redis"
+                                              "running" "healthy" "c-redis")
+              (ebasecamp-data-test--container "myapp" "cache" "sentinel"
+                                              "exited" nil "c-sentinel"))
+      (let* ((instance (car (ebasecamp-data-group-instances 'cache)))
+             (records (plist-get instance :records))
+             (redis (ebasecamp-data-test--record-of records "redis"))
+             (sentinel (ebasecamp-data-test--record-of records "sentinel")))
+        (should (equal "shared" (plist-get instance :scope)))
+        (should (equal "myapp" (plist-get instance :project)))
+        ;; 状态记录的 project 是 other，仍按 scope+group 命中
+        (should (equal "running" (plist-get redis :state)))
+        (should (equal "healthy" (plist-get redis :health)))
+        (should (equal "c-redis" (plist-get redis :id)))
+        (should (equal "exited" (plist-get sentinel :state)))
+        (should (equal "c-sentinel" (plist-get sentinel :id)))
+        ;; 对照：按 project 过滤的 project-records 看不到那条 running
+        (let* ((project-records
+                (ebasecamp-data--filter
+                 (ebasecamp-data-project-records 'myapp) '(:group "cache")))
+               (project-redis (ebasecamp-data-test--record-of
+                               project-records "redis")))
+          (should (equal "stopped" (plist-get project-redis :state))))))))
+
+(ert-deftest ebasecamp-data-test-group-instances-per-project-filters-by-project ()
+  "per-project 组：同名组在两个项目都有状态记录时，实例只看到自己项目的记录。"
+  (ebasecamp-data-test--with-manifest
+    (ebasecamp-define-group queue
+      :services ((redis :image "redis:7" :ports ((6379 . 6379))))
+      :configs ((dev :project myapp) (prod :project other)))
+    (ebasecamp-model-link-configs)
+    (ebasecamp-data-test--with-status
+        (list (ebasecamp-data-test--container "myapp" "queue" "redis"
+                                              "running" "healthy" "c-dev")
+              (ebasecamp-data-test--container "other" "queue" "redis"
+                                              "exited" nil "c-prod"))
+      (let* ((instances (ebasecamp-data-group-instances 'queue))
+             (dev (nth 0 instances))
+             (prod (nth 1 instances))
+             (dev-record (ebasecamp-data-test--record-of
+                          (plist-get dev :records) "redis"))
+             (prod-record (ebasecamp-data-test--record-of
+                           (plist-get prod :records) "redis")))
+        (should (= 2 (length instances)))
+        (should (equal "running" (plist-get dev-record :state)))
+        (should (equal "c-dev" (plist-get dev-record :id)))
+        (should (equal "exited" (plist-get prod-record :state)))
+        (should (equal "c-prod" (plist-get prod-record :id)))
+        (should (equal '("myapp") (mapcar (lambda (record)
+                                            (plist-get record :project))
+                                          (plist-get dev :records))))
+        (should (equal '("other") (mapcar (lambda (record)
+                                            (plist-get record :project))
+                                          (plist-get prod :records))))))))
+
+(ert-deftest ebasecamp-data-test-group-instances-records-match-project-records ()
+  "同一组同一项目：实例 `:records' 与 `project-records' 的该组子集逐条 equal。"
+  (ebasecamp-data-test--with-manifest
+    (ebasecamp-define-group cache
+      :scope shared
+      :services ((redis :image "redis:7" :ports ((6379 . 6379)))
+                 (sentinel :image "redis:7"))
+      :configs ((main :project myapp)))
+    (ebasecamp-model-link-configs)
+    (ebasecamp-data-test--with-status
+        (list (ebasecamp-data-test--container "myapp" "cache" "redis"
+                                              "running" "healthy" "c1"))
+      (let* ((instance (car (ebasecamp-data-group-instances 'cache)))
+             (instance-records (plist-get instance :records))
+             (project-records
+              (ebasecamp-data--filter
+               (ebasecamp-data-project-records 'myapp) '(:group "cache"))))
+        (should (= 2 (length project-records)))
+        (should (= 2 (length instance-records)))
+        (should (equal project-records instance-records))
+        (should (equal '("redis" "sentinel")
+                       (ebasecamp-data-test--services instance-records)))))))
+
+(ert-deftest ebasecamp-data-test-group-instances-uses-overrides ()
+  "配置的服务覆盖（端口）反映到实例 `:desired-ports'。"
+  (ebasecamp-data-test--with-manifest
+    (ebasecamp-define-group cache
+      :services ((redis :image "redis:7" :ports ((6379 . 6379))))
+      :configs ((plain :project myapp)
+                (shifted :project other
+                         :services ((redis :ports ((6380 . 6379)))))))
+    (ebasecamp-model-link-configs)
+    (ebasecamp-data-test--with-status nil
+      (let* ((instances (ebasecamp-data-group-instances 'cache))
+             (plain (nth 0 instances))
+             (shifted (nth 1 instances))
+             (plain-record (ebasecamp-data-test--record-of
+                            (plist-get plain :records) "redis"))
+             (shifted-record (ebasecamp-data-test--record-of
+                              (plist-get shifted :records) "redis")))
+        (should (= 2 (length instances)))
+        (should (equal "6379:6379" (plist-get plain-record :desired-ports)))
+        (should (equal "6380:6379" (plist-get shifted-record :desired-ports)))
+        (should (equal "redis:7" (plist-get shifted-record :image)))))))
+
+(ert-deftest ebasecamp-data-test-group-instances-defensive-without-link ()
+  "配置指向的项目不存在（未物化）→ 仍返回实例，记录来自组默认定义，不 signal。"
+  (ebasecamp-data-test--with-manifest
+    (ebasecamp-define-group cache
+      :scope shared
+      :services ((redis :image "redis:7" :ports ((6379 . 6379))))
+      :configs ((main :project ghost)))
+    ;; 刻意不调用 `ebasecamp-model-link-configs'：项目 ghost 从未注册
+    (ebasecamp-data-test--with-status nil
+      (let* ((instances (ebasecamp-data-group-instances 'cache))
+             (instance (car instances))
+             (records (plist-get instance :records))
+             (record (ebasecamp-data-test--record-of records "redis")))
+        (should (= 1 (length instances)))
+        (should (equal "main" (plist-get instance :config)))
+        (should (equal "ghost" (plist-get instance :project)))
+        (should (null (plist-get instance :project-title)))
+        (should (equal "shared" (plist-get instance :scope)))
+        (should (equal '("redis")
+                       (ebasecamp-data-test--services records)))
+        (should (equal "redis:7" (plist-get record :image)))
+        (should (equal "6379:6379" (plist-get record :desired-ports)))
+        (should (equal "stopped" (plist-get record :state)))))))
 
 (provide 'ebasecamp-data-tests)
 ;;; ebasecamp-data-tests.el ends here
