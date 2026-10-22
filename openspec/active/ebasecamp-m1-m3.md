@@ -2,10 +2,10 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 批次 1 完成
+- 阶段：Phase 3（Implement）· 批次 2 进行中
 - 已确认：方案 V2 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）
-- 已完成：批次 0（T0.1–T0.5）、批次 1（T1.1 model / T1.2 config / T1.3 compose / T1.4 docker / T1.5 测试收口 / T1.6 L2 验证）
-- 下一步：批次 2（T2.1 status 层，先写 ERT 测试）
+- 已完成：批次 0、批次 1（T1.1–T1.6）、T2.1（status 层）、T2.2（data 适配）
+- 下一步：T2.3 etaf 主界面（先读 etaf/etaf-ui 公开 API 契约）
 - 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist；批次 1 修复 Makefile stale .elc 陷阱
 
 ## 目标
@@ -104,9 +104,9 @@ docker compose -f <file> config --no-interpolate --no-env-resolution --no-path-r
 
 ### 批次 2：M1 只读界面
 
-- [ ] T2.1 `lisp/ebasecamp-status.el`：3s 轮询（`ebasecamp-status-refresh-interval` defcustom）、状态归一化为 `(project group service state health ports)`、仅在 UI 挂载时启停定时器
+- [x] T2.1 `lisp/ebasecamp-status.el`：3s 轮询（`ebasecamp-status-refresh-interval` defcustom）、状态归一化为 `(project group service state health ports)`、仅在 UI 挂载时启停定时器
       （依赖：T1.4）验收：ERT 覆盖状态聚合与定时器生命周期（mock docker 层）
-- [ ] T2.2 `lisp/ebasecamp-data.el`：把状态层适配为 ETAF Data 层 —— `etaf-data-source` 的 `:load` 返回状态快照，`etaf-data-controller` 由 UI 持有，轮询后 `etaf-data-reload`，卸载时 `etaf-data-stop`
+- [x] T2.2 `lisp/ebasecamp-data.el`：把状态层适配为 ETAF Data 层 —— `etaf-data-source` 的 `:load` 返回状态快照，`etaf-data-controller` 由 UI 持有，轮询后 `etaf-data-reload`，卸载时 `etaf-data-stop`
       （依赖：T2.1）验收：ERT 覆盖 load 返回结构、reload 语义、stop 清理
 - [ ] T2.3 `lisp/ebasecamp-ui.el`：etaf 主界面 —— 项目 `etaf-tabs`；组用**扁平** `etaf-tree`（叶子即组，聚合状态）；服务 `etaf-data-grid`（`etaf-checkbox` 多选、`etaf-badge` 状态、`etaf-empty` 空态、`etaf-skeleton` 加载态）；toast 由 UI 持有 `:open` ref 与 `:anchor`（Host `:id`），超时由 `etaf-next-tick`/定时器关闭
       （依赖：T2.2）验收：batch 中 `etaf-mount` 到临时 buffer 后断言 `buffer-string` 含预期项目名/服务名/状态文案（可机械验证），并在真实 Emacs 中人工目检一次
