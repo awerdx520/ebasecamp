@@ -94,11 +94,14 @@ cd /home/thomas/WorkSpace/ebasecamp && make clean
 
 =*ebasecamp*= buffer 打开后只有「还没有 ebasecamp 清单 / 在 ~/.config/ebasecamp/ 下定义 groups.el 与 projects/*.el 后重新打开」，没有组树。
 
+另一种形态：组树**有组**、但每组都显示 =0 配置= 、右栏只有「选择左侧的组」—— 见原因 4。
+
 ** 原因
 
 1. 清单目录不存在 —— =ebasecamp-config-load= 返回 =:bootstrap-needed= t，此时 *不创建目录* 、=:errors= 为空，界面按「无任何组」渲染空态。
 2. 目录存在但 =groups.el= 为空 / 只有注释，或 =projects/*.el= 里没有项目。
 3. 清单文件有加载错误 —— 文件里的定义被丢弃（回滚），组表因此为空或残缺。
+4. 清单是 *v0.1 写法* （只在项目侧 =:groups= 引用组，组侧没有 =:configs=）—— 界面把这类关联显示为「旧写法」：组节点 =MySQL  (旧 · 1 项目)=、右栏段头 =（旧写法）→ 示例项目=，并在组标题下给迁移提示；组既无配置也无人引用时显示 =(未关联)=。
 
 ** 排查命令
 
@@ -128,6 +131,23 @@ M-x ebasecamp
 
   目录里已有清单而该命令拒绝执行，说明是原因 2/3，不要用 =C-u= 覆盖。
 - =:groups= 为 0 且 =:errors= 非空 → 按第 3 条逐条修；修完 =M-x ebasecamp-reload= （它会重新加载并刷新表格，用 =message= 报组/项目/错误数）。
+- *有组但 0 配置* （组节点 =MySQL  (旧 · 1 项目)=、右栏段头 =（旧写法）→ 示例项目=）→ 清单是 v0.1 写法（原因 4）。两条路：一是 *保持旧写法* ，界面照常显示「旧写法」段、服务可正常启停，只是没有配置名；二是 *把关联搬到组侧* 的 =:configs= ，项目文件不再写 =:groups= ：
+
+#+begin_src elisp
+;; groups.el —— 关联写在组侧
+(ebasecamp-define-group mysql
+  :title "MySQL"
+  :services ((mysql :image "mysql:8.4" :ports ((3306 . 3306))))
+  :configs ((dev :project example)))     ; 配置名 dev → 项目 example
+
+;; projects/example.el —— 不再写 :groups
+(ebasecamp-define-project example
+  :title "示例项目"
+  :root "~/work/example")
+#+end_src
+
+  改完 =M-x ebasecamp-reload= 。注意 *同一项目同一组只能有一个引用* ：项目侧 =:groups= 与组侧 =:configs= 同时指向同一项目会报 =ebasecamp-config-duplicate-group-ref=，迁移时先删项目侧那一项。
+- 打开界面时 =message= 会回报 =ebasecamp：N 组 · M 配置（K 个旧写法关联）=（无旧写法关联时省略括号段）。用这行回执确认清单读到了什么：组数对、配置数为 0 且有旧写法关联 → 命中原因为 4，按上一条迁移。
 - 清单为空但目录在 → 手工补 =groups.el= 与 =projects/<name>.el= ，写法见 [[file:user-guide.org][用户指南]]。
 
 * 3. 清单加载报错

@@ -1262,5 +1262,117 @@ open 走全新会话（不残留上一次的选中集合、提示与确认状态
                          (etaf-value
                           (ebasecamp-ui-session-expanded second)))))))))
 
+;;; 15. 旧写法可见性与迁移提示（C8）
+
+;; v0.1 清单只在项目侧写 `:groups'。回退后组视图必须能看到这些关联（段 + 迁移
+;; 提示 + 组节点文案），打开界面时还要用 `message' 报告计数，避免「命令失灵」。
+
+(defun ebasecamp-ui-test--legacy-manifest ()
+  "定义 v0.1 风格清单：两个组都没有 `:configs'，项目 example 用 `:groups' 引用。"
+  (ebasecamp-define-group mysql
+    :title "MySQL"
+    :services ((mysql :image "mysql:8.4" :ports ((3306 . 3306)))
+               (mysql-ro :image "mysql:8.4")))
+  (ebasecamp-define-group redis
+    :services ((redis :image "redis:7" :ports ((6379 . 6379)))))
+  (ebasecamp-define-project example
+    :title "示例项目"
+    :groups ((mysql) (redis))))
+
+(defun ebasecamp-ui-test--capture-ebasecamp-messages (function)
+  "调用 FUNCTION，返回其中以 \"ebasecamp\" 开头的 `message' 文案列表。"
+  (let ((messages nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (push (apply #'format-message format-string args) messages)
+                 nil)))
+      (funcall function))
+    (nreverse (cl-remove-if-not
+               (lambda (text) (string-prefix-p "ebasecamp" text))
+               messages))))
+
+(ert-deftest ebasecamp-ui-test-build-state-legacy-counts ()
+  "旧写法清单：组 `:config-count' 为 0，`:instances' 非空且带 `:legacy'。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--legacy-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let* ((state (ebasecamp-ui--build-state))
+             (group (car (plist-get state :groups)))
+             (instances (plist-get group :instances))
+             (instance (car instances)))
+        (should (equal "2 组 · 0 配置" (plist-get state :summary)))
+        (should (equal 0 (plist-get group :config-count)))
+        (should (null (plist-get group :configs)))
+        (should (= 1 (length instances)))
+        (should (eq t (plist-get instance :legacy)))
+        (should (null (plist-get instance :config)))
+        (should (equal "example" (plist-get instance :project)))
+        (should (equal "示例项目" (plist-get instance :project-title)))
+        (should (equal 2 (length (plist-get instance :records))))
+        (should (equal '(0 2)
+                       (list (plist-get instance :running)
+                             (plist-get instance :total))))))))
+
+(ert-deftest ebasecamp-ui-test-render-legacy-section-caption ()
+  "旧写法实例的段头为「（旧写法）→ 项目」，并在组标题下给出迁移提示。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--legacy-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (ebasecamp-status-snapshot)
+      (let* ((session (ebasecamp-ui-session)))
+        (ebasecamp-ui--select-key session "group/mysql")
+        (ebasecamp-ui-refresh (ebasecamp-status-last-records) t)
+        (let ((text (ebasecamp-ui-test--main-text)))
+          (should (ebasecamp-ui-test--contains-p text "（旧写法）→ 示例项目"))
+          (should (ebasecamp-ui-test--contains-p text "建议改为 :configs"))
+          (should (ebasecamp-ui-test--contains-p text "per-project"))
+          (should (ebasecamp-ui-test--contains-p text "mysql-ro"))
+          (should (ebasecamp-ui-test--contains-p text "启动选中")))))))
+
+(ert-deftest ebasecamp-ui-test-render-group-label-legacy ()
+  "组无配置但有旧写法关联 → 组节点文案为「(旧 · N 项目)」。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--legacy-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (ebasecamp-status-snapshot)
+      (let* ((state (ebasecamp-ui--build-state))
+             (group (car (plist-get state :groups)))
+             (items (ebasecamp-ui--tree-items state))
+             (text (ebasecamp-ui-test--main-text)))
+        (should (equal "MySQL  (旧 · 1 项目)"
+                       (ebasecamp-ui--group-caption group)))
+        (should (equal "MySQL  (旧 · 1 项目)"
+                       (plist-get (car items) :label)))
+        ;; 树节点文案在 batch 下会被 etaf-tree 省略号截断（`*ebasecamp*` 实测
+        ;; 只到 "MySQL  (旧"），故 buffer 断言放到「旧」这一段前缀，完整文案
+        ;; 由上面两条 caption / items 断言保证。
+        (should (ebasecamp-ui-test--contains-p text "MySQL  (旧"))))))
+
+(ert-deftest ebasecamp-ui-test-open-messages-counts ()
+  "交互调用 `ebasecamp-ui-open' 时用 `message' 报告组 / 配置 / 旧写法关联数。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--legacy-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((messages (ebasecamp-ui-test--capture-ebasecamp-messages
+                       (lambda () (call-interactively #'ebasecamp-ui-open)))))
+        (should (= 1 (length messages)))
+        (let ((text (car messages)))
+          (should (ebasecamp-ui-test--contains-p text "2 组"))
+          (should (ebasecamp-ui-test--contains-p text "0 配置"))
+          (should (ebasecamp-ui-test--contains-p text "2 个旧写法关联")))))))
+
+(ert-deftest ebasecamp-ui-test-render-no-config-no-legacy-label ()
+  "组既无配置也无旧写法关联 → 组节点文案为「(未关联)」。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-define-group mysql
+      :title "MySQL"
+      :services ((mysql :image "mysql:8.4" :ports ((3306 . 3306)))))
+    (ebasecamp-ui-test--with-ps nil
+      (let* ((state (ebasecamp-ui--build-state))
+             (group (car (plist-get state :groups))))
+        (should (null (plist-get group :instances)))
+        (should (equal "MySQL  (未关联)"
+                       (ebasecamp-ui--group-caption group)))))))
+
 (provide 'ebasecamp-ui-tests)
 ;;; ebasecamp-ui-tests.el ends here

@@ -282,13 +282,15 @@ PROJECT / GROUP / SERVICE 为标签值，STATE / HEALTH 为容器状态，ID 为
                                        records "pg")
                                       :state)))))))))
 
-(ert-deftest ebasecamp-data-test-group-instances-no-configs ()
-  "组无配置 → nil；组不存在 → nil。"
+(ert-deftest ebasecamp-data-test-group-instances-unreferenced-and-missing ()
+  "组无配置且无项目引用 → nil（回退也找不到旧写法关联）；组不存在 → nil。"
   (ebasecamp-data-test--with-manifest
+    (ebasecamp-define-group unused
+      :services ((tool :image "busybox:1.36")))
     (ebasecamp-data-test--with-status nil
-      (should (null (ebasecamp-data-group-instances 'mysql)))
+      (should (null (ebasecamp-data-group-instances 'unused)))
       (should (null (ebasecamp-data-group-instances
-                     (ebasecamp-model-group 'mysql))))
+                     (ebasecamp-model-group 'unused))))
       (should (null (ebasecamp-data-group-instances 'no-such-group))))))
 
 (ert-deftest ebasecamp-data-test-group-instances-shared-ignores-project ()
@@ -424,6 +426,70 @@ PROJECT / GROUP / SERVICE 为标签值，STATE / HEALTH 为容器状态，ID 为
         (should (equal "redis:7" (plist-get record :image)))
         (should (equal "6379:6379" (plist-get record :desired-ports)))
         (should (equal "stopped" (plist-get record :state)))))))
+
+;;; 8. 旧写法（项目侧 :groups）回退（C8）
+
+;; v0.1 清单只在项目侧写 `:groups'，组侧没有 `:configs'。若不回退，组视图
+;; 会把「有服务、被项目引用」的组显示成 0 配置的空壳。回退实例沿用配置实例
+;; 的键，另加 `:legacy' t、`:config' nil（无配置名）。
+
+(ert-deftest ebasecamp-data-test-group-instances-legacy-fallback ()
+  "组无 `:configs' 但被两个项目引用 → 2 个 `:legacy' 实例，按项目名升序。"
+  (ebasecamp-data-test--with-manifest
+    (ebasecamp-data-test--with-status nil
+      ;; 组 redis 无配置；myapp 与 other 都在项目侧引用它
+      (let ((instances (ebasecamp-data-group-instances 'redis)))
+        (should (= 2 (length instances)))
+        (should (equal '("myapp" "other")
+                       (mapcar (lambda (instance)
+                                 (plist-get instance :project))
+                               instances)))
+        (dolist (instance instances)
+          (should (eq t (plist-get instance :legacy)))
+          (should (null (plist-get instance :config)))
+          (should (equal "per-project" (plist-get instance :scope)))
+          (should (equal '("redis")
+                         (ebasecamp-data-test--services
+                          (plist-get instance :records)))))))))
+
+(ert-deftest ebasecamp-data-test-group-instances-legacy-not-mixed ()
+  "组有 `:configs' 时只返回配置实例，不混入其他项目的旧写法引用。"
+  (ebasecamp-model-reset)
+  (unwind-protect
+      (progn
+        ;; myapp 侧不写 :groups（避免「同项目同组多引用」报错），other 侧仍用旧写法
+        (ebasecamp-define-group cache
+          :services ((redis :image "redis:7" :ports ((6379 . 6379))))
+          :configs ((main :project myapp)))
+        (ebasecamp-define-project myapp :groups nil)
+        (ebasecamp-define-project other :groups ((cache)))
+        (ebasecamp-model-link-configs)
+        (ebasecamp-data-test--with-status nil
+          (let ((instances (ebasecamp-data-group-instances 'cache)))
+            (should (= 1 (length instances)))
+            (should (equal "main" (plist-get (car instances) :config)))
+            (should (equal "myapp" (plist-get (car instances) :project)))
+            (should-not (plist-get (car instances) :legacy)))))
+    (ebasecamp-model-reset)))
+
+(ert-deftest ebasecamp-data-test-group-instances-legacy-records ()
+  "旧写法实例的 `:records' 与 `project-records' 的该组子集逐条 equal。"
+  (ebasecamp-data-test--with-manifest
+    (ebasecamp-data-test--with-status
+        (list (ebasecamp-data-test--container "myapp" "mysql" "mysql"
+                                              "running" "healthy" "c1"))
+      (let* ((instance (car (ebasecamp-data-group-instances 'mysql)))
+             (project-records
+              (ebasecamp-data-test--by-group
+               (ebasecamp-data-project-records 'myapp) "mysql")))
+        (should (plist-get instance :legacy))
+        (should (equal "myapp" (plist-get instance :project)))
+        (should (= 2 (length project-records)))
+        (should (equal project-records (plist-get instance :records)))
+        (should (equal "running"
+                       (plist-get (ebasecamp-data-test--record-of
+                                   (plist-get instance :records) "mysql")
+                                  :state)))))))
 
 (provide 'ebasecamp-data-tests)
 ;;; ebasecamp-data-tests.el ends here

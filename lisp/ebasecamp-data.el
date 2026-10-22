@@ -227,15 +227,19 @@ PROJECT 已注册时交给 `ebasecamp-model-resolve-services' 合并 GROUP-REF �
       (ebasecamp-model-resolve-services project group-ref)
     (mapcar #'copy-ebasecamp-service (ebasecamp-group-services group))))
 
-(defun ebasecamp-data--instance-records (group project config-plist indexes)
+(defun ebasecamp-data--instance-records (group project config-plist indexes
+                                               &optional scope-override)
   "装配单份配置实例的服务记录列表（清单 ∪ 状态，纯函数）。
 GROUP 为 ebasecamp-group 对象，PROJECT 为配置指向的项目对象（可为 nil，
 表示项目未注册），CONFIG-PLIST 为配置 plist，INDEXES 见
-`ebasecamp-data--instance-indexes'。记录按服务名升序。"
+`ebasecamp-data--instance-indexes'。SCOPE-OVERRIDE 非 nil 时用它替代组定义的
+scope（旧写法实例允许引用级 `:scope' 覆盖，此时状态匹配必须按该 scope）。
+记录按服务名升序。"
   (let* ((group-symbol (ebasecamp-group-name group))
          (group-name (ebasecamp-data--name-string group-symbol))
          (group-scope (ebasecamp-group-scope group))
-         (scope (ebasecamp-data--name-string group-scope))
+         (scope (or (ebasecamp-data--name-string scope-override)
+                    (ebasecamp-data--name-string group-scope)))
          (project-name (ebasecamp-data--name-string
                         (ebasecamp-model-config-project config-plist)))
          (group-ref (ebasecamp-data--config-ref project group-symbol
@@ -252,10 +256,46 @@ GROUP 为 ebasecamp-group 对象，PROJECT 为配置指向的项目对象（可�
               records)))
     (sort records #'ebasecamp-data--record-lessp)))
 
+(defun ebasecamp-data--legacy-project-lessp (a b)
+  "项目 A 是否应排在 B 之前（项目名升序）。纯函数。"
+  (string< (ebasecamp-data--name-string (ebasecamp-project-name a))
+           (ebasecamp-data--name-string (ebasecamp-project-name b))))
+
+(defun ebasecamp-data--legacy-instances (group indexes)
+  "为 GROUP 装配「旧写法实例」列表（纯函数，无 IO）。
+GROUP 为 ebasecamp-group 对象，INDEXES 见 `ebasecamp-data--instance-indexes'。
+按项目名升序扫描 `ebasecamp-model-projects'，把每个项目 groups 槽里 `:group'
+等于 GROUP 的那条引用转成一个实例：它有「组无 `:configs'」（v0.1 清单只在
+项目侧声明 `:groups'）时才被装配，使旧写法在组视图里仍然可见。
+
+字段与配置实例相同（`:project' / `:project-title' / `:scope' / `:records'），
+另加 `:legacy' t，且 `:config' 为 nil（旧写法没有配置名）。`:scope' 取引用的
+生效 scope —— 旧写法允许引用级覆盖，记录的状态匹配须按该 scope。"
+  (let* ((group-symbol (ebasecamp-group-name group))
+         (instances nil))
+    (dolist (project (sort (copy-sequence (ebasecamp-model-projects))
+                           #'ebasecamp-data--legacy-project-lessp))
+      (let ((group-ref (cl-find group-symbol (ebasecamp-project-groups project)
+                                :key (lambda (ref) (plist-get ref :group))
+                                :test #'eq)))
+        (when group-ref
+          (let ((project-symbol (ebasecamp-project-name project))
+                (scope (ebasecamp-data--group-ref-scope group-ref)))
+            (push (list :config nil
+                        :project (ebasecamp-data--name-string project-symbol)
+                        :project-title (ebasecamp-project-title project)
+                        :scope scope
+                        :legacy t
+                        :records (ebasecamp-data--instance-records
+                                  group project (list :project project-symbol)
+                                  indexes scope))
+                  instances)))))
+    (nreverse instances)))
+
 (defun ebasecamp-data-group-instances (group)
   "返回 GROUP 的配置实例列表，每份配置一项（纯函数，无 IO）。
-GROUP 可为 ebasecamp-group 对象、symbol 或字符串组名；组不存在或组无配置时
-返回 nil。每项形如
+GROUP 可为 ebasecamp-group 对象、symbol 或字符串组名；组不存在时返回 nil。
+每项形如
 
   (:config 配置名 :project 项目名 :project-title 项目 title
    :scope scope :records (记录 ...))
@@ -267,6 +307,12 @@ GROUP 可为 ebasecamp-group 对象、symbol 或字符串组名；组不存在�
 \(:project :group :service :scope :image :desired-ports :state :health :id
  :names :ports)，按服务名升序。
 
+**旧写法回退**：组没有 `:configs' 时（v0.1 清单只在项目侧写 `:groups'）改为
+扫描项目侧的组引用，每个引用一个「旧写法实例」—— 字段同上，另加 `:legacy'
+t、`:config' 为 nil、`:scope' 取引用的生效 scope，顺序按项目名升序。组有
+`:configs' 时行为完全不变，不混入旧写法实例（同一项目同组的重复引用在加载期
+已报 `ebasecamp-config-duplicate-group-ref'）。
+
 服务取自已物化的组引用（优先用 PROJECT 的 groups 槽里同组那一项的
 `:service-overrides'），项目未物化时回退到组默认定义。
 
@@ -275,26 +321,28 @@ GROUP 可为 ebasecamp-group 对象、symbol 或字符串组名；组不存在�
 `:project' 与 `:group' 都相等才命中。状态只读
 `ebasecamp-status-last-records'，不触发采集；未命中时 `:state' 为
 \"stopped\"。"
-  (when-let* ((group-object (ebasecamp-data--resolve-group group))
-              (configs (ebasecamp-model-group-configs group-object)))
+  (when-let* ((group-object (ebasecamp-data--resolve-group group)))
     (let ((indexes (ebasecamp-data--instance-indexes))
-          (scope (ebasecamp-data--name-string
-                  (ebasecamp-group-scope group-object)))
-          (instances nil))
-      (dolist (config configs)
-        (let* ((config-plist (cdr config))
-               (project-symbol (ebasecamp-model-config-project config-plist))
-               (project (and project-symbol
-                             (ebasecamp-model-project project-symbol))))
-          (push (list :config (ebasecamp-data--name-string (car config))
-                      :project (ebasecamp-data--name-string project-symbol)
-                      :project-title (and project
-                                          (ebasecamp-project-title project))
-                      :scope scope
-                      :records (ebasecamp-data--instance-records
-                                group-object project config-plist indexes))
-                instances)))
-      (nreverse instances))))
+          (configs (ebasecamp-model-group-configs group-object)))
+      (if (null configs)
+          (ebasecamp-data--legacy-instances group-object indexes)
+        (let ((scope (ebasecamp-data--name-string
+                      (ebasecamp-group-scope group-object)))
+              (instances nil))
+          (dolist (config configs)
+            (let* ((config-plist (cdr config))
+                   (project-symbol (ebasecamp-model-config-project config-plist))
+                   (project (and project-symbol
+                                 (ebasecamp-model-project project-symbol))))
+              (push (list :config (ebasecamp-data--name-string (car config))
+                          :project (ebasecamp-data--name-string project-symbol)
+                          :project-title (and project
+                                              (ebasecamp-project-title project))
+                          :scope scope
+                          :records (ebasecamp-data--instance-records
+                                    group-object project config-plist indexes))
+                    instances)))
+          (nreverse instances))))))
 
 (provide 'ebasecamp-data)
 ;;; ebasecamp-data.el ends here

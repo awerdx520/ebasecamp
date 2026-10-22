@@ -125,9 +125,12 @@ ${VAR} 引用，不含任何明文。"
 
 ;;;###autoload
 (defun ebasecamp ()
-  "打开 ebasecamp 管理界面（左栏「组 → 配置」树，右栏按配置分段）。"
+  "打开 ebasecamp 管理界面（左栏「组 → 配置」树，右栏按配置分段）。
+打开后用 `message' 报告组数 / 配置数（有旧写法关联时附其数量）—— 回执让
+「组树为空壳」与「命令失灵」可区分。返回界面 buffer。"
   (interactive)
-  (ebasecamp-ui-open))
+  (prog1 (ebasecamp-ui-open)
+    (ebasecamp-ui-report-counts)))
 
 ;;;###autoload
 (defun ebasecamp-create-sample-config (&optional force)

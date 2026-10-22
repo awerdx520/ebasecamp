@@ -114,8 +114,10 @@
   :type 'number
   :group 'ebasecamp)
 
-(defconst ebasecamp-ui--split-ratio 0.32
-  "左侧组树的宽度占比（`etaf-splitter' 的 `:ratio'）。")
+(defconst ebasecamp-ui--split-ratio 0.38
+  "左侧组树的宽度占比（`etaf-splitter' 的 `:ratio'）。
+0.38 而非更窄：组节点文案在旧写法（=旧 · N 项目=）时仍需完整可见，实测
+0.32 会把尾部「· N 项目」截掉。")
 
 ;;; 会话
 
@@ -183,9 +185,10 @@ CONFIRM-ACTION 为等待确认的动作 symbol（无则 nil）；NOTICE-TIMER �
 
 (defun ebasecamp-ui--instance-state (instance)
   "把 `ebasecamp-data-group-instances' 的实例 INSTANCE 转成 state 的段项 plist。
-字段：`:config' 配置名、`:project' 项目名、`:project-title' 项目标题（项目
-未定义时为 nil）、`:scope' 组 scope（配置的 scope 恒等于组定义，D9）、
-`:running' running 服务条数、`:total' 服务总条数、`:records' 服务记录列表。
+字段：`:config' 配置名（旧写法实例为 nil）、`:project' 项目名、
+`:project-title' 项目标题（项目未定义时为 nil）、`:scope' 组 scope（配置的
+scope 恒等于组定义，D9）、`:running' running 服务条数、`:total' 服务总条数、
+`:records' 服务记录列表、`:legacy' 是否为旧写法（项目侧 `:groups'）实例。
 纯函数。"
   (let ((records (plist-get instance :records)))
     (list :config (plist-get instance :config)
@@ -194,6 +197,7 @@ CONFIRM-ACTION 为等待确认的动作 symbol（无则 nil）；NOTICE-TIMER �
           :scope (plist-get instance :scope)
           :running (ebasecamp-ui--running-count records)
           :total (length records)
+          :legacy (and (plist-get instance :legacy) t)
           :records records)))
 
 (defun ebasecamp-ui--config-state (instance)
@@ -216,18 +220,23 @@ CONFIRM-ACTION 为等待确认的动作 symbol（无则 nil）；NOTICE-TIMER �
 (defun ebasecamp-ui--group-state (group)
   "把组对象 GROUP 转成 state 的组项 plist。
 字段：`:name' 组名、`:title' 组标题、`:scope' scope、`:config-count' 配置
-份数、`:running' / `:total'（各实例求和）、`:configs' 配置项列表（见
+份数、`:legacy-count' 旧写法（项目侧 `:groups'）实例数、`:running' /
+`:total'（各实例求和）、`:configs' 配置项列表（见
 `ebasecamp-ui--config-state'）、`:instances' 段项列表（见
 `ebasecamp-ui--instance-state'）、`:service-names' 组定义的服务名。
 组配置实例经 `ebasecamp-data-group-instances' 每组建装配**一次**，配置项由
-实例派生，避免重复读状态快照。纯函数。"
+**配置实例**派生（旧写法实例没有配置名，不进树），避免重复读状态快照。纯函数。"
   (let* ((instances (mapcar #'ebasecamp-ui--instance-state
                             (ebasecamp-data-group-instances group)))
-         (configs (mapcar #'ebasecamp-ui--config-state instances)))
+         (configs (mapcar #'ebasecamp-ui--config-state
+                          (cl-remove-if (lambda (instance)
+                                          (plist-get instance :legacy))
+                                        instances))))
     (list :name (symbol-name (ebasecamp-group-name group))
           :title (ebasecamp-group-title group)
           :scope (symbol-name (ebasecamp-group-scope group))
           :config-count (length configs)
+          :legacy-count (- (length instances) (length configs))
           :running (apply #'+ 0 (mapcar (lambda (instance)
                                           (plist-get instance :running))
                                         instances))
@@ -499,18 +508,28 @@ SOFT 是其余（如 `unknown'，只提示）。纯函数。"
 
 (defun ebasecamp-ui--group-caption (group)
   "返回组项的显示文案：标题 + 配置份数 + running 汇总。
-无服务时省略 running 部分（如 \"redis  (0 配置)\"），否则如
-\"MySQL  (2 配置 · 3/4 running)\"。GROUP 为 state 的组项 plist。纯函数。"
-  (let ((total (or (plist-get group :total) 0))
-        (head (format "%s  (%d 配置"
-                      (ebasecamp-ui--group-label group)
-                      (plist-get group :config-count))))
-    (if (> total 0)
-        (format "%s · %s running)"
-                head
-                (ebasecamp-ui--ratio-label
-                 (or (plist-get group :running) 0) total))
-      (concat head ")"))))
+有配置时如 \"MySQL  (2 配置 · 3/4 running)\"（无服务时省略 running 部分，
+如 \"MySQL  (2 配置)\"）；组无配置但有旧写法（项目侧 `:groups'）关联时如
+\"MySQL  (旧 · 1 项目)\"（用「旧」而非「旧写法」：左栏占比有限，实测更长的
+文案会把尾部「· N 项目」截掉）；既无配置也无关联时如 \"MySQL  (未关联)\"。
+GROUP 为 state 的组项 plist。纯函数。"
+  (let ((title (ebasecamp-ui--group-label group))
+        (config-count (or (plist-get group :config-count) 0))
+        (legacy-count (or (plist-get group :legacy-count) 0))
+        (total (or (plist-get group :total) 0)))
+    (cond
+     ((> config-count 0)
+      (let ((head (format "%s  (%d 配置" title config-count)))
+        (if (> total 0)
+            (format "%s · %s running)"
+                    head
+                    (ebasecamp-ui--ratio-label
+                     (or (plist-get group :running) 0) total))
+          (concat head ")"))))
+     ((> legacy-count 0)
+      (format "%s  (旧 · %d 项目)" title legacy-count))
+     (t
+      (format "%s  (未关联)" title)))))
 
 (defun ebasecamp-ui--config-caption (config)
   "返回配置项的显示文案：配置名 → 项目 + running 计数。
@@ -834,12 +853,14 @@ SCOPE 为 scope 字符串（如 \"per-project\"）。"
 
 (defun ebasecamp-ui--instance-caption (instance)
   "返回段头文案：配置名 → 项目标题（如 \"dev → 示例项目\"）。
-项目标题缺失时回退项目名。INSTANCE 为 state 的段项 plist。纯函数。"
-  (format "%s → %s"
-          (or (plist-get instance :config) "")
-          (or (plist-get instance :project-title)
-              (plist-get instance :project)
-              "")))
+项目标题缺失时回退项目名。旧写法（项目侧 `:groups'）实例没有配置名，段头为
+\"（旧写法）→ 示例项目\"，以区别于已声明 `:configs' 的配置。"
+  (let ((target (or (plist-get instance :project-title)
+                    (plist-get instance :project)
+                    "")))
+    (if (plist-get instance :legacy)
+        (format "（旧写法）→ %s" target)
+      (format "%s → %s" (or (plist-get instance :config) "") target))))
 
 (defun ebasecamp-ui--section-action (action instance)
   "对配置实例 INSTANCE 派发生命周期 ACTION。
@@ -955,6 +976,25 @@ GROUP 为 state 的组项 plist。"
      (etaf-label :text (format "%d 配置" (plist-get group :config-count))
                  :variant 'muted))))
 
+(defun ebasecamp-ui--legacy-instances (group)
+  "返回组项 GROUP 中旧写法（项目侧 `:groups'）实例的列表。纯函数。"
+  (cl-remove-if-not (lambda (instance) (plist-get instance :legacy))
+                    (plist-get group :instances)))
+
+(defconst ebasecamp-ui--legacy-hint
+  (concat "提示：该组尚未声明 :configs（当前关联来自项目侧 :groups 旧写法），"
+          "建议改为 :configs ((<配置名> :project <项目>))")
+  "组只有旧写法关联时给出的迁移提示文案。")
+
+(defun ebasecamp-ui--legacy-hint-view (group)
+  "返回组的迁移提示视图；组无旧写法实例时返回 nil。
+只在组**没有** `:configs'、关联全部来自项目侧 `:groups' 时出现（组有配置即
+已是新写法，不必提示）。调用方用 `(expr …)' 放入渲染树 —— 该位置接受 nil。
+纯函数。"
+  (when (ebasecamp-ui--legacy-instances group)
+    (etaf-view
+     (etaf-label :text ebasecamp-ui--legacy-hint :variant 'warning))))
+
 (defun ebasecamp-ui--empty-configs-view (group)
   "返回「组无配置」的右栏：空态 + 组定义的服务名（只读提示）。
 GROUP 为 state 的组项 plist；服务名取自 `:service-names'（组定义，未经配置
@@ -975,8 +1015,9 @@ GROUP 为 state 的组项 plist；服务名取自 `:service-names'（组定义�
 (defun ebasecamp-ui--detail-view (session state)
   "返回右栏视图。STATE 为渲染数据（读它建立渲染依赖）。三种形态：
 1. 未选中组 → 占位「选择左侧的组」；
-2. 选中组无配置 → 空态「尚未关联任何项目」+ 组定义的服务名（只读）；
-3. 选中组有配置 → 组标题行 + 每份配置一个 `etaf-panel' 段。"
+2. 选中组无任何实例 → 空态「尚未关联任何项目」+ 组定义的服务名（只读）；
+3. 选中组有实例 → 组标题行（+ 旧写法迁移提示）+ 每个实例一个 `etaf-panel' 段。
+旧写法（项目侧 `:groups'）实例没有配置名，段 key 回退为项目名（段内唯一）。"
   (let* ((selected (plist-get state :selected))
          (group (and selected
                      (cl-find selected (plist-get state :groups)
@@ -993,9 +1034,11 @@ GROUP 为 state 的组项 plist；服务名取自 `:service-names'（组定义�
          (column :width 'stretch :height 'stretch :cross-align 'stretch
                  :padding '((lh 1) (ch 1)) :item-gap '(lh 1)
            (expr (ebasecamp-ui--group-header-row group))
+           (expr (ebasecamp-ui--legacy-hint-view group))
            (column :width 'stretch :item-gap '(lh 1)
              (box :for (instance (plist-get group :instances))
-                  :key (plist-get instance :config)
+                  :key (or (plist-get instance :config)
+                           (plist-get instance :project))
                   :width 'stretch
                (expr (ebasecamp-ui--instance-section
                       session group-name instance)))))))))))
@@ -1222,10 +1265,42 @@ t，使事件回调上下文也能弹出该询问）。"
 
 ;;; 公开 API
 
+(defun ebasecamp-ui--legacy-count (state)
+  "返回 STATE 中旧写法（项目侧 `:groups'）实例的总数。纯函数。"
+  (apply #'+ 0 (mapcar (lambda (group)
+                         (or (plist-get group :legacy-count) 0))
+                       (plist-get state :groups))))
+
+(defun ebasecamp-ui--report-counts (state)
+  "用 `message' 报告 STATE 的组数 / 配置数，有旧写法关联时附加其数量。"
+  (let ((groups (length (plist-get state :groups)))
+        (configs (apply #'+ 0 (mapcar (lambda (group)
+                                        (or (plist-get group :config-count) 0))
+                                      (plist-get state :groups))))
+        (legacy (ebasecamp-ui--legacy-count state)))
+    (if (> legacy 0)
+        (message "ebasecamp：%d 组 · %d 配置（%d 个旧写法关联）"
+                 groups configs legacy)
+      (message "ebasecamp：%d 组 · %d 配置" groups configs))))
+
+(defun ebasecamp-ui-report-counts ()
+  "用 `message' 报告当前会话的组数 / 配置数（有旧写法关联时附其数量）。
+界面打开后给用户一条回执，避免「组树 0 配置 + 无任何输出」被误判为命令失灵。
+会话不存在时静默返回 nil。"
+  (interactive)
+  (when ebasecamp-ui--session
+    (ebasecamp-ui--report-counts
+     (etaf-value (ebasecamp-ui-session-state ebasecamp-ui--session)))))
+
 (defun ebasecamp-ui-open ()
   "打开（或复用）ebasecamp 主界面 buffer，返回该 buffer。
 清单未加载时先按 `ebasecamp-config-directory' 加载一次；buffer 已有运行时
-则直接复用，不重复挂载。"
+则直接复用，不重复挂载。
+
+被**直接**交互调用（\\[ebasecamp-ui-open]）时用 `message' 报告「N 组 · M
+配置」，并 `pop-to-buffer'；由 `ebasecamp' 命令间接调用时两者都不做 ——
+回执由该命令在打开后自行报告（`called-interactively-p' 不跨帧传播，故回执
+必须落在用户实际调用的那个命令上）。"
   (interactive)
   (ebasecamp-ui--ensure-manifest)
   (ebasecamp-ui-session)
@@ -1233,7 +1308,8 @@ t，使事件回调上下文也能弹出该询问）。"
     (with-current-buffer buffer
       (unless (etaf-runtime-for-buffer buffer)
         (etaf-mount buffer (ebasecamp-ui-view))))
-    (when (called-interactively-p 'interactive)
+    (when (called-interactively-p 'any)
+      (ebasecamp-ui-report-counts)
       (pop-to-buffer buffer))
     buffer))
 

@@ -33,6 +33,7 @@
 - **`env_file` 往返失败**（D4，技术债 #21 同源）：清单里 `env_file` 为 volumes 语义（`((:source PATH :type env))`）时导出被 compose 拒绝（`services.<name>.env_file must be a string`）；`ebasecamp-import--env-file` 归一为路径字符串列表（`("./api.env")`）后往返通过。
 - **`ports:` / `volumes:` 重复键**（D6，技术债 #23 阻断级）：同一服务既有可表达端口又有 `:extra` ports 桶（或既有 bind 卷又有 tmpfs 卷）时渲染出两个同名键，`docker compose config -q` 报 `mapping key "ports" already defined`；`ebasecamp-compose--service-body` 改为合并 `:extra` 同名桶与显式项、每类只输出一个键。
 - **旧清单里同一项目重复引用同一组被静默取首个**：改为加载期报 `ebasecamp-config-duplicate-group-ref`（见「兼容性」）。
+- **v0.1 清单在组视图里完全不可见（C8）**：`ebasecamp-data-group-instances` 原先只在组侧有 `:configs` 时返回实例，v0.1 清单（关联只写在项目侧 `:groups`）因此渲染出「N 组 · 0 配置」的空壳，且打开界面时没有任何 `message`，容易被误判为命令失灵。现在组无 `:configs` 时按项目名升序回退装配「旧写法实例」（`:legacy` t、`:config` nil，记录仍与 `ebasecamp-data-project-records` 同源）：组节点显示 `MySQL  (旧 · 1 项目)`、右栏段头显示 `（旧写法）→ 项目` 并在组标题下给出迁移提示，既无配置也无关联时显示 `(未关联)`；`ebasecamp` 命令与 `M-x ebasecamp-ui-open` 打开界面时用 `message` 回报「N 组 · M 配置（K 个旧写法关联）」，据此可区分「清单是旧写法」与「命令没生效」。
 - **`M-x ebasecamp` 报「命令不存在」**（批次 A）：根因是运行中的 Emacs 里没有加载该包 —— straight recipe 指向远程上游且 build 目录晚于 daemon 启动生成。recipe 改指本地仓库（`:local-repo` + `:files ("*.el" "lisp/*.el")`）并重建 build 后恢复可用。
 
 ### 移除

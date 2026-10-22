@@ -234,7 +234,7 @@ v0.1 的写法仍然兼容，视作「匿名配置」，配置名等于组名；
 | 区域 | 内容 |
 |------+------|
 | 顶栏 | =ebasecamp= + 统计（「N 组 · M 配置」）+ =刷新= 按钮 |
-| 左栏 | 组树两级：组节点 =MySQL  (2 配置 · 3/4 running)=、配置节点 =dev → 示例项目  (2/2)=；无配置组显示 =redis  (0 配置)= |
+| 左栏 | 组树两级：组节点 =MySQL  (2 配置 · 3/4 running)=、配置节点 =dev → 示例项目  (2/2)=；组无配置但有旧写法关联时显示 =redis  (旧 · 1 项目)=，既无配置也无关联时显示 =redis  (未关联)= |
 | 右栏 | 选中组的每份配置一段 =etaf-panel=（段头两行 + 服务表）；未选中组时显示「选择左侧的组」 |
 | 底栏 | =导入 compose= / =导出 compose= / =销毁环境= |
 | 提示区 | =etaf-alert=：成功/信息类 3 秒后自动消失，错误类保留到你手动关闭 |
@@ -378,6 +378,7 @@ M-x ebasecamp-export-compose     或界面底栏「导出 compose」
 | 同一项目同一组只能 1 份配置 | 容器标签没有配置维度，同名服务会撞。需要「同一组在同一项目两套」时目前无解（记在技术债） |
 | shared 组至多 1 份配置且 =:project= 必填 | 多宿主会互相覆盖 =_shared/compose.yaml= 与 =ebc-shared= 容器集合；缺 =:project= 直接加载报错 |
 | 旧 =:groups= 写法可用，但重复引用同组会报错 | v0.1 静默「取首个」，v0.2 起加载报 =ebasecamp-config-duplicate-group-ref=。修法：删掉重复项，差异并入唯一那一项的 =:services= |
+| 旧 =:groups= 关联显示为「旧写法」段 | 组侧没有 =:configs= 的 v0.1 清单：组节点文案为 =MySQL  (旧 · 1 项目)=、右栏段头为 =（旧写法）→ 示例项目=，并在组标题下给迁移提示（服务仍可正常启停，只是没有配置名）。改成组侧 =:configs= 后段头恢复为 =配置名 → 项目=；组既无配置也无关联赛显示 =(未关联)= |
 | =env_file= 需重新导入 | 清单形态已由 =((:source PATH :type env))= 改为路径字符串列表（=("./db.env")=）；D4 之前导入的清单继续导出会报 =env_file must be a string= |
 | 界面不做清单编辑 | 清单只能手工编辑 Elisp，改完 =M-x ebasecamp-reload= |
 | 没有 shared 清理入口 | 插件侧 =down= 只覆盖 per-project；shared 容器需 =docker rm -f=（技术债 #16） |
