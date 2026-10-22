@@ -2,10 +2,11 @@
 
 ## 当前状态
 
-- 阶段：Phase 2（Plan）· 已修订待复审
-- 已确认：方案 V2 ✅（用户 2026-10-22 确认）、计划 ⏳（修订后待 plan-reviewer 复审 + 用户确认）
-- 修订记录：2026-10-22 第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修「导入落盘语义未定义」并实证 `--no-env-resolution` / `--no-path-resolution`
-- 下一步：plan-reviewer 复审 → 用户确认计划 → Phase 3 批次 0
+- 阶段：Phase 3（Implement）· 批次 0 完成
+- 已确认：方案 V2 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）
+- 已完成：批次 0（T0.1–T0.5）
+- 下一步：批次 1（T1.1 model 层，先写 ERT 测试）
+- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag
 
 ## 目标
 
@@ -75,15 +76,15 @@ docker compose -f <file> config --no-interpolate --no-env-resolution --no-path-r
 
 ### 批次 0：仓库基础设施
 
-- [ ] T0.1 创建目录骨架 `lisp/`、`test/`、`docs/adr/`、`openspec/active/`、`openspec/completed/`
+- [x] T0.1 创建目录骨架 `lisp/`、`test/`、`docs/adr/`、`openspec/active/`、`openspec/completed/`
       （依赖：无）验收：目录存在，本计划位于 `openspec/active/`
-- [ ] T0.2 `.gitignore`：`*.elc`、`.cask/`、`.eask/`、`*~`、`.#*`
+- [x] T0.2 `.gitignore`：`*.elc`、`.cask/`、`.eask/`、`*~`、`.#*`
       （依赖：无）验收：`git status --porcelain` 不显示 .elc
-- [ ] T0.3 `Makefile`：`check-parens`、`compile`（`byte-compile-error-on-warn`）、`test`（ERT）、`check`（串联三者）
+- [x] T0.3 `Makefile`：`check-parens`、`compile`（`byte-compile-error-on-warn`）、`test`（ERT）、`check`（串联三者）
       （依赖：T0.5（产出 `ELPA_LOAD_PATH` 值））验收：`make check` 可运行并在失败时非零退出
-- [ ] T0.4 `AGENTS.md` 仓库地图：目录职责、开发命令、不变量清单（命名/标签/网络/生成物/安全约束）
+- [x] T0.4 `AGENTS.md` 仓库地图：目录职责、开发命令、不变量清单（命名/标签/网络/生成物/安全约束）
       （依赖：无）验收：引用的路径全部真实存在
-- [ ] T0.5 探测 `etaf`/`etaf-ui` 的 batch 加载路径写入 `Makefile` 的 `ELPA_LOAD_PATH`
+- [x] T0.5 探测 `etaf`/`etaf-ui` 的 batch 加载路径写入 `Makefile` 的 `ELPA_LOAD_PATH`
       （依赖：无）验收：`emacs -Q --batch` 下 `(require 'etaf)` 与 `(require 'etaf-ui)` 均成功
 
 ### 批次 1：M1 数据层与 compose 生成

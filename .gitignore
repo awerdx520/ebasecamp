@@ -1,0 +1,10 @@
+# Emacs
+*.elc
+.#*
+*~
+\#*\#
+
+# 构建/测试产物
+.cask/
+.eask/
+test/fixtures/.tmp/
