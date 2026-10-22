@@ -487,17 +487,6 @@ SOFT 是其余（如 `unknown'，只提示）。纯函数。"
         (setq soft (append soft (list conflict)))))
     (cons blocking soft)))
 
-;;; 选中 key → 命令层 key
-
-(defun ebasecamp-ui--command-key (key)
-  "把界面选中 KEY 归一为命令层的 \"group/service\"。
-段内 key 已是该形态（两段），原样返回；三段形态（旧的
-\"project/group/service\"）剥离项目前缀；其他形态也原样返回。纯函数。"
-  (let ((parts (and (stringp key) (split-string key "/"))))
-    (if (and parts (= 3 (length parts)) (nth 1 parts) (nth 2 parts))
-        (format "%s/%s" (nth 1 parts) (nth 2 parts))
-      key)))
-
 ;;; 树项 / 列
 
 (defun ebasecamp-ui--ratio-label (running total)
