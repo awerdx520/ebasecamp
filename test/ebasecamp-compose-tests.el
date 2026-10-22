@@ -335,4 +335,38 @@
       (should (string-match-p
                (regexp-quote "    command: [\"serve\",\"--port\",\"8080\"]") yaml)))))
 
+;;; 14. cache-file / write 的 shared 分支
+
+(ert-deftest ebasecamp-compose-test-cache-file-shared-directory ()
+  "只过滤出 shared 组时生成物目录为 _shared，混合或不过滤时为项目名。"
+  (ebasecamp-compose-test--clean
+    (let* ((project (ebasecamp-compose-test--manifest))
+           (shared (ebasecamp-compose-cache-file project 'mysql))
+           (own (ebasecamp-compose-cache-file project 'app))
+           (all (ebasecamp-compose-cache-file project))
+           (root (file-name-as-directory
+                  (expand-file-name ebasecamp-cache-directory))))
+      (should (equal (expand-file-name "_shared/compose.yaml" root) shared))
+      (should (equal (expand-file-name "myapp/compose.yaml" root) own))
+      (should (equal (expand-file-name "myapp/compose.yaml" root) all))
+      ;; 纯路径计算，不写盘
+      (should-not (file-exists-p shared)))))
+
+(ert-deftest ebasecamp-compose-test-write-shared-branch ()
+  "write 在 group-filter 只含 shared 组时写入 _shared/compose.yaml。"
+  (ebasecamp-compose-test--clean
+    (let* ((project (ebasecamp-compose-test--manifest))
+           (path (ebasecamp-compose-write project 'mysql))
+           (root (file-name-as-directory
+                  (expand-file-name ebasecamp-cache-directory)))
+           (content (with-temp-buffer
+                      (insert-file-contents path)
+                      (buffer-string))))
+      (should (equal (expand-file-name "_shared/compose.yaml" root) path))
+      (should (file-exists-p path))
+      (should (equal (ebasecamp-compose-render project 'mysql) content))
+      (should (string-match-p "^name: ebc-shared$" content))
+      (should (string-match-p "^  mysql:$" content))
+      (should-not (string-match-p "^  api:$" content)))))
+
 ;;; ebasecamp-compose-tests.el ends here

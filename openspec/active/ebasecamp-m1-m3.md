@@ -2,11 +2,11 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 批次 1 进行中
+- 阶段：Phase 3（Implement）· 批次 1 完成
 - 已确认：方案 V2 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）
-- 已完成：批次 0（T0.1–T0.5）、T1.1（model 层）、T1.2（config 层）、T1.3（compose 生成）、T1.4（docker 适配）
-- 下一步：T1.5 ERT 套件收口与 fixture 整理
-- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist 形式
+- 已完成：批次 0（T0.1–T0.5）、批次 1（T1.1 model / T1.2 config / T1.3 compose / T1.4 docker / T1.5 测试收口 / T1.6 L2 验证）
+- 下一步：批次 2（T2.1 status 层，先写 ERT 测试）
+- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist；批次 1 修复 Makefile stale .elc 陷阱
 
 ## 目标
 
@@ -97,9 +97,9 @@ docker compose -f <file> config --no-interpolate --no-env-resolution --no-path-r
       （依赖：T1.1）验收：ERT 快照覆盖 单服务/多服务/端口覆盖/`${VAR}` 原样保留/标签注入；生成物通过 `docker compose config -q`（L2）
 - [x] T1.4 `lisp/ebasecamp-docker.el`：`make-process` 异步封装（回调 + 超时 + kill）；`config -q` 校验（退出码 + stderr 双判据）；`ps --no-trunc` JSON 行解析（Labels 逗号串按 `ebasecamp.*`/`com.docker.compose.*` 前缀解析）；错误归一化（含 `ebasecamp-docker-permission`）；`docker compose version` 启动检测与版本警告
       （依赖：无）验收：ERT 用 fixture 覆盖 ps 解析（截断防护、多标签）、校验失败归类、权限错误归类、版本不符警告
-- [ ] T1.5 ERT 测试套件落地：`test/ebasecamp-model-tests.el`、`test/ebasecamp-config-tests.el`、`test/ebasecamp-compose-tests.el`、`test/ebasecamp-docker-tests.el` + `test/fixtures/`
+- [x] T1.5 ERT 测试套件落地：`test/ebasecamp-model-tests.el`、`test/ebasecamp-config-tests.el`、`test/ebasecamp-compose-tests.el`、`test/ebasecamp-docker-tests.el` + `test/fixtures/`
       （依赖：T1.1–T1.4）验收：`make test` 全绿，fixture 为实测输出
-- [ ] T1.6 L2：生成含 alpine 服务的 compose 并 `docker compose config -q` 通过（不起容器）；同时验证生成物中 `${VAR}` 未被插值
+- [x] T1.6 L2：生成含 alpine 服务的 compose 并 `docker compose config -q` 通过（不起容器）；同时验证生成物中 `${VAR}` 未被插值
       （依赖：T1.3、T1.4）验收：命令输出为零 stderr、退出码 0；并断言生成物文本中含 `${VAR}` 字面量（未被插值）
 
 ### 批次 2：M1 只读界面

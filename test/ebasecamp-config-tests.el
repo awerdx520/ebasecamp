@@ -255,5 +255,36 @@ EXTRA 非 nil 时原样附加在项目名之后（用于构造非法关键字等
                      (ebasecamp-config-ensure-directory target)))
       (should (file-directory-p target)))))
 
+;;; 12. directory
+
+(ert-deftest ebasecamp-config-test-directory-default-value ()
+  "默认清单目录为 ~/.config/ebasecamp/ 的绝对路径且以 / 结尾。"
+  (should (equal (expand-file-name "~/.config/ebasecamp/")
+                 ebasecamp-config-directory))
+  (should (file-name-absolute-p ebasecamp-config-directory))
+  (should (string-suffix-p "/" ebasecamp-config-directory)))
+
+(ert-deftest ebasecamp-config-test-directory-uses-variable-when-omitted ()
+  "省略 DIRECTORY 时路径助手使用 `ebasecamp-config-directory' 并补结尾斜杠。"
+  (let ((ebasecamp-config-directory "/tmp/ebc-config-dir-no-slash"))
+    (should (equal "/tmp/ebc-config-dir-no-slash/"
+                   (ebasecamp-config--directory)))
+    (should (equal (expand-file-name "/tmp/ebc-config-dir-no-slash/projects/x.el")
+                   (ebasecamp-config-project-file 'x)))))
+
+(ert-deftest ebasecamp-config-test-ensure-directory-idempotent ()
+  "目录已存在时重复调用返回同一路径，且不改动目录内已有文件。"
+  (ebasecamp-config-test--with-dir
+    (let* ((target (expand-file-name "list" dir))
+           (marker (expand-file-name "groups.el" target))
+           (first (ebasecamp-config-ensure-directory target)))
+      (ebasecamp-config-test--write marker ";; keep\n")
+      (should (equal first (ebasecamp-config-ensure-directory target)))
+      (should (file-directory-p target))
+      (should (equal ";; keep\n"
+                     (with-temp-buffer
+                       (insert-file-contents marker)
+                       (buffer-string)))))))
+
 (provide 'ebasecamp-config-tests)
 ;;; ebasecamp-config-tests.el ends here

@@ -11,3 +11,5 @@
 | 7 | 清单加载失败时用「reset + 重放已成功文件」回滚（O(n²) 次 load） | 清单文件多时首次加载变慢 | 规模超过 ~50 文件前评估在 model 层补 snapshot/restore |
 | 8 | `extra` 字段原样透传到 compose，清单层不校验键名 | 非法 compose 字段会导致 `config -q` 失败（实测 `services.x.description` 非 schema） | 在 `docs/user-guide.org` 明确「extra 只放合法 compose 字段」；M4 可加字段白名单校验 |
 | 9 | 自定义网络的 external 语义无法表达；跨组同名服务静默保留首个 | 用户无法引用已存在的外部网络；同名服务不会报错而是被静默丢弃 | M4 在 model 层加 `:external` 标记与服务名冲突校验 |
+| 10 | Docker 无健康检查时 `HealthStatus` 为 `"none"` 而非空串 | status 层若原样透传，UI 会显示 `none` | T2.1 在状态归一化时把 `"none"` 与空串都归一为 nil |
+| 11 | `Labels` 值内含逗号时无法完全还原（docker 不转义） | `parse-labels` 的 alist 可能不完整 | 状态层只按 `ebasecamp.*` / `com.docker.compose.*` 前缀取已知键，不依赖完整解析 |

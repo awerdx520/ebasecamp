@@ -12,17 +12,22 @@ check: check-parens compile test
 
 check-parens:
 	@if [ -z "$(EL_FILES)" ]; then echo "check-parens: 无 .el 文件，跳过"; exit 0; fi; \
-	$(EMACS) -Q --batch $(LOAD_PATH) --eval '(let ((fail nil) (files (cdr (member "--" command-line-args)))) (dolist (f files) (with-temp-buffer (insert-file-contents f) (emacs-lisp-mode) (condition-case err (check-parens) (error (setq fail t) (message "check-parens FAIL %s: %s" f err))))) (if fail (kill-emacs 1) (message "check-parens OK (%d files)" (length files))))' -- $(EL_FILES)
+	$(EMACS) -Q --batch $(LOAD_PATH) \
+	  --eval '(setq load-prefer-newer t)' \
+	  --eval '(let ((fail nil) (files (cdr (member "--" command-line-args)))) (dolist (f files) (with-temp-buffer (insert-file-contents f) (emacs-lisp-mode) (condition-case err (check-parens) (error (setq fail t) (message "check-parens FAIL %s: %s" f err))))) (if fail (kill-emacs 1) (message "check-parens OK (%d files)" (length files))))' -- $(EL_FILES)
 
 compile:
 	@if [ -z "$(EL_FILES)" ]; then echo "compile: 无 .el 文件，跳过"; exit 0; fi; \
 	$(EMACS) -Q --batch $(LOAD_PATH) \
+	  --eval '(setq load-prefer-newer t)' \
 	  --eval '(setq byte-compile-error-on-warn t)' \
 	  -f batch-byte-compile $(EL_FILES)
 
 test:
 	@if [ -z "$(TEST_FILES)" ]; then echo "test: 无测试文件，0 项通过"; exit 0; fi; \
-	$(EMACS) -Q --batch $(LOAD_PATH) -l ert $(patsubst %,-l %, $(TEST_FILES)) \
+	$(EMACS) -Q --batch $(LOAD_PATH) \
+	  --eval '(setq load-prefer-newer t)' \
+	  -l ert $(patsubst %,-l %, $(TEST_FILES)) \
 	  --eval '(ert-run-tests-batch-and-exit t)'
 
 clean:

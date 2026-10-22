@@ -342,4 +342,21 @@
       1 "" "permission denied while trying to connect to the Docker daemon socket"
     (should-error (ebasecamp-docker-ps) :type 'ebasecamp-docker-permission)))
 
+;;; 19. 默认超时透传
+
+(ert-deftest ebasecamp-docker-test-run-sync-default-timeout ()
+  "未传 :timeout 时把 `ebasecamp-docker-timeout-seconds' 透传给执行层。"
+  (should (= 30 ebasecamp-docker-timeout-seconds))
+  (let ((ebasecamp-docker-timeout-seconds 7)
+        (seen nil))
+    (let ((ebasecamp-docker--run-sync-function
+           (lambda (_args timeout)
+             (setq seen timeout)
+             (list :exit 0 :stdout "" :stderr ""))))
+      (ebasecamp-docker-run-sync '("ps"))
+      (should (= 7 seen))
+      ;; 显式 :timeout 优先于 defcustom
+      (ebasecamp-docker-run-sync '("ps") :timeout 0.5)
+      (should (= 0.5 seen)))))
+
 ;;; ebasecamp-docker-tests.el ends here
