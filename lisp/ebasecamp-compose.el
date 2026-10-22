@@ -23,6 +23,13 @@
 ;; shared-network 非 nil 时）；服务引用的其余网络在顶层以空映射声明，由
 ;; compose 按项目创建 —— 不声明会让 `config -q' 报「引用了未定义网络」。
 ;;
+;; 跨 scope 依赖：shared 组与 per-project 组落在不同 compose 项目
+;; （`ebc-shared' / `ebc-<project>'），生成物互相独立。按 scope 渲染
+;; （GROUP-FILTER 非 nil）时，depends-on 中指向本次未渲染服务的名字会被剔除
+;; —— 这些依赖在另一个 compose 项目里，保留会让 `docker compose up' 报
+;; 「depends on undefined service」。全量渲染（GROUP-FILTER 为 nil，预览/导出）
+;; 保留全部依赖，供 `ebasecamp-command' 计算跨 scope 依赖闭包。
+;;
 ;; 标签不变量：所有托管服务注入 ebasecamp.managed / .project / .group /
 ;; .service / .scope 五项；用户 labels 先写入，同名键由注入项覆盖。
 ;;
@@ -312,6 +319,17 @@ CONTEXT 为 plist，提供 :project、:group、:scope。不修改 SERVICE 的 la
         (setq networks (append networks (list "ebasecamp")))))
     (cl-remove-duplicates networks :test #'equal)))
 
+(defun ebasecamp-compose--filtered-depends-on (depends-on allowed)
+  "按 ALLOWED 过滤服务依赖 DEPENDS-ON，返回新列表。
+ALLOWED 为 nil 时原样返回 DEPENDS-ON（全量渲染：预览与导出不剔除任何依赖）。
+ALLOWED 非 nil 时只保留其成员：按 scope 渲染时生成物只含本次渲染的服务，
+指向其他 compose 项目（如 shared 组的 `ebc-shared'）的依赖无法解析，保留会
+让 `docker compose up' 报 depends on undefined service。"
+  (if (null allowed)
+      depends-on
+    (cl-remove-if-not (lambda (dependency) (member dependency allowed))
+                      depends-on)))
+
 (defun ebasecamp-compose--healthcheck-body (healthcheck indent)
   "把 healthcheck plist HEALTHCHECK 渲染为 block 映射，每行缩进 INDENT。
 列表值（如 test）渲染为 flow 序列，其余按标量输出。"
@@ -329,10 +347,13 @@ CONTEXT 为 plist，提供 :project、:group、:scope。不修改 SERVICE 的 la
       (setq rest (cddr rest)))
     (mapconcat #'identity (nreverse lines) "\n")))
 
-(defun ebasecamp-compose--service-body (service context volume-entries)
+(defun ebasecamp-compose--service-body (service context volume-entries
+                                               &optional allowed-depends)
   "返回 SERVICE 的服务体文本（每行缩进 4 个空格）。
 CONTEXT 为 plist，提供 :project、:group、:scope、:shared-network；
-VOLUME-ENTRIES 为 `ebasecamp-compose--volume-entries' 的结果。"
+VOLUME-ENTRIES 为 `ebasecamp-compose--volume-entries' 的结果。
+ALLOWED-DEPENDS 为 nil 时保留全部 depends-on；非 nil 时只保留其中的名字
+（见 `ebasecamp-compose--filtered-depends-on'），剔除后为空则不输出该键。"
   (let ((lines nil)
         (pad (make-string 4 ?\s))
         (nested 6)
@@ -344,7 +365,8 @@ VOLUME-ENTRIES 为 `ebasecamp-compose--volume-entries' 的结果。"
                        (cons "restart" (ebasecamp-service-restart service))))
         (environment (ebasecamp-service-environment service))
         (ports (ebasecamp-service-ports service))
-        (depends-on (ebasecamp-service-depends-on service))
+        (depends-on (ebasecamp-compose--filtered-depends-on
+                     (ebasecamp-service-depends-on service) allowed-depends))
         (healthcheck (ebasecamp-service-healthcheck service))
         (extra (ebasecamp-service-extra service)))
     ;; 镜像引用属已知安全值，按原样裸写
@@ -456,38 +478,62 @@ symbol。项目名或组名不匹配 [a-z0-9_-]+ 时报 ebasecamp-compose-error�
 (defun ebasecamp-compose-render (project &optional group-filter)
   "把 PROJECT 渲染为 compose YAML 文本并返回。
 GROUP-FILTER 为 nil 时渲染项目引用的全部组；为 symbol、字符串或它们的列表
-时只渲染指定组（用于 shared 组单独生成）。返回文本以单个换行结尾。"
+时只渲染指定组（用于 shared 组单独生成）。返回文本以单个换行结尾。
+
+GROUP-FILTER 非 nil（按 scope 渲染）时，服务 depends-on 中指向**本次未渲染
+服务**的名字被剔除 —— 这些依赖属于另一个 compose 项目（shared 组在
+`ebc-shared'、per-project 组在 `ebc-<project>'），保留会让 `docker compose up'
+报 depends on undefined service。GROUP-FILTER 为 nil（预览/导出）时行为不变。"
   (ebasecamp-compose--check-project project)
   (let* ((refs (ebasecamp-compose--group-refs project group-filter))
          (name (ebasecamp-compose--compose-name project refs))
          (shared-network (ebasecamp-project-shared-network project))
+         (pairs nil)
          (services nil)
          (networks nil)
-         (volumes nil))
+         (volumes nil)
+         (allowed nil))
+    ;; 第一遍：收集本次渲染的服务（同名只保留首个，与第二遍去重规则一致），
+    ;; filter 模式下同时得到 depends-on 白名单。
     (dolist (ref refs)
-      (let* ((group-name (ebasecamp-compose--ref-group-name ref))
+      (dolist (service (ebasecamp-model-resolve-services project ref))
+        (unless (cl-find (ebasecamp-service-name service) pairs
+                         :key (lambda (pair) (ebasecamp-service-name (cdr pair)))
+                         :test #'eq)
+          (setq pairs (cons (cons ref service) pairs)))))
+    (setq pairs (nreverse pairs))
+    (when group-filter
+      (dolist (pair pairs)
+        (let ((service-name
+               (symbol-name (ebasecamp-service-name (cdr pair)))))
+          (unless (member service-name allowed)
+            (setq allowed (append allowed (list service-name)))))))
+    ;; 第二遍：渲染服务体
+    (dolist (pair pairs)
+      (let* ((ref (car pair))
+             (service (cdr pair))
+             (group-name (ebasecamp-compose--ref-group-name ref))
              (scope (ebasecamp-compose--ref-scope ref))
              (context (list :project (ebasecamp-project-name project)
                             :group group-name
                             :scope scope
-                            :shared-network shared-network)))
-        (dolist (service (ebasecamp-model-resolve-services project ref))
-          (let* ((entries (ebasecamp-compose--volume-entries
-                           service scope group-name))
-                 (body (ebasecamp-compose--service-body service context entries))
-                 (service-networks (ebasecamp-compose--service-networks
-                                    service context)))
-            (dolist (entry entries)
-              (when (and (car entry) (not (member (car entry) volumes)))
-                (setq volumes (append volumes (list (car entry))))))
-            (dolist (network service-networks)
-              (when (and (not (equal network "ebasecamp"))
-                         (not (member network networks)))
-                (setq networks (append networks (list network)))))
-            (unless (assq (ebasecamp-service-name service) services)
-              (setq services
-                    (append services
-                            (list (cons (ebasecamp-service-name service) body)))))))))
+                            :shared-network shared-network))
+             (entries (ebasecamp-compose--volume-entries
+                       service scope group-name))
+             (body (ebasecamp-compose--service-body
+                    service context entries allowed))
+             (service-networks (ebasecamp-compose--service-networks
+                                service context)))
+        (dolist (entry entries)
+          (when (and (car entry) (not (member (car entry) volumes)))
+            (setq volumes (append volumes (list (car entry))))))
+        (dolist (network service-networks)
+          (when (and (not (equal network "ebasecamp"))
+                     (not (member network networks)))
+            (setq networks (append networks (list network)))))
+        (setq services
+              (append services
+                      (list (cons (ebasecamp-service-name service) body))))))
     (let ((sections (list (concat "name: " name)
                           (ebasecamp-compose--services-section services))))
       (when (or shared-network networks)

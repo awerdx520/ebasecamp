@@ -96,6 +96,22 @@
   (ebasecamp-define-project myapp :groups ((app)))
   (ebasecamp-model-project 'myapp))
 
+(defun ebasecamp-command-test--cross-depends ()
+  "构造跨 scope 依赖的清单，返回 myapp 项目对象。
+shared 组 cache 提供 redis；per-project 组 app 提供 api，其 depends-on 指向
+shared 组的 redis —— per-project 生成物里没有 redis 定义。"
+  (ebasecamp-define-group cache
+    :title "缓存"
+    :scope shared
+    :services
+    ((redis :image "redis:7" :ports ((6379 . 6379)))))
+  (ebasecamp-define-group app
+    :scope per-project
+    :services
+    ((api :image "app:1" :depends-on ("redis"))))
+  (ebasecamp-define-project myapp :groups ((cache) (app)))
+  (ebasecamp-model-project 'myapp))
+
 (defun ebasecamp-command-test--stub-sync (exit stderr)
   "构造 `ebasecamp-docker-run-sync' 的替身，恒返回 EXIT / STDERR。"
   (lambda (_args &rest _) (list :exit exit :stdout "" :stderr stderr)))
@@ -468,12 +484,156 @@
       (should-not (ebasecamp-command-port-conflicts project nil))
       (should (= 0 probes)))))
 
+;;; T3.1 补强：跨 scope 的 depends_on
+
+(ert-deftest ebasecamp-command-test-split-keys-requires-shared ()
+  "per-project 服务依赖 shared 服务 → project 分支记录 :requires-shared。"
+  (ebasecamp-command-test--clean
+    (let* ((project (ebasecamp-command-test--cross-depends))
+           (split (ebasecamp-command-split-keys project '("app/api"))))
+      ;; 只选了 per-project 服务 → 本次 shared 分支为空
+      (should-not (plist-get split :shared))
+      (should (equal '("redis")
+                     (plist-get (plist-get split :project) :requires-shared)))
+      ;; 全量选择时 shared 分支存在，project 分支仍记录同一依赖
+      (let ((all (ebasecamp-command-split-keys project nil)))
+        (should (equal '("redis") (plist-get (plist-get all :shared) :services)))
+        (should (equal '("redis")
+                       (plist-get (plist-get all :project) :requires-shared)))
+        ;; shared 分支不带 :requires-shared
+        (should-not (plist-get (plist-get all :shared) :requires-shared))))))
+
+(ert-deftest ebasecamp-command-test-split-keys-no-requires-shared ()
+  "无跨 scope 依赖 → 两个分支的 :requires-shared 均为 nil。"
+  (ebasecamp-command-test--clean
+    (let* ((project (ebasecamp-command-test--mixed))
+           (split (ebasecamp-command-split-keys project nil)))
+      (should-not (plist-get (plist-get split :project) :requires-shared))
+      (should-not (plist-get (plist-get split :shared) :requires-shared)))))
+
+(ert-deftest ebasecamp-command-test-run-auto-starts-shared ()
+  "run：存在 :requires-shared → shared 先、project 后，:order 与标志正确。"
+  (ebasecamp-command-test--clean
+    (let* ((project (ebasecamp-command-test--cross-depends))
+           (calls nil)
+           (result nil))
+      (cl-letf (((symbol-function 'ebasecamp-compose-write)
+                 (lambda (_project group-filter)
+                   (format "/tmp/%s.yaml"
+                           (mapconcat #'symbol-name group-filter "-"))))
+                ((symbol-function 'ebasecamp-docker-run-sync)
+                 (ebasecamp-command-test--stub-sync 0 ""))
+                ((symbol-function 'ebasecamp-docker-run-async)
+                 (lambda (args callback &rest _)
+                   (push args calls)
+                   (funcall callback (list :exit 0 :stdout "" :stderr ""))
+                   'fake-process)))
+        (ebasecamp-command-run 'start project '("app/api")
+                               :on-complete (lambda (value) (setq result value)))
+        (setq calls (nreverse calls))
+        (should (equal 2 (length calls)))
+        ;; 第一条命令是 shared 批次（只含被依赖的 redis）
+        (should (equal "ebc-shared" (nth 4 (nth 0 calls))))
+        (should (equal '("up" "-d" "redis") (nthcdr 5 (nth 0 calls))))
+        ;; 第二条是 project 批次
+        (should (equal "ebc-myapp" (nth 4 (nth 1 calls))))
+        (should (equal '("up" "-d" "api") (nthcdr 5 (nth 1 calls))))
+        (should (equal '(shared project) (plist-get result :order)))
+        (should (eq t (plist-get result :auto-started-shared)))
+        (should (eq t (plist-get result :ok)))
+        (should-not (ebasecamp-command-pending-p project))))))
+
+(ert-deftest ebasecamp-command-test-run-shared-failure-aborts-project ()
+  "run：shared 批次失败 → project 分支未执行，:ok nil，shared 结果标 :failed。"
+  (ebasecamp-command-test--clean
+    (let* ((project (ebasecamp-command-test--cross-depends))
+           (calls nil)
+           (result nil))
+      (cl-letf (((symbol-function 'ebasecamp-compose-write)
+                 (lambda (_project _filter) "/tmp/fake.yaml"))
+                ((symbol-function 'ebasecamp-docker-run-sync)
+                 (ebasecamp-command-test--stub-sync 0 ""))
+                ((symbol-function 'ebasecamp-docker-run-async)
+                 (lambda (args callback &rest _)
+                   (push args calls)
+                   (funcall callback
+                            (list :exit 1 :stdout "" :stderr "Error: shared boom"))
+                   'fake-process)))
+        (ebasecamp-command-run 'start project '("app/api")
+                               :on-complete (lambda (value) (setq result value)))
+        (should (= 1 (length calls)))
+        (should (equal "ebc-shared" (nth 4 (car calls))))
+        (should-not (plist-get result :ok))
+        (should (equal '(shared) (plist-get result :order)))
+        (let ((shared-result (nth 0 (plist-get result :results))))
+          (should (eq 'shared (plist-get shared-result :scope)))
+          (should (eq t (plist-get shared-result :failed)))
+          (should (equal 1 (plist-get shared-result :exit)))
+          (should (equal "Error: shared boom" (plist-get shared-result :stderr))))
+        ;; project 分支未执行，标记为 skipped
+        (should (eq t (plist-get (nth 1 (plist-get result :results)) :skipped)))
+        (should-not (ebasecamp-command-pending-p project))))))
+
+(ert-deftest ebasecamp-command-test-run-unknown-required-shared-service ()
+  "run：:requires-shared 指向项目 shared 组中不存在的服务 → ebasecamp-command-error。"
+  (ebasecamp-command-test--clean
+    (let* ((project (ebasecamp-command-test--cross-depends))
+           (calls 0))
+      ;; 分流层保证 :requires-shared 来自 shared 服务集合，这里直接注入越界值
+      ;; 验证 run 的清单一致性防御
+      (cl-letf (((symbol-function 'ebasecamp-command-split-keys)
+                 (lambda (&rest _)
+                   (list :project (list :scope 'project
+                                        :file "/tmp/own.yaml"
+                                        :name "ebc-myapp"
+                                        :services '("api")
+                                        :groups '(app)
+                                        :requires-shared '("ghost"))
+                         :shared (list :scope 'shared
+                                       :file "/tmp/shared.yaml"
+                                       :name "ebc-shared"
+                                       :services '("redis")
+                                       :groups '(cache)))))
+                ((symbol-function 'ebasecamp-compose-write)
+                 (lambda (_project _filter) "/tmp/fake.yaml"))
+                ((symbol-function 'ebasecamp-docker-run-sync)
+                 (ebasecamp-command-test--stub-sync 0 ""))
+                ((symbol-function 'ebasecamp-docker-run-async)
+                 (lambda (&rest _) (setq calls (1+ calls)))))
+        (should-error (ebasecamp-command-run 'start project '("app/api"))
+                      :type 'ebasecamp-command-error)
+        (should (= 0 calls))
+        (should-not (ebasecamp-command-pending-p project))))))
+
+(ert-deftest ebasecamp-command-test-run-without-requires-keeps-single-branch ()
+  "run：无跨 scope 依赖 → 只执行 project 分支，:auto-started-shared 为 nil。"
+  (ebasecamp-command-test--clean
+    (let* ((project (ebasecamp-command-test--mixed))
+           (calls nil)
+           (result nil))
+      (cl-letf (((symbol-function 'ebasecamp-compose-write)
+                 (lambda (_project _filter) "/tmp/fake.yaml"))
+                ((symbol-function 'ebasecamp-docker-run-sync)
+                 (ebasecamp-command-test--stub-sync 0 ""))
+                ((symbol-function 'ebasecamp-docker-run-async)
+                 (lambda (args callback &rest _)
+                   (push args calls)
+                   (funcall callback (list :exit 0 :stdout "" :stderr ""))
+                   'fake-process)))
+        (ebasecamp-command-run 'start project '("db/mysql")
+                               :on-complete (lambda (value) (setq result value)))
+        (should (equal 1 (length calls)))
+        (should (equal "ebc-myapp" (nth 4 (car calls))))
+        (should (equal '("up" "-d" "mysql") (nthcdr 5 (car calls))))
+        (should-not (plist-get result :auto-started-shared))
+        (should (equal '(project) (plist-get result :order)))
+        (should (eq t (plist-get result :ok)))))))
+
 ;;; 错误条件定义
 
 (ert-deftest ebasecamp-command-test-error-hierarchy ()
   "错误条件：busy 是 command-error 的子类。"
   (should (memq 'ebasecamp-command-error
                 (get 'ebasecamp-command-busy 'error-conditions))))
-
 (provide 'ebasecamp-command-tests)
 ;;; ebasecamp-command-tests.el ends here

@@ -97,6 +97,29 @@
   (ebasecamp-define-project job :shared-network nil :groups ((queue)))
   (ebasecamp-model-project 'job))
 
+(defun ebasecamp-compose-test--cross-depends ()
+  "构造跨 scope 依赖的清单，返回 shop 项目对象。
+shared 组 mysql 提供 mysql；per-project 组 app 提供 api（依赖 mysql 与同组
+worker）与 worker；per-project 组 tools 提供 migrate（只依赖 mysql，属组外）。
+mysql 属 shared 组而 api、migrate 属 per-project 组，两批落在不同 compose
+项目（ebc-shared / ebc-shop），因此跨集合依赖必须按 scope 剔除。"
+  (ebasecamp-define-group mysql
+    :title "MySQL"
+    :scope shared
+    :services
+    ((mysql :image "mysql:8.4")))
+  (ebasecamp-define-group app
+    :scope per-project
+    :services
+    ((api :image "app:1" :depends-on ("mysql" "worker"))
+     (worker :image "app:1")))
+  (ebasecamp-define-group tools
+    :scope per-project
+    :services
+    ((migrate :image "app:1" :depends-on ("mysql"))))
+  (ebasecamp-define-project shop :groups ((mysql) (app) (tools)))
+  (ebasecamp-model-project 'shop))
+
 ;;; 1. 项目命名
 
 (ert-deftest ebasecamp-compose-test-project-name-by-scope ()
@@ -327,13 +350,52 @@
       (should (string-match-p "^      retries: 3$" yaml)))))
 
 (ert-deftest ebasecamp-compose-test-render-depends-on ()
-  "depends_on 渲染为 block 列表。"
+  "depends_on 在全量渲染中渲染为 block 列表（含跨组合法依赖）。"
   (ebasecamp-compose-test--clean
     (let* ((project (ebasecamp-compose-test--manifest))
-           (yaml (ebasecamp-compose-render project 'app)))
+           (yaml (ebasecamp-compose-render project)))
       (should (string-match-p "    depends_on:\n      - mysql" yaml))
       (should (string-match-p
                (regexp-quote "    command: [\"serve\",\"--port\",\"8080\"]") yaml)))))
+
+;;; 13. 跨 scope depends_on（tech-debt #13）
+
+(ert-deftest ebasecamp-compose-test-filter-keeps-in-set-depends-on ()
+  "filter 渲染：依赖落在同一生成物的服务被保留。"
+  (ebasecamp-compose-test--clean
+    (let* ((project (ebasecamp-compose-test--cross-depends))
+           (yaml (ebasecamp-compose-render project '(app tools))))
+      (should (string-match-p "^name: ebc-shop$" yaml))
+      ;; api 依赖 worker（同为 app 组）→ 保留
+      (should (string-match-p "    depends_on:\n      - worker\n" yaml)))))
+
+(ert-deftest ebasecamp-compose-test-filter-drops-cross-set-depends-on ()
+  "filter 渲染：依赖指向集合外服务（跨 compose 项目）时被剔除。"
+  (ebasecamp-compose-test--clean
+    (let* ((project (ebasecamp-compose-test--cross-depends))
+           (yaml (ebasecamp-compose-render project '(app))))
+      (should (string-match-p "^  api:$" yaml))
+      (should (string-match-p "    depends_on:\n      - worker\n" yaml))
+      (should-not (string-match-p (regexp-quote "- mysql") yaml))
+      (should-not (string-match-p "mysql" yaml)))))
+
+(ert-deftest ebasecamp-compose-test-filter-drops-empty-depends-on ()
+  "filter 渲染：剔除后依赖为空时生成物不出现 depends_on 键。"
+  (ebasecamp-compose-test--clean
+    (let* ((project (ebasecamp-compose-test--cross-depends))
+           (yaml (ebasecamp-compose-render project '(tools))))
+      (should (string-match-p "^  migrate:$" yaml))
+      (should-not (string-match-p "depends_on" yaml))
+      (should-not (string-match-p "mysql" yaml)))))
+
+(ert-deftest ebasecamp-compose-test-no-filter-keeps-cross-set-depends-on ()
+  "无 filter 渲染（预览/导出）行为不变：跨组依赖完整保留。"
+  (ebasecamp-compose-test--clean
+    (let* ((project (ebasecamp-compose-test--cross-depends))
+           (yaml (ebasecamp-compose-render project)))
+      (should (string-match-p
+               "    depends_on:\n      - mysql\n      - worker\n" yaml))
+      (should (string-match-p "    depends_on:\n      - mysql\n" yaml)))))
 
 ;;; 14. cache-file / write 的 shared 分支
 

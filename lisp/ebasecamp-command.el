@@ -33,6 +33,13 @@
 ;; 端口冲突检测（T3.3）：启动前的两步检查 —— ①选中集合内 published 端口重复；
 ;; ②宿主端口已被占用。探测不可用（权限等）降级为 `unknown'，**不阻塞**启动。
 ;;
+;; 跨 scope depends_on（tech-debt #13）：per-project 服务的 depends-on 可能指向
+;; shared 组服务（如 api → mysql）。compose 层按 scope 渲染时会剔除这类跨集合
+;; 依赖（否则 `up' 报 depends on undefined service），因此本模块在 `start' 时
+;; 先补齐 shared 批次：`:requires-shared' 非空则串行先跑 shared、成功后才跑
+;; per-project；失败即中止。stop / restart / down 不做补齐（补齐等于在停止
+;; 操作里反向启动容器）。
+;;
 ;; 安全约定：命令参数一律以字符串列表直接交给 `make-process'（不经 shell），
 ;; stderr 原样保留供上层展示；本模块不读取、不打印、不落盘任何密钥值。
 
@@ -198,33 +205,100 @@ KEYS 为 nil 时返回项目全部服务（按项目定义顺序与组内顺序�
 
 ;;; scope 拆分（纯函数）
 
-(defun ebasecamp-command--branch (project selection scope)
-  "构造 SCOPE 批次的执行描述 plist；该 scope 无选中项时返回 nil。
+(defun ebasecamp-command--scope-service-names (project scope)
+  "返回 PROJECT 中 SCOPE 各组提供的服务名列表（字符串数组、去重、定义顺序）。"
+  (let ((names nil))
+    (dolist (ref (ebasecamp-command--scope-refs project scope))
+      (dolist (service (ebasecamp-model-resolve-services project ref))
+        (let ((name (symbol-name (ebasecamp-service-name service))))
+          (unless (member name names)
+            (setq names (append names (list name)))))))
+    names))
+
+(defun ebasecamp-command--requires-shared (project entries)
+  "返回 ENTRIES 需要先行启动的 shared 服务名列表（去重、按名字排序）。
+取每个服务的**原始** depends-on（模型层解析结果，未经 compose 渲染剔除）：
+落在项目 per-project 各组服务集合内的是同批依赖（生成物里已有定义），不计入；
+属于 shared 组服务集合的记入结果 —— 它们在另一个 compose 项目（`ebc-shared'）
+里，不先把 shared 批次启起来就会 `depends on undefined service'。"
+  (let ((own (ebasecamp-command--scope-service-names project 'project))
+        (available (ebasecamp-command--scope-service-names project 'shared))
+        (result nil))
+    (dolist (entry entries)
+      (dolist (dependency (ebasecamp-service-depends-on
+                           (plist-get entry :record)))
+        (let ((name (ebasecamp-command--service-name dependency)))
+          (when (and (not (member name own))
+                     (member name available)
+                     (not (member name result)))
+            (setq result (append result (list name)))))))
+    (sort result #'string<)))
+
+(defun ebasecamp-command--check-requires (project requires)
+  "校验 REQUIRES 中每个名字都是 PROJECT 的 shared 组服务。
+不在 shared 服务集合中时 signal `ebasecamp-command-error'（清单不一致：
+依赖既不在本批生成物里，也无法通过 shared 批次启动）。"
+  (let ((available (ebasecamp-command--scope-service-names project 'shared)))
+    (dolist (name requires)
+      (unless (member name available)
+        (signal 'ebasecamp-command-error
+                (list (format "项目 %s 依赖的 shared 服务 %s 不存在（清单不一致）"
+                              (ebasecamp-project-name project) name)))))))
+
+(defun ebasecamp-command--branch-shell (project scope services)
+  "构造 SCOPE 批次的执行描述 plist，服务集合为 SERVICES；SERVICES 为 nil 返回 nil。
 返回字段：`:scope'、`:file'（`ebasecamp-compose-cache-file' 的生成物路径，
 只含该 scope 的组）、`:name'（compose 项目名）、`:services'（服务名列表）、
 `:groups'（该 scope 的组名列表，供渲染时做 group-filter）。"
-  (let ((entries (cl-remove-if-not
-                  (lambda (entry) (eq scope (plist-get entry :scope)))
-                  selection)))
-    (when entries
-      (let* ((refs (ebasecamp-command--scope-refs project scope))
-             (groups (mapcar (lambda (ref) (plist-get ref :group)) refs)))
-        (unless refs
-          (signal 'ebasecamp-command-error
-                  (list (format "项目 %s 的 %s scope 缺少组引用"
-                                (ebasecamp-project-name project) scope))))
-        (list :scope scope
-              :file (ebasecamp-compose-cache-file project groups)
-              :name (ebasecamp-compose-project-name project (car refs))
-              :services (mapcar (lambda (entry)
-                                  (symbol-name (plist-get entry :service)))
-                                entries)
-              :groups groups)))))
+  (when services
+    (let* ((refs (ebasecamp-command--scope-refs project scope))
+           (groups (mapcar (lambda (ref) (plist-get ref :group)) refs)))
+      (unless refs
+        (signal 'ebasecamp-command-error
+                (list (format "项目 %s 的 %s scope 缺少组引用"
+                              (ebasecamp-project-name project) scope))))
+      (list :scope scope
+            :file (ebasecamp-compose-cache-file project groups)
+            :name (ebasecamp-compose-project-name project (car refs))
+            :services services
+            :groups groups))))
+
+(defun ebasecamp-command--shared-branch (project shared requires)
+  "返回自动补齐依赖用的 shared 批次，服务集合覆盖 REQUIRES。
+SHARED 为本次选中产生的 shared 批次（可能为 nil）：已包含 REQUIRES 全部名字
+时直接复用；否则在选中服务之后追加缺失的依赖服务名（保留选中顺序）。"
+  (let* ((selected (and shared (plist-get shared :services)))
+         (missing (cl-set-difference requires selected :test #'equal)))
+    (if (null missing)
+        shared
+      (ebasecamp-command--branch-shell project 'shared
+                                      (append selected missing)))))
+
+(defun ebasecamp-command--branch (project selection scope)
+  "构造 SCOPE 批次的执行描述 plist；该 scope 无选中项时返回 nil。
+字段见 `ebasecamp-command--branch-shell'；per-project 批次另含
+`:requires-shared'（本批服务的原始 depends-on 中属于 shared 组、需要先启动的
+服务名，去重排序，无跨 scope 依赖时为 nil）。"
+  (let* ((entries (cl-remove-if-not
+                   (lambda (entry) (eq scope (plist-get entry :scope)))
+                   selection))
+         (branch (ebasecamp-command--branch-shell
+                  project scope
+                  (mapcar (lambda (entry)
+                            (symbol-name (plist-get entry :service)))
+                          entries))))
+    (if (and branch (eq scope 'project))
+        (append branch
+                (list :requires-shared
+                      (ebasecamp-command--requires-shared project entries)))
+      branch)))
 
 (defun ebasecamp-command-split-keys (project keys)
   "把选中服务 KEYS 按 scope 分流为 shared 与 per-project 两批。
 返回 plist `(:project BRANCH :shared BRANCH)'，某 scope 无选中服务时对应值
-为 nil，BRANCH 结构见 `ebasecamp-command--branch'。
+为 nil，BRANCH 结构见 `ebasecamp-command--branch-shell'；per-project 批次另含
+`:requires-shared'（跨 scope 依赖的 shared 服务名列表，见
+`ebasecamp-command--requires-shared'），shared 批次不带该键。
 KEYS 元素为 \"group/service\" 字符串或 (:group G :service S) plist；nil 表示
 项目全部服务。未知 group/service signal `ebasecamp-command-error'。
 纯函数：不执行命令、不落盘（`:file' 只计算路径）。"
@@ -319,6 +393,80 @@ PROJECT 可为项目对象、symbol 或字符串。"
   (let ((exit (plist-get result :exit)))
     (and (numberp exit) (zerop exit))))
 
+(defun ebasecamp-command--dispatch (action object name branches
+                                          sequential auto-shared on-complete)
+  "派发批次 BRANCHES（分支 plist 列表），返回已启动的进程列表。
+SEQUENTIAL 非 nil 时按顺序派发，某批次失败后中止后续批次（结果记为
+`:skipped'）；AUTO-SHARED 非 nil 表示 shared 批次是为跨 scope 依赖自动补齐的。
+ON-COMPLETE 在所有批次结束后调用，参数 plist：
+`(:action :project :ok :results :auto-started-shared :order)'，
+`:results' 元素为 `(:scope :exit :stderr [:failed t|:skipped t])'，
+`:order' 为实际派发的 scope 顺序。"
+  (let* ((total (length branches))
+         (results (make-vector total nil))
+         (remaining total)
+         (executed nil)
+         (finished nil)
+         (processes nil))
+    (puthash name t ebasecamp-command--pending)
+    (cl-labels
+        ((report ()
+           (unless finished
+             (setq finished t)
+             (remhash name ebasecamp-command--pending)
+             (when (functionp on-complete)
+               (funcall on-complete
+                        (list :action action
+                              :project (ebasecamp-project-name object)
+                              :ok (cl-every #'ebasecamp-command--successful-p
+                                            (append results nil))
+                              :results (append results nil)
+                              :auto-started-shared (and auto-shared t)
+                              :order (nreverse executed))))))
+         (skip (from)
+           (let ((index from))
+             (while (< index total)
+               (aset results index
+                     (list :scope (plist-get (nth index branches) :scope)
+                           :exit nil :stderr "" :skipped t))
+               (cl-decf remaining)
+               (setq index (1+ index))))
+           (report))
+         (settle (index result)
+           (let* ((branch (nth index branches))
+                  (entry (ebasecamp-command--result branch result))
+                  (ok (ebasecamp-command--successful-p entry)))
+             (aset results index (if ok entry (append entry (list :failed t))))
+             (cl-decf remaining)
+             (cond
+              ((and sequential (not ok)) (skip (1+ index)))
+              ((<= remaining 0) (report))
+              (sequential (launch (1+ index))))))
+         (launch (index)
+           (let* ((branch (nth index branches))
+                  (file (ebasecamp-compose-write
+                         object (plist-get branch :groups)))
+                  (args (ebasecamp-command-compose-args
+                         action file (plist-get branch :name)
+                         (unless (eq action 'down)
+                           (plist-get branch :services)))))
+             (setq executed (cons (plist-get branch :scope) executed))
+             (push (ebasecamp-docker-run-async
+                    args
+                    (lambda (result) (settle index result)))
+                   processes))))
+      (condition-case err
+          (if sequential
+              (launch 0)
+            (dotimes (index total) (launch index)))
+        ((error quit)
+         ;; 派发失败（生成物写入 / 参数构造）时释放 pending，避免永久锁死
+         (unless finished
+           (setq finished t)
+           (remhash name ebasecamp-command--pending))
+         (signal (car err) (cdr err))))
+      (nreverse processes))))
+
 (cl-defun ebasecamp-command-run (action project keys &key on-complete)
   "执行生命周期 ACTION（start / stop / restart / down），返回启动的进程列表。
 PROJECT 为项目对象、symbol 或字符串；KEYS 为选中服务（nil 表示全部）。
@@ -327,12 +475,19 @@ PROJECT 为项目对象、symbol 或字符串；KEYS 为选中服务（nil 表�
    `ebasecamp-command-busy'；
 2. 按 scope 拆分（`ebasecamp-command-split-keys'）；down 对 shared 分支
    signal `ebasecamp-command-error'（shared 组可能被其他项目使用）；
-3. `ebasecamp-command-ensure-network' 同步确保 external network 存在；
-4. 每个非 nil 分支：先 `ebasecamp-compose-write' 写该 scope 的生成物，再
+3. start 且 per-project 批次带 `:requires-shared'（跨 scope depends_on）时：
+   校验依赖确实是 shared 组服务（否则 signal `ebasecamp-command-error'），
+   然后**串行**先跑 shared 批次（服务集合覆盖这些依赖）、成功后才跑
+   per-project 批次；shared 失败即中止，未派发的批次记为 `:skipped'。
+   stop / restart / down 不做自动补齐 —— 补齐等于在停止/重启操作里反向启动
+   容器；
+4. `ebasecamp-command-ensure-network' 同步确保 external network 存在；
+5. 每个非 nil 分支：先 `ebasecamp-compose-write' 写该 scope 的生成物，再
    `ebasecamp-docker-run-async' 异步执行；down 不追加服务名；
-5. 全部批次结束后清除 pending 并调用 ON-COMPLETE，参数为 plist：
+6. 全部批次结束后清除 pending 并调用 ON-COMPLETE，参数为 plist：
    `(:action ACTION :project NAME :ok BOOL :results ((:scope S :exit N
-   :stderr STR) ...))'，任一分支失败 `:ok' 为 nil，stderr 原样保留。
+   :stderr STR [:failed t|:skipped t]) ...) :auto-started-shared BOOL
+   :order (SCOPE ...))'，任一分支失败 `:ok' 为 nil，stderr 原样保留。
 返回已启动进程对象列表（无分支或同步完成时可能为 nil）。"
   (let* ((object (ebasecamp-command--project project))
          (name (ebasecamp-command--name object)))
@@ -340,58 +495,32 @@ PROJECT 为项目对象、symbol 或字符串；KEYS 为选中服务（nil 表�
       (signal 'ebasecamp-command-busy
               (list (format "项目 %s 已有命令在执行" name))))
     (let* ((split (ebasecamp-command-split-keys object keys))
-           (branches (delq nil (list (plist-get split :project)
-                                     (plist-get split :shared)))))
+           (project-branch (plist-get split :project))
+           (shared-branch (plist-get split :shared))
+           (requires (and project-branch
+                          (plist-get project-branch :requires-shared))))
       (when (eq action 'down)
-        (when (plist-get split :shared)
+        (when shared-branch
           (signal 'ebasecamp-command-error
                   (list "shared 组不提供 down：其他项目可能正在使用这些容器")))
-        (unless (plist-get split :project)
+        (unless project-branch
           (signal 'ebasecamp-command-error
                   (list (format "项目 %s 没有 per-project 组的服务可 down" name)))))
-      (ebasecamp-command-ensure-network)
-      (let* ((total (length branches))
-             (results (make-vector total nil))
-             (remaining total)
-             (finished nil)
-             (processes nil))
-        (puthash name t ebasecamp-command--pending)
-        (cl-labels
-            ((complete (index result)
-                       (aset results index result)
-                       (cl-decf remaining)
-                       (when (and (not finished) (<= remaining 0))
-                         (setq finished t)
-                         (remhash name ebasecamp-command--pending)
-                         (when (functionp on-complete)
-                           (funcall on-complete
-                                    (list :action action
-                                          :project (ebasecamp-project-name object)
-                                          :ok (cl-every #'ebasecamp-command--successful-p
-                                                        (append results nil))
-                                          :results (append results nil)))))))
-          (condition-case err
-              (dotimes (index total)
-                (let* ((branch (nth index branches))
-                       (file (ebasecamp-compose-write
-                              object (plist-get branch :groups)))
-                       (args (ebasecamp-command-compose-args
-                              action file (plist-get branch :name)
-                              (unless (eq action 'down)
-                                (plist-get branch :services)))))
-                  (push (ebasecamp-docker-run-async
-                         args
-                         (lambda (result)
-                           (complete index
-                                     (ebasecamp-command--result branch result))))
-                        processes)))
-            ((error quit)
-             ;; 派发失败（生成物写入 / 参数构造）时释放 pending，避免永久锁死
-             (unless finished
-               (setq finished t)
-               (remhash name ebasecamp-command--pending))
-             (signal (car err) (cdr err)))))
-        (nreverse processes)))))
+      (let ((auto (and requires (eq action 'start) t)))
+        (when auto
+          (ebasecamp-command--check-requires object requires))
+        (ebasecamp-command-ensure-network)
+        (if auto
+            (ebasecamp-command--dispatch
+             action object name
+             (list (ebasecamp-command--shared-branch
+                    object shared-branch requires)
+                   project-branch)
+             t t on-complete)
+          (ebasecamp-command--dispatch
+           action object name
+           (delq nil (list project-branch shared-branch))
+           nil nil on-complete))))))
 
 ;;; 端口冲突检测（T3.3）
 

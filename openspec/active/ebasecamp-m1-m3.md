@@ -4,10 +4,10 @@
 
 - 阶段：Phase 3（Implement）· 批次 3 进行中
 - 已确认：方案 V2 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）
-- 已完成：批次 0、批次 1（T1.1–T1.6）、批次 2（T2.1–T2.5）、批次 3 部分（T3.1 生命周期命令、T3.3 端口冲突检测）
+- 已完成：批次 0、批次 1（T1.1–T1.6）、批次 2（T2.1–T2.5）、批次 3 部分（T3.1 生命周期命令、T3.3 端口冲突检测）、T3.1 补强（跨 scope 依赖处理）
 - 下一步：T3.2 并发与操作态接线 + T3.4 错误链路
 - 待用户确认：真实 Emacs 中目检 `M-x ebasecamp` 界面（T2.3 验收项）
-- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist；批次 1 修复 stale .elc 陷阱；T2.3 修正 data 层为「清单 ∪ 状态」语义、check-parens 覆盖 test/*.el、加载态改用 data-grid label、toast 推迟至 T3.4；T3.1 用 compose 层既有 `group-filter` 按 scope 拆分（未改 compose 层），pending 标记改为进程计数器归零后清除
+- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist；批次 1 修复 stale .elc 陷阱；T2.3 修正 data 层为「清单 ∪ 状态」语义、check-parens 覆盖 test/*.el、加载态改用 data-grid label、toast 推迟至 T3.4；T3.1 用 compose 层既有 `group-filter` 按 scope 拆分（未改 compose 层），pending 标记改为进程计数器归零后清除；T3.1 补强（修 tech-debt #13）：compose 层在 filter 渲染时剔除跨集合 `depends_on`，command 层 `start` 时先补齐 shared 批次（串行、失败即中止）
 
 ## 目标
 
