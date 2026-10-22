@@ -32,6 +32,7 @@
 (require 'ebasecamp-model)
 (require 'ebasecamp-config)
 (require 'ebasecamp-import)
+(require 'ebasecamp-export)
 
 ;;; 测试脚手架
 
@@ -517,6 +518,94 @@ compose 读取由 `ebasecamp-docker--run-sync-function' 伪造为实测 fixture�
         (should-error (ebasecamp-import-apply compose-file "probe-app" :force t)
                       :type 'ebasecamp-import-error))
       (should (equal ";;; sentinel\n" (ebasecamp-import-test--read path))))))
+
+;;; 13. 导入 → 导出全链路安全断言（T4.5）
+
+(defconst ebasecamp-import-test--e2e-secret "fake-e2e-secret"
+  "端到端安全断言用的探针明文。只用于断言它不出现在任何落盘文件里。")
+
+(defconst ebasecamp-import-test--e2e-compose
+  (concat
+   "services:\n"
+   "  api:\n"
+   "    image: myapp/api:dev\n"
+   "    env_file:\n"
+   "      - ./api.env\n"
+   "    environment:\n"
+   "      SECRET_REF: \"${FAKE_SECRET}\"\n"
+   "    ports:\n"
+   "      - \"8080:80\"\n")
+  "端到端用例的 compose 输入：含 `${FAKE_SECRET}' 引用与相对 `env_file'。")
+
+(defconst ebasecamp-import-test--e2e-json
+  (concat
+   "{\"name\":\"probe-e2e\",\"services\":{\"api\":{"
+   "\"image\":\"myapp/api:dev\","
+   "\"environment\":{\"SECRET_REF\":\"${FAKE_SECRET}\"},"
+   "\"env_file\":[{\"path\":\"./api.env\",\"required\":true}],"
+   "\"ports\":[{\"mode\":\"ingress\",\"target\":80,\"published\":\"8080\","
+   "\"protocol\":\"tcp\"}]}}}")
+  "docker 不可用时替代 `compose config' 输出的 JSON（与实测形态一致）。")
+
+(defun ebasecamp-import-test--e2e-docker-p ()
+  "判断真实 docker compose 是否可用于端到端用例。"
+  (and (executable-find "docker")
+       (eq 0 (ignore-errors
+               (plist-get (ebasecamp-docker-run-sync (list "compose" "version"))
+                          :exit)))))
+
+(ert-deftest ebasecamp-import-test-e2e-import-export-keeps-reference ()
+  "导入 → 清单 → 导出全链路：两处文件都保留 `${FAKE_SECRET}'、都不含探针明文。
+环境里给了 `FAKE_SECRET=fake-e2e-secret'，因此任何一次插值都会在落盘文本里
+留下明文；清单侧的 `env_file' 还必须是相对路径（`--no-path-resolution'）。"
+  (let* ((config-dir (make-temp-file "ebc-e2e-config-" t))
+         (compose-dir (make-temp-file "ebc-e2e-compose-" t))
+         (compose-file (expand-file-name "compose.yaml" compose-dir))
+         (ebasecamp-config-directory config-dir)
+         (process-environment
+          (cons (format "FAKE_SECRET=%s" ebasecamp-import-test--e2e-secret)
+                process-environment))
+         (use-docker (ebasecamp-import-test--e2e-docker-p)))
+    (unwind-protect
+        (progn
+          (with-temp-file compose-file
+            (insert ebasecamp-import-test--e2e-compose))
+          (with-temp-file (expand-file-name "api.env" compose-dir)
+            (insert "FROM_FILE=1\n"))
+          (let* ((ebasecamp-docker--run-sync-function
+                  (unless use-docker
+                    (lambda (_args _timeout)
+                      (list :exit 0
+                            :stdout ebasecamp-import-test--e2e-json
+                            :stderr ""))))
+                 (manifest (ebasecamp-import-apply compose-file "probe-e2e"))
+                 (status (ebasecamp-config-load config-dir))
+                 (project (ebasecamp-model-project 'probe-e2e))
+                 (export-file nil))
+            (should (null (plist-get status :errors)))
+            ;; 清单侧
+            (let ((manifest-text (ebasecamp-import-test--read manifest)))
+              (should (string-match-p (regexp-quote "${FAKE_SECRET}")
+                                      manifest-text))
+              (should-not (string-match-p
+                           (regexp-quote ebasecamp-import-test--e2e-secret)
+                           manifest-text))
+              ;; env_file 只留相对路径引用
+              (should (string-match-p "\"./api.env\"" manifest-text))
+              (should-not (string-match-p "\"/[^\"]*api\\.env\"" manifest-text)))
+            ;; 导出侧（docker 校验打桩，不依赖守护进程）
+            (cl-letf (((symbol-function 'ebasecamp-docker-check-compose)
+                       (lambda (&rest _) (list :ok t :exit 0 :stderr ""))))
+              (setq export-file (ebasecamp-export-project project :force t)))
+            (should (file-exists-p export-file))
+            (let ((export-text (ebasecamp-import-test--read export-file)))
+              (should (string-match-p (regexp-quote "${FAKE_SECRET}")
+                                      export-text))
+              (should-not (string-match-p
+                           (regexp-quote ebasecamp-import-test--e2e-secret)
+                           export-text)))))
+      (ignore-errors (delete-directory config-dir t))
+      (ignore-errors (delete-directory compose-dir t)))))
 
 (provide 'ebasecamp-import-tests)
 ;;; ebasecamp-import-tests.el ends here

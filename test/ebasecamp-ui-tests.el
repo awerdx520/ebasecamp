@@ -19,6 +19,8 @@
 (require 'ert)
 (require 'ebasecamp-model)
 (require 'ebasecamp-command)
+(require 'ebasecamp-import)
+(require 'ebasecamp-export)
 (require 'ebasecamp-ui)
 
 ;;; 测试脚手架
@@ -553,6 +555,143 @@
       (should (timerp (ebasecamp-ui-session-notice-timer session)))
       (ebasecamp-ui-close)
       (should (= baseline (length timer-list))))))
+
+;;; 10. 导入 / 导出入口（T4.4）
+
+(ert-deftest ebasecamp-ui-test-renders-import-export-buttons ()
+  "操作条除四个生命周期按钮外，还渲染「导入 compose」「导出 compose」。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (ebasecamp-ui-open)
+      (let ((text (ebasecamp-ui-test--buffer-text)))
+        (should (ebasecamp-ui-test--contains-p text "导入 compose"))
+        (should (ebasecamp-ui-test--contains-p text "导出 compose"))
+        ;; 生命周期按钮未被挤掉
+        (should (ebasecamp-ui-test--contains-p text "启动选中"))
+        (should (ebasecamp-ui-test--contains-p text "销毁环境"))))))
+
+(ert-deftest ebasecamp-ui-test-export-without-project ()
+  "无当前项目时导出：返回 nil、notice 为 info、导出层未被调用。"
+  (ebasecamp-ui-test--with-ui
+    (let ((called 0))
+      (cl-letf (((symbol-function 'ebasecamp-export-project)
+                 (lambda (&rest _) (cl-incf called) "/tmp/never.yaml")))
+        (should-not (ebasecamp-ui-export-compose))
+        (should (= 0 called))
+        (let ((notice (ebasecamp-ui-test--notice)))
+          (should (eq 'info (plist-get notice :kind)))
+          (should (ebasecamp-ui-test--contains-p
+                   (plist-get notice :title) "项目")))))))
+
+(ert-deftest ebasecamp-ui-test-export-success ()
+  "导出成功：调用导出层且 FORCE 为 nil，notice 为 success 且 message 含路径。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (let ((calls nil)
+          (target "/tmp/ebc-export/docker-compose.ebasecamp.yaml"))
+      (cl-letf (((symbol-function 'ebasecamp-export-project)
+                 (lambda (project &rest keys)
+                   (push (cons project keys) calls)
+                   target)))
+        (should (equal target (ebasecamp-ui-export-compose)))
+        (should (= 1 (length calls)))
+        (should (ebasecamp-project-p (car (car calls))))
+        (should (eq 'myapp (ebasecamp-project-name (car (car calls)))))
+        (should-not (plist-get (cdr (car calls)) :force))
+        (let ((notice (ebasecamp-ui-test--notice)))
+          (should (eq 'success (plist-get notice :kind)))
+          (should (ebasecamp-ui-test--contains-p
+                   (plist-get notice :message) target)))))))
+
+(ert-deftest ebasecamp-ui-test-export-failure ()
+  "导出层 signal `ebasecamp-export-error' 时：返回 nil、notice 为 error。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (cl-letf (((symbol-function 'ebasecamp-export-project)
+               (lambda (&rest _)
+                 (signal 'ebasecamp-export-error
+                         (list "/tmp/x.yaml 已存在；覆盖需显式指定 :force")))))
+      (should-not (ebasecamp-ui-export-compose))
+      (let ((notice (ebasecamp-ui-test--notice)))
+        (should (eq 'error (plist-get notice :kind)))
+        (should (ebasecamp-ui-test--contains-p
+                 (plist-get notice :message) "覆盖需显式指定"))
+        (should (ebasecamp-ui-test--contains-p
+                 (plist-get notice :title) "导出"))))))
+
+(defmacro ebasecamp-ui-test--with-compose-file (&rest body)
+  "在临时目录里创建一个 compose.yaml 并在 BODY 中执行。
+BODY 内可用 `compose-file' 取该文件绝对路径。"
+  (declare (indent 0) (debug t))
+  `(let* ((dir (make-temp-file "ebc-ui-compose-" t))
+          (compose-file (expand-file-name "compose.yaml" dir)))
+     (unwind-protect
+         (progn
+           (with-temp-file compose-file (insert "services: {}\n"))
+           ,@body)
+       (ignore-errors (delete-directory dir t)))))
+
+(ert-deftest ebasecamp-ui-test-import-success ()
+  "选中文件 + 确认名字：apply 收到 (FILE NAME) 并被调用一次，notice 为 success。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--with-compose-file
+      (let ((target (ebasecamp-config-project-file "fake-e2e"))
+            (calls nil))
+        (cl-letf (((symbol-function 'read-file-name)
+                   (lambda (&rest _) compose-file))
+                  ((symbol-function 'read-string)
+                   (lambda (&rest _) "fake-e2e"))
+                  ((symbol-function 'ebasecamp-import-suggest-name)
+                   (lambda (&rest _) 'suggested))
+                  ((symbol-function 'ebasecamp-import-apply)
+                   (lambda (&rest args) (push args calls) target)))
+          (should (equal target (ebasecamp-ui-import-compose)))
+          (should (= 1 (length calls)))
+          (let ((args (car calls)))
+            (should (equal compose-file (nth 0 args)))
+            (should (equal "fake-e2e" (nth 1 args)))
+            ;; 目标不存在 → 不要求 force
+            (should-not (plist-get (nthcdr 2 args) :force)))
+          (let ((notice (ebasecamp-ui-test--notice)))
+            (should (eq 'success (plist-get notice :kind)))
+            (should (ebasecamp-ui-test--contains-p
+                     (plist-get notice :message) target))))))))
+
+(ert-deftest ebasecamp-ui-test-import-cancelled ()
+  "用户取消选文件（`read-file-name' 返回 nil）：返回 nil、无 notice、不落盘。"
+  (ebasecamp-ui-test--with-ui
+    (let ((called 0))
+      (cl-letf (((symbol-function 'read-file-name) (lambda (&rest _) nil))
+                ((symbol-function 'ebasecamp-import-apply)
+                 (lambda (&rest _) (cl-incf called) "/tmp/never.el")))
+        (should-not (ebasecamp-ui-import-compose))
+        (should (= 0 called))
+        (should-not (ebasecamp-ui-test--notice))))))
+
+(ert-deftest ebasecamp-ui-test-import-failure ()
+  "apply signal `ebasecamp-import-error' 时：notice 为 error，detail 非空。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--with-compose-file
+      (cl-letf (((symbol-function 'read-file-name)
+                 (lambda (&rest _) compose-file))
+                ((symbol-function 'read-string) (lambda (&rest _) "fake-e2e"))
+                ((symbol-function 'ebasecamp-import-suggest-name)
+                 (lambda (&rest _) 'fake-e2e))
+                ((symbol-function 'ebasecamp-import-apply)
+                 (lambda (&rest _)
+                   (signal 'ebasecamp-import-error
+                           (list "读取 /tmp/compose.yaml 失败（退出码 1）"
+                                 "go-yaml load error: line 3")))))
+        (should-not (ebasecamp-ui-import-compose))
+        (let ((notice (ebasecamp-ui-test--notice)))
+          (should (eq 'error (plist-get notice :kind)))
+          (should (ebasecamp-ui-test--contains-p
+                   (plist-get notice :message) "退出码 1"))
+          (should (stringp (plist-get notice :detail)))
+          (should-not (string-empty-p (plist-get notice :detail)))
+          (should (ebasecamp-ui-test--contains-p
+                   (plist-get notice :detail) "go-yaml load error")))))))
 
 (provide 'ebasecamp-ui-tests)
 ;;; ebasecamp-ui-tests.el ends here

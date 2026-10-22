@@ -265,6 +265,7 @@ external network），先写临时文件并经 `docker compose config -q' 校验
       (or (ebasecamp-model-project (intern name))
           (ebasecamp-export--fail "项目 %s 不在清单中" name)))))
 
+;;;###autoload
 (cl-defun ebasecamp-export-compose (&optional project file)
   "交互式把 PROJECT 导出为部署用 compose 文件，返回路径或 nil。
 PROJECT 省略时用 `completing-read' 从清单里选；FILE 省略时用项目的默认导出

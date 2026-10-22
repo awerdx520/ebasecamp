@@ -673,6 +673,7 @@ FORCE 为 nil 且目标已存在时 signal `ebasecamp-import-error'（不动原�
                                   "写入后新项目未出现在清单注册表中")))))
       target))))
 
+;;;###autoload
 (defun ebasecamp-import-file (file &optional name)
   "交互式把 compose 文件 FILE 导入为清单，返回清单文件绝对路径。
 NAME 为默认项目名，省略时由 `ebasecamp-import-suggest-name' 推断；用户可在

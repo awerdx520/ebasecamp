@@ -29,6 +29,8 @@
 ;;   M-x ebasecamp                      打开管理界面
 ;;   M-x ebasecamp-reload               重新加载清单并刷新界面
 ;;   M-x ebasecamp-create-sample-config 生成示例清单（C-u 前缀强制覆盖）
+;;   M-x ebasecamp-import-file          从 compose 文件导入清单
+;;   M-x ebasecamp-export-compose       把项目导出为部署用 compose
 ;;
 ;; 安全约束：
 ;;
@@ -48,6 +50,8 @@
 (require 'ebasecamp-config)
 (require 'ebasecamp-compose)
 (require 'ebasecamp-docker)
+(require 'ebasecamp-import)
+(require 'ebasecamp-export)
 (require 'ebasecamp-status)
 (require 'ebasecamp-data)
 (require 'ebasecamp-ui)

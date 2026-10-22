@@ -4,10 +4,10 @@
 
 - 阶段：Phase 3（Implement）· 批次 4 进行中
 - 已确认：方案 V2 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）
-- 已完成：批次 0、批次 1、批次 2、批次 3（T3.1–T3.6）、T4.1（导入映射）、T4.2（导入落盘）、T4.3（导出）
-- 下一步：T4.4 导入导出 UI 入口
+- 已完成：批次 0、批次 1、批次 2、批次 3（T3.1–T3.6）、T4.1（导入映射）、T4.2（导入落盘）、T4.3（导出）、T4.4（导入导出 UI 入口）、T4.5（导入导出安全断言）
+- 下一步：T4.6 L3 导入→启停→导出闭环
 - 待用户确认：真实 Emacs 中目检 `M-x ebasecamp` 界面（T2.3 验收项）
-- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist；批次 1 修复 stale .elc 陷阱；T2.3 修正 data 层语义、check-parens 覆盖 test/*.el；T3.1 补强跨 scope 依赖；T3.4 toast 降级为 alert；T4.1 落地导入映射（JSON 走 hash-table 解析、不可表达端口进 extra）；T4.2 落地导入落盘（组名 = 项目名、手工构造可读格式、写后自校验与回滚；临时 buffer 读回须显式 `forward-comment` 跳注释，`string-match-p` 校验名字须关 `case-fold-search`）；T4.3 落地导出（只渲 per-project 组 + 项目副本关 shared-network + 原子写 tmp→校验→rename；实测 `docker compose -f x.yaml.tmp config -q` 接受 `.tmp` 扩展名）
+- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist；批次 1 修复 stale .elc 陷阱；T2.3 修正 data 层语义、check-parens 覆盖 test/*.el；T3.1 补强跨 scope 依赖；T3.4 toast 降级为 alert；T4.1 落地导入映射（JSON 走 hash-table 解析、不可表达端口进 extra）；T4.2 落地导入落盘（组名 = 项目名、手工构造可读格式、写后自校验与回滚；临时 buffer 读回须显式 `forward-comment` 跳注释，`string-match-p` 校验名字须关 `case-fold-search`）；T4.3 落地导出（只渲 per-project 组 + 项目副本关 shared-network + 原子写 tmp→校验→rename；实测 `docker compose -f x.yaml.tmp config -q` 接受 `.tmp` 扩展名）；T4.4 落地导入导出 UI 入口（操作条改两行避免 80 列溢出裁切、`etaf-call-with-input` 只捕获 `etaf-event-error` 降级、导出侧绑 `ebasecamp-export--interactive` 让冲突三选一在回调里可用）；T4.5 落地导入→导出全链路密钥断言（docker 可用走真实 `--no-interpolate`，否则注入同形态 JSON）
 
 ## 目标
 
@@ -142,10 +142,12 @@ docker compose -f <file> config --no-interpolate --no-env-resolution --no-path-r
 - [x] T4.3 `lisp/ebasecamp-export.el`：清单 → 项目 compose 文件（默认 `<project-root>/docker-compose.ebasecamp.yaml`，可由项目 `:export-file` 覆盖），带生成头注释（事实源路径 + 重新生成命令）；目标存在时非交互报错、交互式提示「换路径 / 覆盖（二次确认） / 取消」；落盘前 `config -q` 自校验
       （依赖：T1.6）验收：ERT 覆盖 默认文件名、`:export-file` 覆盖、已存在时三种分支、导出往返（export → `config --no-interpolate --no-env-resolution --no-path-resolution --format json` → 逐字段语义等价）、导出物不含明文密钥
       （已完成：API 为 `ebasecamp-export-project`（`:file` / `:force`）、交互封装 `ebasecamp-export-compose` 与 `ebasecamp-export-default-file`；导出语义 = 只渲 per-project 组 + 项目副本 `:shared-network` 置 nil（不声明 `ebasecamp` 外部网络）+ 头注释（来源 / 事实源 / 重新生成 / shared 未包含）；落盘走 `<target>.tmp` → `ebasecamp-docker-check-compose` → rename 的原子写，校验失败删 tmp 并 signal；冲突三分支为 `read-char-choice` 单次选择（计划里写的「覆盖二次确认」未采纳，冲突确认本身已是一次显式选择，二次确认留待 T4.4 UI 按需加）；项目无 per-project 组时 signal（避免产出空部署文件）；ERT 新增 19 项，全量 226 项）
-- [ ] T4.4 UI 入口：导入向导（选文件 → 预览服务列表 → 编辑项目名 → 落盘 → 反馈）与导出按钮（选项目 → 目标路径 → 冲突提示 → 反馈）
+- [x] T4.4 UI 入口：导入向导（选文件 → 预览服务列表 → 编辑项目名 → 落盘 → 反馈）与导出按钮（选项目 → 目标路径 → 冲突提示 → 反馈）
       （依赖：T2.3、T4.2、T4.3）验收：batch 渲染断言入口存在；真实 Emacs 中完成一次导入与一次导出，并断言 `~/.config/ebasecamp/projects/` 下落盘文件存在且可加载
-- [ ] T4.5 ERT 安全断言：导入含 `${FAKE_SECRET}` 与 `env_file` 的 fixture，断言清单保留引用、不出现明文、`env_file` 为相对路径；导出物同样不含明文
+      （已完成：API 为 `ebasecamp-ui-import-compose` / `ebasecamp-ui-export-compose`（均 interactive，按钮 `:on-press` 直接调用）；导入链 = 选文件 → `ebasecamp-import-suggest-name` 取名 + `read-string` 确认 → 目标已存在时 `y-or-n-p` 确认覆盖 → `ebasecamp-import-apply` → notice success + `ebasecamp-ui-refresh`；项目根目录取 compose 父目录（不再单独提问），计划里的「预览服务列表」未实现（`etaf-dialog` 无法在事件回调里同步返回用户输入）；导出链 = 无当前项目 → notice info，否则 `ebasecamp-export-project`（`:force` nil，并把 `ebasecamp-export--interactive` 绑 t，使冲突三选一在事件回调上下文仍可弹出）；`etaf-call-with-input` 只捕获 `etaf-event-error` 降级为裸 `read-file-name`（`M-x` / ERT 场景）；操作条改为两行（生命周期一行 + 导入/导出一行），实测 80 列下六按钮同行会溢出裁切；`ebasecamp.el` 补两个 require，`ebasecamp-import-file` / `ebasecamp-export-compose` 加 autoload cookie；ERT 新增 7 项）
+- [x] T4.5 ERT 安全断言：导入含 `${FAKE_SECRET}` 与 `env_file` 的 fixture，断言清单保留引用、不出现明文、`env_file` 为相对路径；导出物同样不含明文
       （依赖：T4.1、T4.3）验收：断言匹配 `${FAKE_SECRET}`、不含探针值、`env_file` 路径不以 `/` 开头
+      （已完成：端到端用例 `ebasecamp-import-test-e2e-import-export-keeps-reference` 在 `FAKE_SECRET=fake-e2e-secret` 环境下跑 导入落盘 → 读清单文本 → `ebasecamp-config-load` → 导出 → 读导出文本；docker 可用时走真实 `compose config --no-interpolate`（本机实测走真实分支），不可用时注入同形态 JSON；导出前 `cl-letf` 打桩 `ebasecamp-docker-check-compose` 返回 `(:ok t)`；断言两处文本均含 `${FAKE_SECRET}`、均不含探针明文，清单侧 `env_file` 为 `"./api.env"` 且无绝对化路径。ERT 新增 1 项，全量 234 项）
 - [ ] T4.6 L3 闭环：真实项目 compose → 导入（项目名交互）→ 启动 → 停止 → 导出 → `config -q` 通过
       （依赖：T4.1–T4.5）验收：全链路成功；`~/.config/ebasecamp/projects/<name>.el` 存在且可加载；清理干净
 

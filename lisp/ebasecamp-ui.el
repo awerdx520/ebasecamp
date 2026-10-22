@@ -19,6 +19,7 @@
 ;;   │  └─ box → etaf-data-grid（服务表：服务 / 镜像 / 状态 / 端口 / 健康）
 ;;   ├─ etaf-divider
 ;;   ├─ row（操作条）: 启动选中 / 停止选中 / 重启选中 / 销毁环境
+;;   │                 （下一行）导入 compose / 导出 compose
 ;;   ├─ etaf-alert（notice；无提示时退化为一行 etaf-label 操作提示）
 ;;   └─ etaf-dialog（销毁环境确认；`:open' 绑在会话的 confirm ref 上）
 ;;
@@ -65,10 +66,13 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
 (require 'etaf)
 (require 'etaf-ui)
 (require 'ebasecamp-model)
 (require 'ebasecamp-config)
+(require 'ebasecamp-import)
+(require 'ebasecamp-export)
 (require 'ebasecamp-status)
 (require 'ebasecamp-data)
 (require 'ebasecamp-command)
@@ -628,14 +632,32 @@ SESSION 的 busy 为真时按钮禁用（渲染期读 ref，写 ref 即触发重
     :disabled (and (etaf-value (ebasecamp-ui-session-busy session)) t)
     :on-press (lambda () (ebasecamp-ui-run-action action)))))
 
-(defun ebasecamp-ui--action-bar (session)
-  "返回底栏操作条：启动选中 / 停止选中 / 重启选中 / 销毁环境。"
+(defun ebasecamp-ui--bar-button (label function variant)
+  "返回操作条按钮：文案 LABEL、语义 VARIANT，按下调用 FUNCTION。
+与 `ebasecamp-ui--action-button' 的区别：本函数直接调用回调，不经
+`ebasecamp-ui-run-action' 派发生命周期动作。"
   (etaf-view
-   (row :width 'stretch :cross-align 'center :item-gap '(ch 2)
-     (expr (ebasecamp-ui--action-button session "启动选中" 'start 'primary))
-     (expr (ebasecamp-ui--action-button session "停止选中" 'stop 'secondary))
-     (expr (ebasecamp-ui--action-button session "重启选中" 'restart 'secondary))
-     (expr (ebasecamp-ui--action-button session "销毁环境" 'down 'ghost)))))
+   (etaf-button
+    :label label
+    :variant variant
+    :on-press (lambda () (funcall function)))))
+
+(defun ebasecamp-ui--action-bar (session)
+  "返回底栏操作条：生命周期按钮一行，导入 / 导出 compose 入口一行。
+导入 / 导出不参与 `busy' 判定（它们不是生命周期动作），因此恒可点。
+两行而不是一行：80 列终端下六个按钮同行会溢出，标签会被裁切。"
+  (etaf-view
+   (column :width 'stretch :item-gap '(lh 0)
+     (row :width 'stretch :cross-align 'center :item-gap '(ch 2)
+       (expr (ebasecamp-ui--action-button session "启动选中" 'start 'primary))
+       (expr (ebasecamp-ui--action-button session "停止选中" 'stop 'secondary))
+       (expr (ebasecamp-ui--action-button session "重启选中" 'restart 'secondary))
+       (expr (ebasecamp-ui--action-button session "销毁环境" 'down 'ghost)))
+     (row :width 'stretch :cross-align 'center :item-gap '(ch 2)
+       (expr (ebasecamp-ui--bar-button
+              "导入 compose" #'ebasecamp-ui-import-compose 'ghost))
+       (expr (ebasecamp-ui--bar-button
+              "导出 compose" #'ebasecamp-ui-export-compose 'ghost))))))
 
 (defun ebasecamp-ui--confirm-dialog (session)
   "返回销毁环境的确认框：`:open' 绑在 SESSION 的 confirm ref 上。
@@ -735,6 +757,124 @@ SESSION 的 busy 为真时按钮禁用（渲染期读 ref，写 ref 即触发重
          (expr (ebasecamp-ui--action-bar session))
          (expr (ebasecamp-ui--notice-view session))
          (expr (ebasecamp-ui--confirm-dialog session)))))))
+
+;;; 导入 / 导出入口
+
+(defun ebasecamp-ui--error-text (err)
+  "从错误对象 ERR（`(SYMBOL . DATA)'）取主消息字符串。纯函数。"
+  (let ((data (cdr err)))
+    (cond
+     ((and data (stringp (car data))) (car data))
+     (t (error-message-string err)))))
+
+(defun ebasecamp-ui--error-detail (err)
+  "从错误对象 ERR 取可展示的细节（DATA 中主消息之后的项）；无则 nil。纯函数。"
+  (let ((rest (cddr err)))
+    (when rest
+      (mapconcat (lambda (item) (if (stringp item) item (format "%S" item)))
+                 rest "\n"))))
+
+(defun ebasecamp-ui--call-with-input (reader)
+  "在有 etaf 事件上下文时用 `etaf-call-with-input' 执行 READER，否则直接执行。
+`etaf-call-with-input' 只在 Host 事件回调（按钮 `:on-press'）里可用，否则
+signal `etaf-event-error'；因此 `M-x' 直接调用与 ERT 场景降级为裸调用。
+只捕获该错误类型：READER 自身的错误必须原样上抛，否则会被执行两次。"
+  (if (fboundp 'etaf-call-with-input)
+      (condition-case nil
+          (etaf-call-with-input reader)
+        (etaf-event-error (funcall reader)))
+    (funcall reader)))
+
+(defun ebasecamp-ui--read-compose-file ()
+  "读一个 compose 文件路径；用户取消时返回 nil。
+经 `ebasecamp-ui--call-with-input' 调用 `read-file-name'，使事件回调里由
+Ebox 负责目标有效性与焦点恢复。"
+  (ebasecamp-ui--call-with-input
+   (lambda () (read-file-name "Compose 文件：" nil nil t))))
+
+(defun ebasecamp-ui--import-name (file)
+  "推断 FILE 的项目名并让用户确认，返回非空字符串。
+空输入（直接回车）按建议名处理，与 `ebasecamp-import-file' 一致。"
+  (let* ((default (ebasecamp-import-suggest-name file))
+         (text (if (stringp default) default (symbol-name default)))
+         (input (read-string (format "项目名（%s）：" text) nil nil text)))
+    (if (string-empty-p (string-trim input)) text input)))
+
+(defun ebasecamp-ui--target-file (name)
+  "返回 NAME 对应的清单文件路径；NAME 非法时返回 nil。
+归一与 `ebasecamp-import-apply' 同源（都经 `ebasecamp-import--normalize-name'），
+否则大小写不一致会让「已存在」检查与实际写入路径错位。"
+  (condition-case nil
+      (ebasecamp-config-project-file (ebasecamp-import--normalize-name name))
+    (ebasecamp-import-error nil)))
+
+(defun ebasecamp-ui--import-compose (session file)
+  "把 FILE 导入清单，成功后写 SESSION 的 notice 并刷新界面；返回落盘路径。
+目标文件已存在时先经 `y-or-n-p' 确认覆盖，用户拒绝则返回 nil（不写 notice）。"
+  (let* ((file (expand-file-name file))
+         (name (ebasecamp-ui--import-name file))
+         (target (ebasecamp-ui--target-file name))
+         (force (and target (file-exists-p target) t)))
+    (if (and force (not (y-or-n-p (format "%s 已存在，覆盖？" target))))
+        nil
+      (let ((path (ebasecamp-import-apply file name :force force)))
+        (ebasecamp-ui--set-notice session 'success "导入完成" path)
+        (ebasecamp-ui-refresh)
+        path))))
+
+(defun ebasecamp-ui-import-compose ()
+  "选择 compose 文件导入为清单，成功后提示并刷新界面。返回落盘路径或 nil。
+交互链：选文件（`read-file-name'）→ 确认项目名（`read-string'）→ 冲突时
+`y-or-n-p' 确认覆盖 → `ebasecamp-import-apply' 落盘。项目根目录取 compose
+文件父目录（与 `ebasecamp-import-apply' 的默认一致），不再单独提问。
+用户取消（`quit'）静默返回 nil。"
+  (interactive)
+  (let ((session (ebasecamp-ui-session)))
+    (condition-case err
+        (let ((file (ebasecamp-ui--read-compose-file)))
+          (when file
+            (ebasecamp-ui--import-compose session file)))
+      (quit nil)
+      (ebasecamp-import-error
+       (ebasecamp-ui--set-notice session 'error "导入失败"
+                                 (ebasecamp-ui--error-text err)
+                                 (ebasecamp-ui--error-detail err))
+       nil)
+      (error
+       (ebasecamp-ui--set-notice session 'error "导入失败"
+                                 (error-message-string err))
+       nil))))
+
+(defun ebasecamp-ui-export-compose ()
+  "把当前项目导出为部署用 compose 文件，成功后提示。返回导出路径或 nil。
+路径选择与覆盖冲突「换一个路径 / 覆盖 / 取消」三选一都由
+`ebasecamp-export-project' 负责（这里把 `ebasecamp-export--interactive' 绑成
+t，使事件回调上下文也能弹出该询问）。"
+  (interactive)
+  (let ((session (ebasecamp-ui-session))
+        (project (ebasecamp-ui-current-project)))
+    (if (null project)
+        (progn
+          (ebasecamp-ui--set-notice session 'info "请先选择项目"
+                                    "清单里还没有项目，或尚未选定项目")
+          nil)
+      (condition-case err
+          (let ((ebasecamp-export--interactive t)
+                (path (ebasecamp-export-project
+                       (ebasecamp-model-project project) :force nil)))
+            (when path
+              (ebasecamp-ui--set-notice session 'success "导出完成" path))
+            path)
+        (quit nil)
+        (ebasecamp-export-error
+         (ebasecamp-ui--set-notice session 'error "导出失败"
+                                   (ebasecamp-ui--error-text err)
+                                   (ebasecamp-ui--error-detail err))
+         nil)
+        (error
+         (ebasecamp-ui--set-notice session 'error "导出失败"
+                                   (error-message-string err))
+         nil)))))
 
 ;;; 公开 API
 
