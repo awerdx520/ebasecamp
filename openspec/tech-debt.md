@@ -13,3 +13,4 @@
 | 9 | 自定义网络的 external 语义无法表达；跨组同名服务静默保留首个 | 用户无法引用已存在的外部网络；同名服务不会报错而是被静默丢弃 | M4 在 model 层加 `:external` 标记与服务名冲突校验 |
 | 10 | Docker 无健康检查时 `HealthStatus` 为 `"none"` 而非空串 | status 层若原样透传，UI 会显示 `none` | T2.1 在状态归一化时把 `"none"` 与空串都归一为 nil |
 | 11 | `Labels` 值内含逗号时无法完全还原（docker 不转义） | `parse-labels` 的 alist 可能不完整 | 状态层只按 `ebasecamp.*` / `com.docker.compose.*` 前缀取已知键，不依赖完整解析 |
+| 12 | `make check-parens` 原先不覆盖 test/*.el，测试文件括号错漏时会静默吞掉用例 | 测试数下降但显示全绿 | 已在 T2.3 修复：`PARENS_FILES` 含 `TEST_FILES` |

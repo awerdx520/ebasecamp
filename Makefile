@@ -5,16 +5,17 @@ ELPA_LOAD_PATH ?= -L $(STRAIGHT_BUILD)/etaf -L $(STRAIGHT_BUILD)/etaf-ui \
 LOAD_PATH = -L . -L lisp $(ELPA_LOAD_PATH)
 EL_FILES   = $(strip $(wildcard *.el) $(wildcard lisp/*.el))
 TEST_FILES = $(strip $(wildcard test/*-tests.el))
+PARENS_FILES = $(strip $(EL_FILES) $(TEST_FILES))
 
 .PHONY: check check-parens compile test clean
 
 check: check-parens compile test
 
 check-parens:
-	@if [ -z "$(EL_FILES)" ]; then echo "check-parens: 无 .el 文件，跳过"; exit 0; fi; \
+	@if [ -z "$(PARENS_FILES)" ]; then echo "check-parens: 无 .el 文件，跳过"; exit 0; fi; \
 	$(EMACS) -Q --batch $(LOAD_PATH) \
 	  --eval '(setq load-prefer-newer t)' \
-	  --eval '(let ((fail nil) (files (cdr (member "--" command-line-args)))) (dolist (f files) (with-temp-buffer (insert-file-contents f) (emacs-lisp-mode) (condition-case err (check-parens) (error (setq fail t) (message "check-parens FAIL %s: %s" f err))))) (if fail (kill-emacs 1) (message "check-parens OK (%d files)" (length files))))' -- $(EL_FILES)
+	  --eval '(let ((fail nil) (files (cdr (member "--" command-line-args)))) (dolist (f files) (with-temp-buffer (insert-file-contents f) (emacs-lisp-mode) (condition-case err (check-parens) (error (setq fail t) (message "check-parens FAIL %s: %s" f err))))) (if fail (kill-emacs 1) (message "check-parens OK (%d files)" (length files))))' -- $(PARENS_FILES)
 
 compile:
 	@if [ -z "$(EL_FILES)" ]; then echo "compile: 无 .el 文件，跳过"; exit 0; fi; \
