@@ -2,8 +2,8 @@
 
 ERT 测试套件，每个模块一个 `*-tests.el`：`ebasecamp-model` / `ebasecamp-config` /
 `ebasecamp-compose` / `ebasecamp-docker` / `ebasecamp-status` / `ebasecamp-data` /
-`ebasecamp-ui` / `ebasecamp-command` / `ebasecamp-import`，外加包入口的
-`ebasecamp-tests.el`。
+`ebasecamp-ui` / `ebasecamp-command` / `ebasecamp-import` / `ebasecamp-export`，
+外加包入口的 `ebasecamp-tests.el`。
 
 ## 运行
 
