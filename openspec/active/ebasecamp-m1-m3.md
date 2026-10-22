@@ -5,7 +5,7 @@
 - 阶段：Phase 3（Implement）· 批次 5 进行中
 - 已确认：方案 V2 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）
 - 已完成：批次 0–4（M1 数据层与界面、M2 生命周期、M3 导入导出）、T5.1（Readme.org）、T5.3（CHANGELOG.md）
-- 下一步：T5.2 docs/ 四份文档
+- 下一步：T5.2 下半：user-guide.org + troubleshooting.org
 - 待用户确认：真实 Emacs 中目检 `M-x ebasecamp` 界面（T2.3 验收项）
 - 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist；批次 1 修复 stale .elc 陷阱；T2.3 修正 data 层语义、check-parens 覆盖 test/*.el；T3.1 补强跨 scope 依赖；T3.4 toast 降级为 alert；T4.1 落地导入映射（JSON 走 hash-table 解析、不可表达端口进 extra）；T4.2 落地导入落盘（组名 = 项目名、手工构造可读格式、写后自校验与回滚；临时 buffer 读回须显式 `forward-comment` 跳注释、`string-match-p` 校验名字须关 `case-fold-search`）；T4.3 落地导出（只渲 per-project 组 + 项目副本关 shared-network + 原子写 tmp→校验→rename；实测 `docker compose -f x.yaml.tmp config -q` 接受 `.tmp` 扩展名）；T4.4 落地导入导出 UI 入口（操作条改两行避免 80 列溢出裁切、`etaf-call-with-input` 只捕获 `etaf-event-error` 降级、导出侧绑 `ebasecamp-export--interactive` 让冲突三选一在回调里可用）；T4.5 落地导入→导出全链路密钥断言（docker 可用走真实 `--no-interpolate`，否则注入同形态 JSON）；T4.6 真实 docker 闭环通过（导入→加载→启动→状态回读→停止→导出→部署 `config -q`，全程断言 40 项零失败，`:order (project)`、`:auto-started-shared nil`；清理后容器/网络/缓存目录回到基线）；批次 5 落地 T5.1（Readme.org：清单示例用 `emacs -Q --batch` 实测加载，确认覆盖合并为 environment 按键合并 + ports 整体替换）与 T5.3（CHANGELOG.md 首版 0.1.0，按 20 个提交归纳）
 

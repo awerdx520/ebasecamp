@@ -1,0 +1,248 @@
+#+title: ebasecamp compose 生成与导入导出
+#+author: Thomas
+#+options: toc:t
+
+* 渲染输入
+
+渲染入口是 =ebasecamp-compose-render= ，输入只有三样东西：
+
+1. *项目对象* （ =ebasecamp-project= ）：提供 =:name= 、 =:groups= （组引用 plist 列表）、 =:shared-network= 。
+2. *组引用列表* ： =:groups= 的每一项形如 =(:group SYMBOL :scope SCOPE :service-overrides ALIST)= ； =GROUP-FILTER= 非 nil 时只保留命中的组。
+3. *服务视图* ：由 =ebasecamp-model-resolve-services= 计算 —— 取组内服务对象，按组引用的 =:service-overrides= 合并项目级覆盖，返回新对象（ =environment= / =labels= / =:extra= 按键合并，其余字段整体替换）。
+
+渲染层对 =resolve-services= 的返回值 *只读* ： =ports= / =volumes= / =environment= / =extra= 的列表结构与组内对象共享，禁止就地修改。
+
+* 输出结构
+
+下面是真实渲染结果（ =emacs -Q --batch= 加载 =ebasecamp-model= + =ebasecamp-compose= ，一个 shared 组 =mysql= 与一个 per-project 组 =app= ，项目 =myapp= 无 GROUP-FILTER）：
+
+#+begin_src yaml
+name: ebc-myapp
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: "${DB_ROOT_PASSWORD}"
+    labels:
+      ebasecamp.managed: "true"
+      ebasecamp.project: myapp
+      ebasecamp.group: mysql
+      ebasecamp.service: mysql
+      ebasecamp.scope: shared
+    volumes:
+      - "ebasecamp-shared-mysql-mysql-data:/var/lib/mysql"
+    networks:
+      - ebasecamp
+    healthcheck:
+      test: ["CMD","mysqladmin","ping"]
+      interval: 5s
+      retries: 5
+  api:
+    image: ghcr.io/acme/api:1.2.3
+    environment:
+      APP_ENV: dev
+      DB_PASSWORD: "${DB_PASSWORD}"
+    labels:
+      com.example.owner: platform
+      ebasecamp.managed: "true"
+      ebasecamp.project: myapp
+      ebasecamp.group: app
+      ebasecamp.service: api
+      ebasecamp.scope: per-project
+    ports:
+      - "8080:8000"
+    networks:
+      - backend
+      - ebasecamp
+    depends_on:
+      - mysql
+    healthcheck:
+      test: ["CMD-SHELL","curl -fsS localhost:8000/health"]
+      interval: 10s
+networks:
+  ebasecamp:
+    external: true
+    name: ebasecamp
+  backend: {}
+volumes:
+  ebasecamp-shared-mysql-mysql-data: {}
+#+end_src
+
+段顺序固定为 =name= → =services= → =networks= （有网络时）→ =volumes= （有命名卷时）。同一服务名在多个组里重复时 *保留首个* （技术债 #9）。输出 2 空格缩进、block style，标量按需加双引号，文本以单个换行结尾。
+
+* 字段映射表
+
+| 清单字段 | compose 字段 | 取值规则 |
+|----------+--------------+----------|
+| 服务名（symbol） | services 下的键 | 服务名直接作键 |
+| =:image= | =image= | 原样裸写，不加引号 |
+| =:command= | =command= | 字符串 → 引号标量；列表 → flow 序列 |
+| =:entrypoint= | =entrypoint= | 同上；nil 时整键不输出 |
+| =:working-dir= | =working_dir= | 引号标量 |
+| =:user= | =user= | 引号标量 |
+| =:restart= | =restart= | 引号标量 |
+| =:environment= | =environment= | block 映射；value 需引号时双引号 |
+| =:labels= | =labels= | 用户键在前，注入项覆盖同名键 |
+| =:ports= | =ports= | 每项 ="PUB:TGT"= 字符串 |
+| =:volumes= | =volumes= | bind → ="源:目标"= ；见命名规则 |
+| =:volumes= （volume） | 顶层 =volumes= | 命名卷去重后声明为空映射 |
+| =:networks= | =networks= | 服务原有网络在前， =ebasecamp= 追加在后 |
+| =:depends-on= | =depends_on= | 服务名字符串列表；见跨 scope 规则 |
+| =:healthcheck= | =healthcheck= | plist 展开成映射；列表值用 flow 序列 |
+| =:extra= | 服务体附加键 | alist 逐键展开，不校验键名 |
+| 项目 =:name= | =name= | =ebc-<project>= 或 =ebc-shared= |
+| =:shared-network= | 顶层 =networks.ebasecamp= | 非 nil 时声明 external |
+| =:title= / =:root= / =:export-file= | 不输出 | 仅清单内部使用 |
+
+补充规则：
+
+- 需要加引号的标量：空串、前后有空格、含 YAML 特殊字符（冒号、逗号、花括号、方括号、& * ! | > ' " % @ 与反引号），或形如数字 / 布尔 / =null= / =~= 。因此 =${VAR}= 一律带引号。
+- =environment= / =labels= 是 *点对* alist，写作 =(("KEY" . "VALUE"))= ；写成 =(("KEY" "VALUE"))= 会被模型层拒绝（元素必须是字符串点对）。
+- =:image= 视为已知安全值裸写； =${VAR}= 不插值、不转义，原样输出。
+
+* 命名规则
+
+- *compose 项目名* ：本次渲染的组 *全部* 为 shared → =ebc-shared= ；否则 =ebc-<project>= 。名字只允许 =[a-z0-9_-]+= ，由 =ebasecamp-compose--name-string= 校验并在渲染前报错。
+- *生成物路径* ： =<ebasecamp-cache-directory>/<project>/compose.yaml= （默认 =~/.cache/ebasecamp/= ）；全部 shared 时目录为 =_shared= ，避免与项目自身生成物互相覆盖。
+- *命名卷* ：清单的 =(:source X :target T :type volume)= 渲染为 =ebasecamp-<scope>-<group>-<source>= ，挂载形如 ="ebasecamp-shared-mysql-mysql-data:/var/lib/mysql"= ； =scope= 取 =shared= / =per-project= ， =group= 为组名。 =:read-only= 非 nil 时挂载加 =:ro= 。
+- *bind 卷* ：渲染为 ="<:source>:<:target>"= ，不做路径绝对化（保持清单里的相对形式）。
+- *容器名* ：插件 *不设* =container_name= ，由 compose 按 =<compose 项目名>-<服务名>-1= 推导（实测 =ebc-myapp-web-1= ），避免跨项目重名冲突。
+
+* 标签注入
+
+每个服务都注入五项，值取自渲染上下文：
+
+| 标签 | 取值 |
+|------+------|
+| =ebasecamp.managed= | 固定 ="true"= |
+| =ebasecamp.project= | 项目名 |
+| =ebasecamp.group= | 组名 |
+| =ebasecamp.service= | 服务名 |
+| =ebasecamp.scope= | =shared= / =per-project= |
+
+- 注入优先级：用户 =:labels= 先写入，同名键由注入项 *覆盖* （用户无法伪造归属标签）。
+- 其他标签原样保留并按原顺序排在前面（见上面 YAML 里的 =com.example.owner= ）。
+- 状态采集只按这些标签归属容器，因此标签与容器名不一致时以标签为准。
+
+* 网络策略
+
+| 场景 | 服务网络列表 | 顶层 networks 段 |
+|------+--------------+------------------|
+| 本地运行（缓存生成物） | 原有网络 + =ebasecamp= | =ebasecamp: {external: true, name: ebasecamp}= + 其余网络 ={}= |
+| 导出（部署物） | 仅原有网络 | 仅原有网络 ={}= ，不出现 =ebasecamp= |
+
+- =ebasecamp= 声明为 external network，由 =ebasecamp-command-ensure-network= 在执行前创建；所有托管容器加入它，使 per-project 容器能按服务名访问 shared 容器。
+- 服务的自定义网络在顶层以空映射声明，由 compose 按项目自建 =<compose 项目名>_<网络名>= ；不声明会让 =config -q= 报「引用了未定义网络」。
+- 导出物刻意不声明 =ebasecamp= ：它要能脱离 ebasecamp 部署，共享基础设施由部署环境自行提供。
+
+* 跨 scope depends_on 规则
+
+三处规则配合，缺一处就会互相打架：
+
+| 层 | 行为 |
+|----+------|
+| 渲染（filter 非 nil） | 剔除 =depends_on= 中不属于本次渲染服务的名字 |
+| 渲染（filter 为 nil） | 保留全部依赖（预览与导出用） |
+| 执行层（ =start= ） | 用 =:requires-shared= 先补起 shared 批次 |
+
+- *为什么剔除* ：shared 组与 per-project 组落在不同 compose 项目（ =ebc-shared= / =ebc-<project>= ），生成物互相独立；保留跨集合依赖会让 =docker compose up= 报 depends on undefined service。
+- *执行顺序* （ =start= 且 per-project 批次带 =:requires-shared= ）：①校验依赖名确实属于本项目 shared 组服务，否则报错「清单不一致」；②串行跑 shared 批次（服务集合 = 本次选中的 shared 服务 + 缺失的依赖服务，保留选中顺序）；③shared 成功后才派发 per-project 批次；④shared 失败即中止，未派发批次标记 = :skipped =；⑤=on-complete= 回报 =:order= 与 =:auto-started-shared= 。
+- *不做补齐的动作* ： =stop= / =restart= / =down= —— 补齐等于在停止操作里反向启动容器。
+
+* 导入映射表
+
+读取命令固定为（缺任一 flag 即违反不变量 6）：
+
+#+begin_src text
+docker compose -f <file> config --no-interpolate --no-env-resolution --no-path-resolution --format json
+#+end_src
+
+| compose JSON 字段 | 映射到清单 | 规则 |
+|-------------------+------------+------|
+| 顶层 =name= | 忽略 | 仅用于推断建议项目名 |
+| =services.*.image= | =:image= | 原样 |
+| =services.*.command= | =:command= | 数组 → 列表；字符串保留 |
+| =services.*.entrypoint= | =:entrypoint= | =null= 忽略；数组 → 列表 |
+| =services.*.environment= | =:environment= | map → alist；键顺序保留 |
+| =services.*.labels= | =:labels= | 剔除两前缀（见下） |
+| =services.*.ports= （tcp） | =:ports= | =(published . target)= 整数对 |
+| =services.*.ports= （不可表达） | =:extra= =ports= | 保留原始端口对象 |
+| =services.*.volumes= bind | =:volumes= | =:type bind= + 相对源路径 |
+| =services.*.volumes= volume | =:volumes= | =:type volume= + 卷名 |
+| =services.*.volumes= 其它 | =:extra= =volumes= | tmpfs 等保留原始对象 |
+| =services.*.networks= | =:networks= | 保留网络名，剔除 =default= |
+| =services.*.depends_on= | =:depends-on= | 对象/数组两形态归一为名字列表 |
+| =services.*.healthcheck= | =:healthcheck= | 取 test/interval/timeout/retries/start_period |
+| =services.*.working_dir= | =:working-dir= | 原样 |
+| =services.*.user= | =:user= | 原样 |
+| =services.*.restart= | =:restart= | 原样 |
+| =services.*.env_file= | =:extra= =env_file= | 仅留路径引用，不读内容 |
+| 其余未识别字段 | =:extra= | 原样保存供导出回写 |
+
+特例说明：
+
+- *ports 进 =:extra= 的判据* ：协议非 =tcp= 、缺 =published= 或无 =target= 、绑定到具体宿主 IP（ =host_ip= 既不空也不是 =0.0.0.0= / =::= / =[::]= ）。 =published= 可能是字符串（如 ="18081"= 或 ="127.0.0.1:9090"= ），取最后一个冒号后的端口段转整数。
+- *labels 剔除前缀* ： =ebasecamp.= （插件自己注入）与 =com.docker.compose.= （compose 生成）。
+- *entrypoint: null* 与整键缺失等价，都映射为 nil（落盘时省略）。
+- *=default= 网络* ：compose 归一化后总会带 =default= ，它由 compose 隐式创建，不写入清单。
+- *字段可缺省* ： =--no-interpolate= 的输出比常规 =config= 缺更多字段（无 =command: null= 、 =entrypoint: null= 、 =ipam: {}= ），导入层按「字段可缺省」处理，不把缺失当语义差异。
+- *落盘结构* ：导入结果所有服务挂在组引用 =app= 的 =:service-overrides= ；落盘时物化成一份 =ebasecamp-define-group= （组名 = 项目名）+ 一份 =ebasecamp-define-project= ，文件为 =projects/<name>.el= 。
+
+* 导出规则
+
+| 项 | 规则 |
+|----+------|
+| 渲染范围 | 只渲染 per-project 组（shared 由部署环境自行提供） |
+| 网络 | 用 =:shared-network= 置 nil 的项目副本渲染，不出现 =ebasecamp= |
+| 头注释 | 来源项目、事实源清单路径、重新生成命令、shared 未包含说明 |
+| 默认文件名 | =<project-root>/docker-compose.ebasecamp.yaml= |
+| =:export-file= | 相对路径按 =:root= 展开，覆盖默认文件名 |
+| 无 =:root= 且无 =:export-file= | 报错（无法定位派生文件） |
+| 无 per-project 组 | 报错（不产出空部署文件） |
+| 覆盖冲突 | =:force= 直接覆盖；非交互报错；交互三选一（换路径 / 覆盖 / 取消） |
+| 落盘 | 写 =<target>.tmp= → =config -q= 校验 → rename 到目标 |
+| 失败处理 | 校验失败删 tmp 并报错，目标路径不动（不会出现半写文件） |
+
+头注释实测形如：
+
+#+begin_src text
+# 由 ebasecamp 生成，请勿手工编辑。
+#
+# 项目：myapp
+# 事实源：/home/thomas/.config/ebasecamp/projects/myapp.el
+# 重新生成：M-x ebasecamp-export-compose 选择项目 myapp，或
+#   (ebasecamp-export-project (ebasecamp-model-project 'myapp) :force t)
+#
+# 说明：只含项目 myapp 的 per-project 组服务（组：app）。
+#       shared 组（mysql）的服务由部署环境自行提供，不在本文件中。
+#       因此本文件不声明 ebasecamp 共享网络；服务原有的自定义网络由
+#       compose 按项目自建（myapp_<网络名>）。
+#+end_src
+
+导出正文与被过滤的 per-project 渲染一致（实测：服务 =api= 的网络只剩 =backend= ，顶层只有 =networks: backend: {}= ， =depends_on= 已剔除）。
+
+* Compose 5.6.0 实测约束
+
+| 现象 | 应对 |
+|------+------|
+| =config --format json= 会插值变量 | 读取时加 =--no-interpolate= |
+| =${VAR}= 未设时静默置空且 exit 0 | 同上，且用密钥断言测试守 |
+| 缺 =--no-env-resolution= 会合并 =env_file= | 导入用三 flag，只保留路径引用 |
+| 缺 =--no-path-resolution= 相对路径被绝对化 | 导入用三 flag，路径保持相对 |
+| =--no-interpolate= 输出字段更少 | 导入按「字段可缺省」处理 |
+| =published= 是字符串 | 取端口段转整数，兼容含 IP 写法 |
+| =entrypoint: null= 恒出现（常规 config） | 映射为 nil 并忽略 |
+| =docker ps= 默认截断长字段 | 必须 =--no-trunc= |
+| =Labels= 是逗号串 | 按第一个 = 切分；值内逗号无法还原 |
+| 无健康检查时 =HealthStatus "none"= | 状态层归一为 nil |
+| =config -q= 合法时零输出 exit 0 | 双判据：exit 0 *且* stderr 无 =level=error= |
+| 未定义变量只产生 =level=warning= | 不因 warning 判失败，但要展示 |
+| =config -q= 接受 =.tmp= 扩展名 | 导出可直接校验临时文件 |
+
+* 相关文档
+
+- [[file:architecture.org][架构与分层]]
+- [[file:adr/0001-architecture.org][ADR-0001 架构与同步模型]]
+- [[file:user-guide.org][用户指南]]
+- [[file:troubleshooting.org][故障排查]]
+- [[file:../AGENTS.md][AGENTS.md 不变量清单]]

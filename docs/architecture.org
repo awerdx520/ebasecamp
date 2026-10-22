@@ -1,0 +1,237 @@
+#+title: ebasecamp 架构
+#+author: Thomas
+#+options: toc:t
+
+* 定位与范围
+
+ebasecamp 是 Emacs 里的 Docker 环境分组管理插件，核心不变式是「 *清单是唯一事实源，compose 是派生产物* 」：组与项目的定义以 Elisp 形式保存在 =~/.config/ebasecamp/= （ =groups.el= 与 =projects/*.el= ），任何 compose 文件要么是由清单渲染出的可重建缓存（ =~/.cache/ebasecamp/= ），要么是用户显式触发的部署导出物。插件不做双向同步，也不解析 YAML —— 读取 compose 一律交给 =docker compose config= ，写出用自写的最小序列化器。架构决策与取舍见 [[file:adr/0001-architecture.org][ADR-0001]]。
+
+本文档只描述 *当前实现* （HEAD 批次 4 完成态）；代码是最终依据，文档与代码冲突时以代码为准并回头修文档。
+
+* 分层与依赖方向
+
+| 层 | 模块 | 职责 | 允许依赖 | 禁止依赖 |
+|----+------+------+----------+----------|
+| 1 纯数据 | =model= / =config= | struct、字段校验、覆盖合并、清单加载 | =cl-lib= | etaf、docker、2 层以上 |
+| 2 渲染映射 | =compose= / =import= / =export= | YAML 写出、compose JSON 读入映射、导出落盘 | 1 层 + =docker= | etaf |
+| 3 进程 | =docker= | 起进程、捕获 stdout/stderr、解析 ps 与 config | =cl-lib= / =json= | =model= / =compose= 、etaf |
+| 4 语义 | =command= / =status= | 生命周期分派、跨 scope 补齐、状态归一与聚合 | 1–3 层 | etaf |
+| 5 适配 | =data= | 清单 ∪ 状态合并、ETAF Data source/controller | 1、4 层 + etaf | 直接调 docker |
+| 6 界面 | =ui= | etaf 渲染、会话状态、动作派发 | 1–5 层 + etaf / etaf-ui | =docker= / 拼 docker 命令 |
+
+依赖方向的硬约束：
+
+- =ui= 层不得直接调用 =docker= 层，也不得拼接 docker 命令行；进程与参数构造只允许出现在 =ebasecamp-docker.el= / =ebasecamp-command.el= （AGENTS.md 禁止行为 1）。
+- =model= / =config= 不依赖 etaf，可在 =emacs -Q --batch= 下单独加载与单测。
+- =compose= 只读 =model= 的数据：不写注册表、不执行 docker、不解析 YAML；对 =resolve-services= 返回的浅拷贝字段一律只读，禁止 =setcar= / =plist-put= 就地修改。
+- =docker= 不判断任何业务语义（哪些服务该起、容器归属哪个项目、状态如何聚合），只做「进程 + 解析」。
+- =data= 的 source =:load= 只读最近一次成功快照，不主动执行 =docker ps= ；轮询归 =status= ，避免一次刷新跑两次 docker。
+
+* 数据流
+
+按序号为「一次启动操作 + 一次界面刷新」的完整路径：
+
+1. 用户在 =ui= 的服务表里勾选服务（ =selected-ref= 持有 =project/group/service= 稳定身份），点操作条按钮。
+2. =ui= → =command-split-keys= ：把选中集合按有效 scope 拆成 =shared= 与 =per-project= 两批（纯函数，只读清单）。
+3. =command= 为每批算生成物路径与 compose 项目名：per-project → ==cache>/<project>/compose.yaml= （ =ebc-<project>= ）；shared → ==cache>/_shared/compose.yaml= （ =ebc-shared= ）。
+4. =command= 调 =compose-write= 渲染该 scope 的生成物（GROUP-FILTER 非 nil，跨集合 =depends_on= 被剔除）。
+5. =command= 调 =docker-run-async= 执行 =docker compose -f <file> -p <name> up -d <services...>= ； =start= 时若 per-project 批次带 =:requires-shared= ，先串行跑 shared 批次。
+6. =status= 按 =ebasecamp-status-refresh-interval= （默认 3 秒）轮询： =status-snapshot= → =docker-ps= （ =--no-trunc= ）→ 容器 plist → =status-normalize= 得状态记录。
+7. =data-project-records= 把清单服务与状态记录按 =project/group/service= 三元组合并（清单有定义无容器的服务 =:state "stopped"= ）。
+8. =ui= 用 ETAF Data controller 取记录渲染（服务表 / 组树 / 状态徽标 / =etaf-alert= 错误详情）。
+
+* 模块职责表
+
+公开 API 的判定口径： =defun= / =cl-defun= / =defmacro= 定义、名字中 *不含* =--= 的非私有符号。逐个模块的数量：
+
+| 文件 | 职责 | 公开 API 数 |
+|------+------+-------------|
+| =ebasecamp.el= | 包入口：defcustom 组、autoload 命令、示例清单生成 | 3 |
+| =ebasecamp-model.el= | 三个 struct、定义宏、注册表、覆盖合并 | 8 |
+| =ebasecamp-config.el= | 加载 =groups.el= / =projects/*.el= 、错误收集、引用校验 | 3 |
+| =ebasecamp-compose.el= | 清单 → compose YAML 渲染、生成物路径与落盘 | 4 |
+| =ebasecamp-docker.el= | docker CLI 同步/异步封装、ps 与 config 解析、版本检测 | 8 |
+| =ebasecamp-status.el= | 容器状态归一、聚合、轮询定时器生命周期 | 9 |
+| =ebasecamp-command.el= | 生命周期命令分派、跨 scope 补齐、端口冲突检测 | 7 |
+| =ebasecamp-data.el= | 清单 ∪ 状态合并、ETAF Data source/controller | 4 |
+| =ebasecamp-import.el= | compose → 清单（纯映射 + 落盘自校验） | 7 |
+| =ebasecamp-export.el= | 清单 → 部署用 compose（原子写 + 校验） | 3 |
+| =ebasecamp-ui.el= | etaf 主界面、会话状态、动作派发、导入导出入口 | 12 |
+
+合计 68 个公开符号。明细（含每个符号的一句话职责）：
+
+** =ebasecamp.el= （3）
+
+- =ebasecamp= —— 打开管理界面（ =ebasecamp-ui-open= 的 autoload 封装）。
+- =ebasecamp-create-sample-config= —— 生成 =groups.el= 与 =projects/example.el= ；已存在时 =C-u= 才覆盖。
+- =ebasecamp-reload= —— 重新加载清单并刷新界面，返回 =config-load= 的结果 plist。
+
+** =ebasecamp-model.el= （8）
+
+- =ebasecamp-define-group= / =ebasecamp-define-project= —— 清单定义宏（注册到内存注册表）。
+- =ebasecamp-model-reset= —— 清空注册表（每次加载前调用，保证重新加载幂等）。
+- =ebasecamp-model-groups= / =ebasecamp-model-projects= —— 返回注册表副本（定义顺序）。
+- =ebasecamp-model-group= / =ebasecamp-model-project= —— 按名字取对象，不存在返回 nil。
+- =ebasecamp-model-resolve-services= —— 组 + 项目级覆盖 → 服务对象列表（浅拷贝）。
+
+** =ebasecamp-config.el= （3）
+
+- =ebasecamp-config-load= —— 加载清单，返回 =(:groups :projects :errors :bootstrap-needed)= 。
+- =ebasecamp-config-project-file= —— 项目清单文件路径 =<dir>/projects/<name>.el= 。
+- =ebasecamp-config-ensure-directory= —— 创建清单目录并返回带尾斜杠的路径。
+
+** =ebasecamp-compose.el= （4）
+
+- =ebasecamp-compose-project-name= —— 单个组对应的 compose 项目名（ =ebc-shared= / =ebc-<project>= ）。
+- =ebasecamp-compose-render= —— 渲染为 YAML 文本（可选 GROUP-FILTER 限定渲染哪些组）。
+- =ebasecamp-compose-cache-file= —— 生成物绝对路径（不落盘）。
+- =ebasecamp-compose-write= —— 渲染并写入缓存目录，返回文件路径。
+
+** =ebasecamp-docker.el= （8）
+
+- =ebasecamp-docker-run-sync= / =ebasecamp-docker-run-async= —— 执行 docker CLI，返回 =(:exit :stdout :stderr)= 。
+- =ebasecamp-docker-classify-error= —— 退出码 + stderr → =ok= / =permission= / =exit= 。
+- =ebasecamp-docker-check-compose= —— =config -q= 双判据校验，返回 =(:ok :exit :stderr :warnings)= 。
+- =ebasecamp-docker-parse-labels= —— =Labels= 逗号串 → alist（值内逗号无法还原）。
+- =ebasecamp-docker-parse-ps-output= —— =ps --format '{{json .}}'= 多行 JSON → 容器 plist 列表。
+- =ebasecamp-docker-ps= —— 采集托管容器（ =--no-trunc= + =--filter label= ）。
+- =ebasecamp-docker-version-check= —— =docker compose version= 检测，主版本不符只警告。
+
+** =ebasecamp-status.el= （9）
+
+- =ebasecamp-status-normalize= —— 容器 plist → 状态记录（ =:health "none"= → nil）。
+- =ebasecamp-status-aggregate= —— 按 =(project group)= 聚合出 =up= / =down= / =partial= 。
+- =ebasecamp-status-group-records= —— 取某项目某组的状态记录。
+- =ebasecamp-status-snapshot= —— 采集一次并归一；失败不 signal，错误存 =last-error= 。
+- =ebasecamp-status-last-records= / =ebasecamp-status-last-error= —— 最近一次成功记录 / 最近错误。
+- =ebasecamp-status-running-p= —— 轮询是否在运行。
+- =ebasecamp-status-start= / =ebasecamp-status-stop= —— 启动（立即刷一次）/ 停止轮询定时器。
+
+** =ebasecamp-command.el= （7）
+
+- =ebasecamp-command-service-key= —— 服务标识归一为 ="group/service"= 。
+- =ebasecamp-command-split-keys= —— 选中集合按 scope 拆成两批（含 =:requires-shared= ）。
+- =ebasecamp-command-compose-args= —— 构造 compose 参数列表（ =down= 不带 =-v= ）。
+- =ebasecamp-command-ensure-network= —— 确保 external network =ebasecamp= 存在。
+- =ebasecamp-command-pending-p= —— 该项目是否有命令在执行。
+- =ebasecamp-command-run= —— 执行 start/stop/restart/down，返回启动的进程列表。
+- =ebasecamp-command-port-conflicts= —— 端口冲突检测（ =duplicate= / =busy= / =unknown= ）。
+
+** =ebasecamp-data.el= （4）
+
+- =ebasecamp-data-project-records= —— 项目的清单 ∪ 状态记录（纯函数）。
+- =ebasecamp-data-source= / =ebasecamp-data-controller= —— ETAF Data source / controller（ =:auto-load= nil）。
+- =ebasecamp-data-refresh= —— 采一次快照后让 controller 重新 =load= 。
+
+** =ebasecamp-import.el= （7）
+
+- =ebasecamp-import-parse= —— 执行三 flag 的 =compose config= 并映射为项目结构。
+- =ebasecamp-import-parse-json= —— 同上但输入是 JSON 字符串（纯函数）。
+- =ebasecamp-import-suggest-name= —— 推断建议项目名（顶层 =name= → 父目录 → 文件名 → =imported= ）。
+- =ebasecamp-import-service-plists= / =ebasecamp-import-service-plist= —— 读导入结果的服务 plist。
+- =ebasecamp-import-apply= —— 落盘为 =projects/<name>.el= 并自校验（失败回滚）。
+- =ebasecamp-import-file= —— 交互式导入封装。
+
+** =ebasecamp-export.el= （3）
+
+- =ebasecamp-export-default-file= —— 默认导出路径（ =:export-file= 或 =<root>/docker-compose.ebasecamp.yaml= ）。
+- =ebasecamp-export-project= —— 导出（原子写 + =config -q= 校验 + 冲突三分支）。
+- =ebasecamp-export-compose= —— 交互式导出封装。
+
+** =ebasecamp-ui.el= （12）
+
+- =ebasecamp-ui-open= / =ebasecamp-ui-close= —— 建/销界面会话（挂载与卸载钩子、定时器清理）。
+- =ebasecamp-ui-view= —— 返回整棵 etaf Host 树（纯渲染）。
+- =ebasecamp-ui-refresh= —— 重载清单并刷新表格。
+- =ebasecamp-ui-session= —— 当前会话对象访问器。
+- =ebasecamp-ui-current-project= —— 当前项目对象。
+- =ebasecamp-ui-selected-keys= —— 当前勾选的服务标识列表。
+- =ebasecamp-ui-run-action= —— 派发生命周期动作（ =busy= 时直接拒绝）。
+- =ebasecamp-ui-confirm= / =ebasecamp-ui-dismiss-confirm= —— 销毁环境确认框。
+- =ebasecamp-ui-import-compose= / =ebasecamp-ui-export-compose= —— 导入 / 导出的界面入口。
+
+* 不变量清单
+
+以下每条都可机械检查（命令或断言），违反即视为缺陷而非风格问题。
+
+| # | 不变量 | 违反后果 |
+|---+--------+----------|
+| 1 | compose 项目名：全 shared → =ebc-shared= ；否则 =ebc-<project>= | 容器归属混淆，shared 被重复启动或误删 |
+| 2 | 项目名与组名仅 =[a-z0-9_-]+= | compose 拒绝、跨项目命名冲突 |
+| 3 | 托管服务注入五项标签（managed/project/group/service/scope） | 状态采集漏容器，起停作用于错集合 |
+| 4 | 本地运行注入 external network =ebasecamp= ；导出 *不注入* | 缺注入 → 跨 scope 服务名不解析；导出注入 → 部署机需预建网络 |
+| 5 | 生成物固定 =<cache>/<project>/compose.yaml= 与 =<cache>/_shared/compose.yaml= | shared 生成物与项目生成物互相覆盖 |
+| 6 | 读取项目 compose 必须三 flag（ =--no-interpolate= 等） | =${VAR}= 明文或静默置空、 =env_file= 内容合并、相对路径被绝对化 |
+| 7 | =docker ps= 必须带 =--no-trunc= | ID / Labels 被截断，归属判定失效 |
+| 8 | =config -q= 判据为「退出码 + stderr 不含 =level=error= 」 | 未定义变量的错误漏报，非法生成物被当通过 |
+| 9 | 按 scope 渲染时剔除指向集合外服务的 =depends_on= | =up= 报 depends on undefined service |
+| 10 | shared 组不提供 =down= | 误删其他项目正在共用的容器 |
+| 11 | 清单与生成物只存 =${VAR}= 引用与相对路径 | 密钥明文落盘、路径跨机器失效 |
+
+第 6 条的三个 flag 缺一不可，缺 =--no-interpolate= 时退出码仍为 0（静默），因此只能靠代码审查 + 密钥断言测试守。
+
+* 生命周期语义
+
+| 动作 | 作用 scope | 补齐 shared | 命令形态 | 备注 |
+|------+-----------+------------+----------+------|
+| =start= | per-project + shared | 是（跨 scope 依赖） | =up -d SVC...= | 先 shared 后 per-project，串行 |
+| =stop= | per-project + shared | 否 | =stop SVC...= | 补齐等于在停止里反向启动 |
+| =restart= | per-project + shared | 否 | =restart SVC...= | 见技术债 #14 |
+| =down= | 仅 per-project | 否 | =down= （不带 =-v= ） | shared 分支直接报错 |
+
+- *作用范围* ： =start=/=stop=/=restart= 的 SERVICE 列表来自勾选集合； =down= 的语义是整个 compose 项目，收到服务名即报错。
+- *补齐顺序* ： =start= 且 per-project 批次带 =:requires-shared= 时，先校验这些名字确实是本项目的 shared 组服务（否则报错），再串行跑 shared 批次（服务集合覆盖这些依赖，必要时在选中服务后追加缺失项），成功后才派发 per-project 批次；shared 失败即中止，未派发的批次在结果里标记 =:skipped= 。
+- *幂等与清理* ： =ebasecamp-command-ensure-network= 每次执行前同步确保 external network 存在（ =network inspect= 失败则 =create= ，stderr 含 =already exists= 视为成功）。
+- *并发模型* ：pending 标记按 *项目名* 置位（ =ebasecamp-command--pending= hash），在派发前置位、全部批次结束后清除；重复调用 signal =ebasecamp-command-busy= 。派发阶段抛错也会释放 pending（避免永久锁死）。UI 侧 =busy= 是会话级：为真时操作条全部 =:disabled= ，且 =ebasecamp-ui-run-action= 函数层再次拒绝（双保险）。
+- *端口冲突检测时机* ：仅 =start= 前，经 =ebasecamp-command-port-conflicts= 做两步检查 —— ①选中集合内 published 端口重复（ =duplicate= ）；②宿主端口已被占用（ =busy= ）。探测用 =make-network-process= bind 探测（注入点 =ebasecamp-command--port-free-p= ），探测本身报错（权限等）降级为 =unknown= ， *不阻塞* 启动，由 UI 以 warning 呈现。
+
+* 状态模型
+
+| 项 | 规则 |
+|----+------|
+| 采集 | =docker ps -a --no-trunc --filter label=ebasecamp.managed=true --format '{{json .}}'= |
+| 轮询间隔 | =ebasecamp-status-refresh-interval= ，默认 3 秒；仅在 UI 挂载时启停 |
+| 首次刷新 | =status-start= 立即刷一次（返回时 =last-records= 已有值）再起定时器 |
+| =:health= 归一 | ="none"= / 空串 / nil → nil； =healthy= / =unhealthy= / =starting= 原样 |
+| =:state= 归一 | 小写字符串原样语义（ =running= / =exited= / =created= / =paused= ），不做 up/down 二次判断 |
+| 标签取值 | 只按 =ebasecamp.project= 等 *精确键* 取，不做前缀匹配；缺失时回退顶层字段 |
+| 合并 | 记录 = 清单服务 ∪ 同名容器状态，键为 =project/group/service= ；未命中 =:state "stopped"= |
+| 聚合 | 按 =(project group)= ：running =total>0 → =up= ；running =0 → =down= ；其余 =partial= |
+| 排序 | 聚合按 project 再 group 字典序；记录按 group 再 service 字典序 |
+| 失败处理 | 刷新失败不 signal、不停表，错误进 =last-error= ， =last-records= 保持上次成功值 |
+
+* 测试策略
+
+| 级别 | 覆盖内容 | 入口 |
+|------+----------+------|
+| L1 语法 | =check-parens= （含 =test/*.el= ）+ 字节编译零 warning | =make check-parens= / =make compile= |
+| L2 功能 | ERT 全量（234 项）+ 真实 docker 冒烟 | =make test= / 见下「真实 docker」 |
+| L3 不变量 | 标签、网络、命名、密钥保真、跨 scope 依赖 | ERT 断言 + 真实容器回读 |
+
+- *fixture 来源* ： =test/fixtures/= 下的 compose / ps / config JSON 均为 2026-10-22 在 Docker 29.9.1 + Compose 5.6.0 上 *实测输出* ，不是手写臆造；格式漂移时先重采再改断言。
+- *真实 docker 的用例* ：L2/L3 中凡需要真实进程的（ =config -q= 校验、起停冒烟、导入导出闭环、shared ↔ per-project 网络互通）都在 docker 可用时才跑。
+- *如何跳过* ：注入点在 =ebasecamp-docker--run-sync-function= / =ebasecamp-command--port-free-p= / =ebasecamp-docker--run-async-process= 等；测试用 =cl-letf= 换掉执行函数，或用「docker 不可用则注入同形态 JSON」的分支。UI 用例一律 =emacs -Q --batch= 下 =etaf-mount= 到临时 buffer 后断言 =buffer-string= ，并在真实 Emacs 中人工目检一次。
+
+* 已知设计取舍
+
+每条一句话，细节见 [[file:../openspec/tech-debt.md][技术债]]。
+
+- 自写 YAML 序列化器只覆盖清单可能出现的类型，新字段靠 =:extra= 透传（#3）。
+- 状态用 3 秒轮询而非 =docker events= ，延迟与进程开销换实现简单（#4）。
+- =Labels= 值内含逗号无法完全还原，只按已知前缀取键（#5、#11）。
+- 清单加载失败用「重置 + 重放已成功文件」回滚，O(n²) 但清单规模小（#7）。
+- =:extra= 原样透传、清单层不校验键名，非法 compose 字段会推迟到 =config -q= 才暴露（#8）。
+- 自定义网络的 external 语义不可表达，跨组同名服务静默保留首个（#9）。
+- =restart= 不补齐 shared 分支， =depends-on= 笔误被静默剔除（#14）。
+- UI 的 =busy= 是会话级而非项目级，多项目并行被收窄为单飞（#15）。
+- shared 容器没有插件侧清理入口，只能 =docker rm -f= （#16）。
+- 导入成功后不自动切换到新项目（#17）。
+
+* 相关文档
+
+- [[file:adr/0001-architecture.org][ADR-0001 架构与同步模型]]
+- [[file:compose-generation.org][compose 生成与导入导出规则]]
+- [[file:user-guide.org][用户指南]]
+- [[file:troubleshooting.org][故障排查]]
+- [[file:../AGENTS.md][AGENTS.md 仓库地图与不变量]]
+- [[file:../openspec/tech-debt.md][技术债清单]]
