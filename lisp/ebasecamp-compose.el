@@ -133,8 +133,14 @@ nil 输出 null，t 输出 true，数字原样，其余按字符串处理。"
          (t (format "%s" key)))))
 
 (defun ebasecamp-compose--mapping-p (value)
-  "判断 VALUE 是否为映射（元素为 cons 的 alist）。"
-  (and (consp value) (consp (car value))))
+  "判断 VALUE 是否为映射（元素为 (STRING-KEY . VALUE) 的 alist）。
+键必须是字符串：清单里 alist 的键一律是字符串，而「元素为 alist 的列表」
+（如 `:extra' 里的端口对象列表 `(((\"host_ip\" . \"127.0.0.1\") …))'）是
+序列，不能当映射展开 —— 否则 `(car pair)' 是 cons，会被 `--yaml-key' 渲染成
+`(host_ip . 127.0.0.1)' 这类垃圾键（tech-debt #21）。"
+  (and (consp value)
+       (consp (car value))
+       (stringp (caar value))))
 
 ;;; 序列化器
 

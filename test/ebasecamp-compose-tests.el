@@ -8,7 +8,7 @@
 ;; 字符集校验、单服务与多服务渲染、environment 中 ${VAR} 原样保留、标签
 ;; 注入优先级、命名卷与 bind 卷、external network 附加与关闭、group-filter
 ;; 过滤、extra 字段序列化与引号策略、healthcheck 与 depends_on 形态、
-;; 生成物落盘路径与内容、结尾换行。
+;; 生成物落盘路径与内容、结尾换行、mapping 判据（alist vs alist 列表）。
 
 ;;; Code:
 
@@ -430,5 +430,54 @@ mysql 属 shared 组而 api、migrate 属 per-project 组，两批落在不同 c
       (should (string-match-p "^name: ebc-shared$" content))
       (should (string-match-p "^  mysql:$" content))
       (should-not (string-match-p "^  api:$" content)))))
+
+;;; 15. mapping 判据（tech-debt #21 / D5）
+
+(defun ebasecamp-compose-test--host-ip-port ()
+  "构造含「绑定宿主 IP 端口」的项目，返回项目对象。
+端口对象取自导入层真实形态（D3 实测）：`published' 是字符串、`target' 是
+整数，整份对象列表落在服务的 `:extra' 里（键为 \"ports\"）。"
+  (ebasecamp-define-group web
+    :services
+    ((web :image "nginx:1.27"
+          :extra (("ports" (("host_ip" . "127.0.0.1")
+                            ("mode" . "ingress")
+                            ("protocol" . "tcp")
+                            ("published" . "18097")
+                            ("target" . 80)))))))
+  (ebasecamp-define-project site :root "/tmp/ebc-site" :groups ((web)))
+  (ebasecamp-model-project 'site))
+
+(ert-deftest ebasecamp-compose-test-mapping-p-rejects-plist-list ()
+  "字符串键的 alist 判为映射；「单元素 alist 列表」判为非映射（走序列分支）。"
+  (should (ebasecamp-compose--mapping-p '(("a" . "b"))))
+  (should (ebasecamp-compose--mapping-p '(("a" . "b") ("c" . "d"))))
+  ;; 形如 ((("host_ip" . "127.0.0.1") …))：列表里放的是端口对象，不是键值对
+  (should-not (ebasecamp-compose--mapping-p
+               '((("host_ip" . "127.0.0.1") ("target" . 80)))))
+  (should-not (ebasecamp-compose--mapping-p '((("a" . "b") ("c" . "d")))))
+  ;; 空值与纯标量序列都不是映射
+  (should-not (ebasecamp-compose--mapping-p nil))
+  (should-not (ebasecamp-compose--mapping-p '("a" "b"))))
+
+(ert-deftest ebasecamp-compose-test-yaml-renders-port-object-list-as-sequence ()
+  "`:extra' 里的端口对象列表渲染为 block 序列（compose 长语法）。
+不再把 alist 当 (KEY . VALUE) 对展开，因而不产出 `(host_ip . 127.0.0.1):'
+这类垃圾键。"
+  (ebasecamp-compose-test--clean
+    (let* ((project (ebasecamp-compose-test--host-ip-port))
+           (yaml (ebasecamp-compose-render project)))
+      (should (string-match-p "^    ports:$" yaml))
+      ;; 恰好一层序列项：`-' 单独成行，对象字段在下一层缩进（不重复嵌套）
+      (should (string-match-p
+               "    ports:\n      -\\s-*\n        host_ip: 127\\.0\\.0\\.1\n"
+               yaml))
+      (should (string-match-p "^\\s-+mode: ingress$" yaml))
+      (should (string-match-p "^\\s-+protocol: tcp$" yaml))
+      ;; published 是字符串，加引号后才不会被 compose 读成整数之外的类型
+      (should (string-match-p "^\\s-+published: \"18097\"$" yaml))
+      (should (string-match-p "^\\s-+target: 80$" yaml))
+      (should-not (string-match-p "(host_ip" yaml))
+      (should-not (string-match-p "127\\.0\\.0\\.1):" yaml)))))
 
 ;;; ebasecamp-compose-tests.el ends here

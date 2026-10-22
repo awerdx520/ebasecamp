@@ -420,5 +420,46 @@ BODY 内 `checked-file' 为最后一次校验收到的文件路径。"
         (should (string-match-p "myapp/api:dev"
                                 (ebasecamp-export-test--read target)))))))
 
+;;; 9. 绑定宿主 IP 端口（tech-debt #21 / D5）
+
+(defun ebasecamp-export-test--host-ip-port-world (root)
+  "在 ROOT 下注册含「绑定宿主 IP 端口」的清单，返回项目对象。
+端口对象走导入层真实形态（`published' 字符串、`target' 整数），进服务
+`:extra' 的 \"ports\" 键 —— 渲染层必须把它当序列而非映射。"
+  (ebasecamp-model-reset)
+  (ebasecamp-model--register-group
+   'web
+   (list :title "Web"
+         :scope 'per-project
+         :services
+         '((web
+            :image "nginx:1.27"
+            :extra (("ports" (("host_ip" . "127.0.0.1")
+                              ("mode" . "ingress")
+                              ("protocol" . "tcp")
+                              ("published" . "18097")
+                              ("target" . 80))))))))
+  (ebasecamp-model--register-project
+   'site
+   (list :title "Site" :root root
+         :groups '((web :scope per-project)))))
+
+(ert-deftest ebasecamp-export-test-render-host-ip-port-passes-config-q ()
+  "含绑定宿主 IP 端口的项目可导出：ports 段为合法长语法，校验通过即落盘。
+校验用 `cl-letf' 打桩（真实 docker 见 batch 闭环），因此本用例不依赖 docker。"
+  (ebasecamp-export-test--with-root
+    (ebasecamp-export-test--with-fake-check ebasecamp-export-test--ok-result
+      (let* ((project (ebasecamp-export-test--host-ip-port-world root-dir))
+             (path (ebasecamp-export-project project))
+             (text (ebasecamp-export-test--read path)))
+        ;; 导出成功且临时文件已被 rename 掉
+        (should (file-exists-p path))
+        (should-not (file-exists-p checked-file))
+        ;; ports 段是「序列 + 对象映射」的正确形态
+        (should (string-match-p "^    ports:$" text))
+        (should (string-match-p "^\\s-+host_ip: 127\\.0\\.0\\.1$" text))
+        (should (string-match-p "^\\s-+target: 80$" text))
+        (should-not (string-match-p "(host_ip" text))))))
+
 (provide 'ebasecamp-export-tests)
 ;;; ebasecamp-export-tests.el ends here
