@@ -1,18 +1,24 @@
 ;;; ebasecamp.el --- Emacs 中的 Docker 环境分组管理 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "29.1") (etaf "0.2.3") (etaf-ui "0.1.3"))
 
 ;;; Commentary:
 
-;; ebasecamp 把 Docker 环境按「项目 → 组 → 服务」三层管理：
+;; ebasecamp 把 Docker 环境按「组 → 配置 → 项目」组织：
 ;;
-;; - 服务组（group）是可复用的基础组件集合，例如 mysql、redis，scope 为
-;;   shared（跨项目共用一套容器）或 per-project（每个项目一套）；
-;; - 项目（project）绑定若干组，可以覆盖端口、环境变量与卷；
-;; - 主界面按服务多选，批量启动/停止/重启（操作命令见后续批次）。
+;; - 组（group）是可复用的基础组件集合，例如 mysql、redis，是全局第一等
+;;   对象，不依赖任何项目即可存在；scope 为 shared（跨项目共用一套容器）
+;;   或 per-project（每个项目一套）；
+;; - 配置（config）挂在组的 `:configs' 槽里，用 `:project' 指向一个项目，
+;;   并可为该项目覆盖端口、环境变量与卷；一份配置 = 一个「组 × 项目」实例；
+;; - 项目（project）是业务工程的容器，提供 title / root / shared-network /
+;;   export-file；项目对组的引用由组内 `:configs' 在加载期物化而来。
+;;
+;; 主界面以组为中心：左栏「组 → 配置」树，右栏每份配置一段服务表，勾选
+;; 服务后按段批量启动/停止/重启。
 ;;
 ;; 清单目录：默认为 `ebasecamp-config-directory'（~/.config/ebasecamp/），
 ;; 结构如下：
@@ -26,11 +32,16 @@
 ;;
 ;; 常用命令：
 ;;
-;;   M-x ebasecamp                      打开管理界面
+;;   M-x ebasecamp                      打开管理界面（组 → 配置 → 项目）
 ;;   M-x ebasecamp-reload               重新加载清单并刷新界面
 ;;   M-x ebasecamp-create-sample-config 生成示例清单（C-u 前缀强制覆盖）
 ;;   M-x ebasecamp-import-file          从 compose 文件导入清单
-;;   M-x ebasecamp-export-compose       把项目导出为部署用 compose
+;;   M-x ebasecamp-export-compose       选项目导出为部署用 compose
+;;   M-x ebasecamp-ui-close             关闭主界面，停轮询并销毁会话
+;;
+;; 界面内的导入 / 导出 / 销毁环境走底栏三个按钮
+;; （`ebasecamp-ui-import-compose' / `ebasecamp-ui-export-compose' /
+;; `ebasecamp-ui-destroy-environment'）。
 ;;
 ;; 安全约束：
 ;;
@@ -114,7 +125,7 @@ ${VAR} 引用，不含任何明文。"
 
 ;;;###autoload
 (defun ebasecamp ()
-  "打开 ebasecamp 管理界面。"
+  "打开 ebasecamp 管理界面（左栏「组 → 配置」树，右栏按配置分段）。"
   (interactive)
   (ebasecamp-ui-open))
 

@@ -7,9 +7,9 @@
 
 ;;; Commentary:
 
-;; 主界面（**组为中心的骨架**，C0）：在一个 etaf 缓冲区里展示「组 → 配置」
-;; 两级的只读视图。组来自清单（`ebasecamp-model-groups'），因此**不依赖**
-;; 项目是否存在；配置来自组的 configs 槽（`ebasecamp-model-group-configs'）。
+;; 主界面：在一个 etaf 缓冲区里展示组为中心的「组 → 配置」两级视图。组来自
+;; 清单（`ebasecamp-model-groups'），因此**不依赖**项目是否存在；配置来自
+;; 组的 configs 槽（`ebasecamp-model-group-configs'），每份配置指向一个项目。
 ;;
 ;; 布局（一个 Host 树）：
 ;;
@@ -26,7 +26,10 @@
 ;;   │                         header 槽 = 段头 row（配置 → 项目 + scope 徽标
 ;;   │                         + running/total 徽标 + 启动/停止/重启按钮）
 ;;   │                         default 槽 = etaf-divider + 服务表 etaf-table
-;;   └─ etaf-divider
+;;   ├─ etaf-divider
+;;   ├─ row（底栏）: 导入 compose / 导出 compose / 销毁环境（ghost 按钮）
+;;   ├─ 提示区: `etaf-alert'（`ebasecamp-ui--notice-view'）
+;;   └─ 销毁确认框: `etaf-dialog'（`ebasecamp-ui-confirm-dialog'，读 confirm ref）
 ;;
 ;; 无任何组时整棵树替换为 `etaf-empty'（引导用户去
 ;; `ebasecamp-config-directory' 定义清单）。
@@ -58,8 +61,14 @@
 ;;   语义（容器 ID 与项目名不参与 key，重启后选中仍稳定）。`selected-ref'
 ;;   由 `ebasecamp-ui-selected-keys' 消费：段内按钮经
 ;;   `ebasecamp-ui--section-action' 按**该段自己的** `:project' 派发到命令层
-;;   （C4）；旧的项目视图接口 `ebasecamp-ui-run-action' 仍走
-;;   `ebasecamp-ui--run-action'（C5 迁移到「选项目」语义）；底栏留 C5；
+;;   （`ebasecamp-command-run'），同组多实例因此不会串段；
+;; - 底栏三个动作（`ebasecamp-ui--footer-view'）：导入 compose
+;;   （`ebasecamp-ui-import-compose'）、导出 compose
+;;   （`ebasecamp-ui-export-compose'）、销毁环境
+;;   （`ebasecamp-ui-destroy-environment'）。导出与销毁都用 `completing-read'
+;;   选项目；销毁先写 `confirm-action' 再打开 `etaf-dialog' 二次确认，
+;;   `ebasecamp-ui-confirm' 确认后走与段内按钮同一条派发路径
+;;   `ebasecamp-ui--dispatch'（keys 为 nil = 全部服务）；
 ;; - 提示的呈现：`ebasecamp-ui--notice-view' 把 notice 渲染成 `etaf-alert'
 ;;   （`:detail' 以换行拼接进 message，`:dismissible' 的关闭按钮清空 notice）；
 ;;   成功 / 信息类提示在 `ebasecamp-ui-notice-timeout' 秒后自动清除，定时器
@@ -67,9 +76,10 @@
 ;;   这里不用 `etaf-toast'：其实测要求 `:anchor' 必填（必须是带 `:id' 的
 ;;   Host），且 batch 下只画出标题、正文不可见，无法覆盖需要展示 stderr 的
 ;;   场景；
-;; - `busy' 为真时操作条与段内按钮全部 `:disabled'，`ebasecamp-ui-run-action'
-;;   与 `ebasecamp-ui--section-action' 也直接拒绝（双保险：UI 不渲染可点按钮，
-;;   函数层不被误调）。
+;; - `busy' 为真时段内按钮全部 `:disabled'（渲染期从 ref 求值），
+;;   `ebasecamp-ui--section-action' 与 `ebasecamp-ui--dispatch' 也直接拒绝
+;;   （双保险：UI 不渲染可点按钮，函数层不被误调）；底栏三个动作不是生命
+;;   周期命令，故不参与 busy 判定，销毁的危险性由二次确认承担。
 ;;
 ;; 渲染期读 ref（`etaf-value'）会建立渲染依赖：写 ref 即可让统计文案、树项、
 ;; 展开状态同步更新。注意 `etaf-button' 的 `:disabled' 只接受布尔值（传 ref
@@ -124,7 +134,7 @@ CONFIRM-ACTION 为等待确认的动作 symbol（无则 nil）；NOTICE-TIMER �
 
 (defconst ebasecamp-ui--hint
   "勾选服务后可批量启动 / 停止 / 重启；销毁环境只移除本项目的 per-project 容器。"
-  "操作条下方的默认提示文案（notice 为空时显示）。")
+  "界面底部提示区的默认文案（notice 为空时显示）。")
 
 (defun ebasecamp-ui--ensure-manifest ()
   "模型注册表为空时，按 `ebasecamp-config-directory' 加载一次清单。
@@ -333,12 +343,12 @@ nil → \"-\"；healthy → OK；unhealthy → BAD；starting → STARTING；其
 GROUP-NAME 可为 symbol 或字符串，RECORD 为服务记录 plist（见
 `ebasecamp-data-group-instances'）。
 
-已定的选择模型（C4 直接消费）：
+已定的选择模型（`ebasecamp-ui--section-action' 直接消费）：
 - `selected-ref' 存字符串列表，元素形如 \"组名/服务名\"；
 - 容器 ID 与项目名**不参与** key，因此容器重启后选中状态仍然稳定；
 - 同一组在不同项目实例下若服务同名，key 相同 → 选中状态**跨段共享**。
-  这是可接受的第一期语义（段内按钮的派发留 C4，届时按段隔离选中集合）；
-  需要按实例区分时应把配置名并入 key，但那要等容器标签新增配置维度。
+  这是可接受的第一期语义（段内按钮只按该段自己的项目派发，故不串段）；
+  需要按实例区分选中时应把配置名并入 key，但那要等容器标签新增配置维度。
 
 纯函数。"
   (format "%s/%s" group-name (plist-get record :service)))
@@ -422,7 +432,7 @@ KIND 为 error / warning / success / info；成功与信息类通知会在
     (_ 'info)))
 
 (defun ebasecamp-ui--notice-view (session)
-  "返回操作条下方的提示视图。
+  "返回界面底部提示区的提示视图。
 无 notice 时给默认的操作提示 label；有 notice 时渲染 `etaf-alert'
 （`:dismissible' 的关闭按钮清空 notice，`:detail' 以换行拼进 message）。"
   (let ((notice (ebasecamp-ui--notice session)))
@@ -674,7 +684,7 @@ GROUP-NAME 为组名（段内 key 的组部分）。列 `:key' 用关键字，�
 (defun ebasecamp-ui--dispatch (session action project keys)
   "把生命周期动作 ACTION（PROJECT + KEYS）派发到命令层，返回 t 或 nil。
 **唯一的派发路径**：段内生命周期按钮（`ebasecamp-ui--section-action'）与销毁
-确认（`ebasecamp-ui-confirm'）都走本函数，C5 起不再有第二条派发路径。
+确认（`ebasecamp-ui-confirm'）都走本函数，没有第二条派发路径。
 派发前置 busy；命令层 signal 时按类型映射 notice 并复位 busy（绝不让界面卡在
 「执行中」）：
 - `ebasecamp-command-busy'（同项目已有命令在执行）→ info「操作进行中」；
@@ -722,7 +732,7 @@ GROUP-NAME 为组名（段内 key 的组部分）。列 `:key' 用关键字，�
       (setf (ebasecamp-ui-session-confirm-action session) nil)))
   nil)
 
-;;; 底栏与销毁确认视图（C5）
+;;; 底栏与销毁确认视图
 
 ;; 底栏是主视图 column 的最后一个内容行（分割线之后、notice 之前）：导入
 ;; compose / 导出 compose / 销毁环境三个 ghost 按钮。三者都不是生命周期动作，
@@ -804,14 +814,14 @@ ref（展开状态由会话持有，重渲染后保持）；`:on-select' 写 sel
                  (etaf-set-value (ebasecamp-ui-session-expanded session) next))
     :on-select (lambda (key) (ebasecamp-ui--select-key session key)))))
 
-;;; 右栏段渲染（C3）与段内派发（C4）
+;;; 右栏段渲染与段内派发
 
 ;; 右栏是「选中组 → 每份配置一个 `etaf-panel' 段」的视图。段头含
 ;; 配置名 → 项目、scope 徽标、running/total 徽标与三个生命周期按钮；
 ;; 段体是服务表（首列 checkbox，选中状态写进会话的 selected-ref）。
-;; 段内按钮的派发（C4）走 `ebasecamp-ui--section-action'：把该段**自己的**
-;; `:project' 与当前选中集合交给命令层，不再经过 `ebasecamp-ui-current-project'
-;; 兼容层，因此同组多个实例不会串段。`:disabled' 仍由渲染期的 busy 求值。
+;; 段内按钮的派发走 `ebasecamp-ui--section-action'：把该段**自己的**
+;; `:project' 与当前选中集合交给命令层，因此同组多个实例不会串段。
+;; `:disabled' 由渲染期的 busy 值决定。
 
 (defun ebasecamp-ui--busy-p (session)
   "SESSION 的 busy ref 当前是否为真（渲染期读取以建立渲染依赖）。"
@@ -897,7 +907,7 @@ SCOPE 为 scope 字符串（如 \"per-project\"）。"
 (defun ebasecamp-ui--section-button (label action variant instance disabled)
   "返回段内生命周期按钮：文案 LABEL、语义 VARIANT，按下对 INSTANCE 派发 ACTION。
 INSTANCE 为 state 的段项 plist（`:config' / `:project' / `:records'）—— 按钮
-只绑定该段自己的项目，不读 `ebasecamp-ui-current-project' 兼容层。
+只绑定该段自己的项目。
 DISABLED 为真时禁用 —— `etaf-button' 的 `:disabled' 只接受布尔值，调用方
 必须在渲染期从 busy ref 取当前值传入（不能传 ref 对象）。"
   (etaf-view
@@ -1182,7 +1192,7 @@ PROMPT 为提示文案。清单无项目时写 info notice「没有可用项目�
 
 (defun ebasecamp-ui-export-compose ()
   "选项目并导出为部署用 compose 文件，成功后提示。返回导出路径或 nil。
-项目经 `completing-read' 选择（D5：不再依赖「当前项目」兼容层）；返回 nil 的
+项目经 `completing-read' 选择（不依赖任何「当前项目」状态）；返回 nil 的
 三种情形一律安静：清单无项目（写 info notice「没有可用项目」）、用户取消
 选择（`quit'）、导出层返回 nil（例如冲突三选一里选了取消）。
 路径选择与覆盖冲突「换一个路径 / 覆盖 / 取消」三选一都由

@@ -1,20 +1,27 @@
 #+title: ebasecamp
 #+author: Thomas
-#+options: toc:nil
+#+options: toc:t
 
-ebasecamp 是 Emacs 里的 Docker 环境分组管理插件。
+ebasecamp 是 Emacs 里的 Docker 环境分组管理插件（版本 0.2.0）。
 
 * ebasecamp 是什么
 
-ebasecamp 把 Docker 环境按「项目 → 组 → 服务」三层管理：服务组是可复用的基础组件集合（例如 mysql、redis），项目绑定若干组并可按项目覆盖端口、环境变量与卷。界面用 etaf / etaf-ui 在 Emacs buffer 内渲染，按服务多选即可批量启动、停止、重启。清单（组与项目定义）以 Elisp 形式保存在 =~/.config/ebasecamp/=，是唯一事实源；compose 文件只是由清单派生的生成物。插件还支持从已有 compose 文件导入清单，以及把项目导出为部署用 compose。
+ebasecamp 把 Docker 环境按「组 → 配置 → 项目」组织：
+
+- *组*（group）是可复用的基础组件集合（mysql、redis、应用栈……），是全局第一等对象，不依赖任何项目即可存在；组有 scope：=shared= 跨项目共用一套容器，=per-project= 每个项目一套。
+- *配置*（config）挂在组内（组的 =:configs= 槽），用 =:project= 指向一个项目，并可为该项目覆盖端口、环境变量与卷。一份配置 = 一个「组 × 项目」实例，界面右栏给每份配置渲染一段。
+- *项目*（project）是业务工程的容器，提供 =:title=、=:root=、=:shared-network=、=:export-file=。
+
+界面用 etaf / etaf-ui 在 Emacs buffer 内渲染：左栏「组 → 配置」树，右栏每份配置一段服务表，勾选服务即可批量启动 / 停止 / 重启。清单（组与项目定义）以 Elisp 形式保存在 =~/.config/ebasecamp/=，是唯一事实源；compose 文件只是由清单派生的生成物。插件还支持从已有 compose 文件导入清单，以及把项目导出为部署用 compose。
 
 * 特性
 
-- *组复用*：一个组定义可被多个项目引用；=:scope shared= 的组跨项目共用一套容器（compose 项目名固定 =ebc-shared=），=:scope per-project= 的组每个项目一套（=ebc-<project>=）。
+- *组复用*：一个组定义可被多个项目引用（每份 =:configs= 一项）；=:scope shared= 的组跨项目共用一套容器（compose 项目名固定 =ebc-shared=），=:scope per-project= 的组每个项目一套（=ebc-<project>=）。
+- *组内声明关联*：项目归属写在组侧的 =:configs=，加载期由插件物化成该项目对组的引用，界面 / 启停 / 导出五处读取点看到的是同一形态。
 - *服务级多选启停*：界面里勾选具体服务，批量执行启动 / 停止 / 重启，不强制整组起停。
 - *状态轮询*：容器状态由 =docker ps --no-trunc= 采集并按标签归一，默认 3 秒轮询一次（见 =ebasecamp-status-refresh-interval=）。
-- *导入已有 compose*：用 =docker compose config --no-interpolate= 系列 flag 读取项目 compose，映射为清单文件落盘。
-- *导出部署用 compose*：把项目（含项目级覆盖）渲染为可直接部署的 compose 文件。
+- *导入已有 compose*：用 =docker compose config --no-interpolate= 系列 flag 读取项目 compose，映射为清单文件落盘（组内 =:configs= 写法）。
+- *导出部署用 compose*：把项目的 per-project 组（含项目级覆盖）渲染为可直接部署的 compose 文件。
 - *密钥只存引用*：清单里只保存 =${VAR}= 引用与相对路径，插件不读取、不打印、不落盘任何密钥值。
 
 * 安装
@@ -28,17 +35,35 @@ ebasecamp 把 Docker 环境按「项目 → 组 → 服务」三层管理：服�
 | etaf-ui | 0.1.3 |
 | Docker + Compose | Compose 5.x（本插件按 Compose 5.6.0 实测） |
 
-** 方式一：straight.el
+** 方式一：straight.el（开发期，本地仓库）
+
+开发插件本身时用 =:local-repo=，并显式声明 =:files= —— =ebasecamp.el= 在仓库根目录、实现模块在 =lisp/= 下，只拷 =.el= 会漏掉整个 =lisp/=：
 
 #+begin_src elisp
-(straight-use-package '(ebasecamp :local-repo "~/Workspace/ebasecamp"))
+(straight-use-package
+ '(ebasecamp :type git
+             :local-repo "/home/thomas/WorkSpace/ebasecamp"
+             :files ("*.el" "lisp/*.el")))
 #+end_src
 
-** 方式二：手工 load-path
+改完代码要重建 build 目录（=M-x straight-rebuild-package RET ebasecamp=），否则运行中的 Emacs 仍在用旧副本 —— 现象是 =M-x ebasecamp= 报「命令不存在」（见「排查」一节）。
+
+** 方式二：straight.el（发布后，远程仓库）
+
+仓库发布后改成 =:repo=，=:files= 保持不变（=:repo= 的值替换成真实的用户/仓库名）：
 
 #+begin_src elisp
-(add-to-list 'load-path "~/Workspace/ebasecamp")
-(add-to-list 'load-path "~/Workspace/ebasecamp/lisp")
+(straight-use-package
+ '(ebasecamp :type git
+             :repo "OWNER/ebasecamp"
+             :files ("*.el" "lisp/*.el")))
+#+end_src
+
+** 方式三：手工 load-path
+
+#+begin_src elisp
+(add-to-list 'load-path "~/WorkSpace/ebasecamp")
+(add-to-list 'load-path "~/WorkSpace/ebasecamp/lisp")
 (require 'ebasecamp)
 #+end_src
 
@@ -60,18 +85,19 @@ ebasecamp 把 Docker 环境按「项目 → 组 → 服务」三层管理：服�
    M-x ebasecamp
    #+end_src
 
-界面分四区：
+界面分五区（以组为中心）：
 
-- *顶栏*：项目 tabs（切换项目）+ =刷新= 按钮；
-- *组列表*：当前项目引用的组（左侧）；
-- *服务表*：服务名 / 镜像 / 状态 / 端口 / 健康（右侧）；
-- *操作条*：第一行 =启动选中= / =停止选中= / =重启选中= / =销毁环境=，第二行 =导入 compose= / =导出 compose=。
+- *顶栏*：=ebasecamp= 标题 + 统计（「N 组 · M 配置」）+ =刷新= 按钮；
+- *左栏*：组树两级 —— 组节点（=MySQL  (1 配置 · 1/1 running)=）与配置节点（=host → 示例项目=）；未关联任何项目的组也照样出现在这里（=redis  (0 配置)=）；
+- *右栏*：选中组的每份配置一段 =etaf-panel= —— 段头第一行 =配置名 → 项目名= + scope 徽标 + =running/total= 徽标，第二行 =启动选中= / =停止选中= / =重启选中= 三个按钮；段体是服务表（服务 / 镜像 / 状态 / 端口 / 健康，首列勾选框）；未选中组时显示「选择左侧的组」，选中组无配置时显示「尚未关联任何项目」并列出组定义的服务名（只读）；
+- *底栏*：=导入 compose= / =导出 compose= / =销毁环境= 三个按钮；
+- *提示区*：=etaf-alert= —— 成功 / 信息类 3 秒后自动消失，错误类保留到你手动关闭。
 
-勾选流程：在服务表里勾选目标服务 → 点操作条按钮。勾选状态是项目级的，切换项目会清空勾选。=销毁环境= 会弹确认框，确认后只移除本项目（per-project）的容器，不删卷。
+勾选流程：在右栏服务表里勾选目标服务 → 点该段（或该段所属项目）的按钮。点段内按钮只对 *该段自己的项目* 派发，同组多实例不会串段。勾选 key 是 =组名/服务名=（不含项目名与容器 ID），因此容器重启后选中仍稳定；同一组的两份配置里若服务同名，勾选状态 *跨段共享*（第一期语义）。=销毁环境= 会弹确认框，确认后只移除所选项目（per-project）的容器，不删卷。
 
 * 清单怎么写
 
-清单目录默认为 =ebasecamp-config-directory=（=~/.config/ebasecamp/=）：
+清单目录默认为 =ebasecamp-config-directory=（=~/.config/ebasecamp/=）；目录不存在时不会自动创建，加载结果里 =:bootstrap-needed= 为 =t=。
 
 #+begin_src text
 ~/.config/ebasecamp/
@@ -81,23 +107,27 @@ ebasecamp 把 Docker 环境按「项目 → 组 → 服务」三层管理：服�
 
 ** groups.el 示例
 
+下面两个组覆盖了两种 scope、组内配置、服务字段与跨 scope 依赖，可整段粘贴到 =groups.el=：
+
 #+begin_src elisp
 ;;; -*- lexical-binding: t; -*-
 
-(ebasecamp-define-group postgres
-  :title "PostgreSQL"
+(ebasecamp-define-group mysql
+  :title "MySQL"
   :scope shared
   :services
-  ((postgres :image "postgres:16"
-             :ports ((5432 . 5432))
-             :volumes ((:source "postgres-data"
-                        :target "/var/lib/postgresql/data"
-                        :type volume))
-             :environment (("POSTGRES_PASSWORD"
-                            . "${EBASECAMP_PG_PASSWORD}"))
-             :healthcheck (:test ("CMD-SHELL" "pg_isready -U postgres")
-                           :interval "10s")
-             :restart "unless-stopped")))
+  ((mysql :image "mysql:8.4"
+          :ports ((3306 . 3306))
+          :volumes ((:source "mysql-data"
+                     :target "/var/lib/mysql"
+                     :type volume))
+          :environment (("MYSQL_ROOT_PASSWORD"
+                         . "${EBASECAMP_MYSQL_ROOT_PASSWORD}"))
+          :healthcheck (:test ("CMD" "mysqladmin" "ping")
+                        :interval "10s")
+          :restart "unless-stopped"))
+  :configs
+  ((host :project example)))
 
 (ebasecamp-define-group app
   :title "应用栈"
@@ -106,13 +136,24 @@ ebasecamp 把 Docker 环境按「项目 → 组 → 服务」三层管理：服�
   ((api :image "example/api:latest"
         :ports ((8080 . 8000))
         :environment (("DATABASE_URL" . "${EBASECAMP_DATABASE_URL}"))
-        :depends-on ("redis")
+        :depends-on ("mysql")
         :volumes ((:source "../api"
                    :target "/app"
                    :type bind
                    :read-only t)))
-   (redis :image "redis:7")))
+   (redis :image "redis:7"))
+  :configs
+  ((dev :project example
+        :services ((api :ports ((18080 . 8000))
+                        :environment (("LOG_LEVEL" . "debug")))))))
 #+end_src
+
+读法：
+
+- =mysql= 组是 =shared=，跨项目共用一套容器，只有 *一份* 配置（=host=）：shared 组的 =:project= 是「宿主」，只用于渲染上下文、=ebc-shared= 生成物命名与 =ebasecamp.project= 标签归属，不是业务绑定；
+- =app= 组是 =per-project=，配置 =dev= 关联项目 =example=，可独立覆盖服务字段；
+- =dev= 配置把 =api= 的宿主端口改成 18080 并加了 =LOG_LEVEL=；
+- =depends-on ("mysql")= 指向 shared 组的服务，属于 *跨 scope 依赖*：=启动选中= 时会自动先把 shared 批次拉起来。
 
 ** projects/example.el 示例
 
@@ -123,61 +164,73 @@ ebasecamp 把 Docker 环境按「项目 → 组 → 服务」三层管理：服�
   :title "示例项目"
   :root "~/Workspace/example"
   :shared-network t
-  :export-file "deploy/compose.yaml"
-  :groups ((postgres)
-           (app
-            :scope per-project
-            :services
-            ((api :ports ((18080 . 8000))
-                  :environment (("LOG_LEVEL" . "debug")))))))
+  :export-file "deploy/compose.yaml")
 #+end_src
 
-这段示例与上面的 =groups.el= 配套：=postgres= 组按组自身的 =shared= 进 =ebc-shared=，=app= 组在本项目内被覆盖为 per-project 并改掉了 =api= 的宿主端口与环境变量。
+项目文件里 *不写* =:groups= —— 项目对组的引用由组内 =:configs= 在加载期物化而来；两处都写会构成「同项目同组双引用」而被加载层报错。
 
 ** 关键字表
 
-组定义 =ebasecamp-define-group= 支持 =:title=、=:scope=、=:services=；=:scope= 取 =shared= 或 =per-project=，缺省 =per-project=。
+组定义 =ebasecamp-define-group= 支持 =:title=、=:scope=、=:services=、=:configs=；=:scope= 取 =shared= 或 =per-project=，缺省 =per-project=。
 
-项目定义 =ebasecamp-define-project= 支持 =:title=、=:root=、=:shared-network=、=:export-file=、=:groups=。=:shared-network= 缺省为 =t=，控制是否在生成物顶层把 =ebasecamp= 声明为 external network。
+项目定义 =ebasecamp-define-project= 支持 =:title=、=:root=、=:shared-network=、=:export-file=、=:groups=（旧写法）。=:shared-network= 缺省为 =t=，控制是否在生成物顶层把 =ebasecamp= 声明为 external network。
+
+配置项写在 =:configs= 里，格式 =(配置名 :project 项目名 [:services 覆盖...])=：
+
+| 规则 | 说明 |
+|------+------|
+| 配置名 | symbol，*组内唯一*；重复会加载报错 |
+| =:project= | *必填*，symbol，必须指向已定义的项目（项目文件可后加载，存在性在物化阶段校验） |
+| =:services= | 可选，格式 =((服务名 :字段 值 ...) ...)=，与旧写法的组引用覆盖格式一致 |
+| =:scope= | *不允许*：配置的 scope 恒等于组定义的 scope |
 
 服务定义支持 =:image=（必填）、=:command=、=:entrypoint=、=:environment=、=:labels=、=:ports=、=:volumes=、=:healthcheck=、=:depends-on=、=:networks=、=:working-dir=、=:user=、=:restart=、=:extra=。
 
-项目里的组引用支持 =:scope= 与 =:services= 两个关键字。未知关键字会报错（错误记入加载结果的 =:errors=，不中断其他文件）。
+未知关键字会报错（错误记入加载结果的 =:errors=，不中断其他文件）。
 
 ** 字段写法约定
 
 - =:scope shared= 与 =:scope per-project= 的差异：shared 组渲染进 compose 项目 =ebc-shared=，跨项目共用同一套容器；per-project 组渲染进 =ebc-<project>=，每个项目各自一套。两组分别落在不同 compose 项目里，网络通过 external network =ebasecamp= 互通。
-- =ports= 用 =("PUBLISHED . TARGET)= 整数对，例如 =(3306 . 3306)= 表示宿主 3306 → 容器 3306。
-- =volumes= 用 plist：=(:source S :target T :type volume|bind [:read-only t])=。=:read-only= 非 nil 时挂载追加 =:ro=。
+- =ports= 用 =(PUBLISHED . TARGET)= 整数对，例如 =(3306 . 3306)= 表示宿主 3306 → 容器 3306。
+- =volumes= 用 plist：=(:source S :target T :type volume|bind [:read-only t])=。=:read-only= 非 nil 时挂载追加 =:ro=；命名卷在生成物里自动改成 =ebasecamp-<scope>-<组>-<source>=。
 - =environment= 与 =labels= 是字符串 alist，值用 =${VAR}= 引用，插件原样保留不插值。
 - =:extra= 存放清单未识别的 compose 字段，导出时原样回写；清单层不校验其键名。
 
-** 项目覆盖
+** 覆盖合并语义
 
-项目对组的覆盖有两个层面：
+覆盖写在配置的 =:services= 里，按服务名逐字段处理：=environment=、=labels=、=:extra= 按键合并（项目值覆盖同键、其余键保留），=image=、=command=、=entrypoint=、=ports=、=volumes=、=healthcheck=、=depends-on=、=networks=、=working-dir=、=user=、=restart= 整体替换。覆盖组内不存在的服务名会报错。
 
-- *=:scope= 覆盖*：项目里写 =(:group ... :scope shared)= 只改变该项目的解析语义，不修改组对象本身。
-- *=:services= 字段覆盖*：按服务名覆盖字段。=environment=、=labels=、=:extra= 按键合并（项目值覆盖同键、其余键保留），=image=、=command=、=entrypoint=、=ports=、=volumes=、=healthcheck=、=depends-on=、=networks=、=working-dir=、=user=、=restart= 整体替换。
+** 旧写法（项目侧 :groups，v0.1）
 
-覆盖不存在的服务名会报错。
+v0.1 的写法仍然可用，视作「匿名配置」（配置名等于组名），引用可带 =:scope= 与 =:services=：
+
+#+begin_src elisp
+(ebasecamp-define-project example
+  :title "示例项目"
+  :groups ((mysql)
+           (app :services ((api :ports ((18080 . 8000)))))))
+#+end_src
+
+新旧写法可以共存，但 *同一项目同一组只能有一个引用*：项目侧 =:groups= 与组侧 =:configs= 指向同一项目时加载报 =ebasecamp-config-duplicate-group-ref=；同一项目在 =:groups= 里重复引用同一组同样报错（v0.1 是静默取首个）。
 
 * 命令表
 
-以下为全部 =M-x= 可见的交互命令：
+以下为全部 =M-x= 可见的交互命令（共 13 个，=fboundp= 实测）：
 
 | 命令 | 说明 |
 |------+------|
 | =ebasecamp= | 打开管理界面（=ebasecamp-ui-open= 的入口命令）。 |
 | =ebasecamp-ui-open= | 打开或复用主界面 buffer；清单未加载时先加载一次。 |
 | =ebasecamp-ui-close= | 关闭主界面，停轮询并销毁会话。 |
-| =ebasecamp-ui-refresh= | 采一次容器状态快照并让表格重新加载。 |
+| =ebasecamp-ui-refresh= | 采一次容器状态快照并重建渲染数据。 |
 | =ebasecamp-reload= | 重新加载清单并刷新界面，报告组 / 项目 / 错误数量。 |
 | =ebasecamp-create-sample-config= | 生成示例清单；=C-u= 前缀强制覆盖。 |
 | =ebasecamp-import-file= | 选一个 compose 文件导入为清单（迷你缓冲区确认项目名）。 |
 | =ebasecamp-ui-import-compose= | 界面版导入入口（选文件 → 确认项目名 → 冲突时确认覆盖 → 刷新）。 |
 | =ebasecamp-export-compose= | 选项目导出为部署用 compose 文件。 |
-| =ebasecamp-ui-export-compose= | 界面版导出入口，导出当前项目。 |
-| =ebasecamp-ui-confirm= | 执行确认框里待确认的动作（当前只有 =销毁环境=）。 |
+| =ebasecamp-ui-export-compose= | 界面版导出入口（选项目 → 冲突时三选一：换路径 / 覆盖 / 取消）。 |
+| =ebasecamp-ui-destroy-environment= | 界面版销毁入口：选项目 → 二次确认 → =docker compose down=（不带 =-v=）。 |
+| =ebasecamp-ui-confirm= | 执行确认框里待确认的动作。 |
 | =ebasecamp-ui-dismiss-confirm= | 关闭确认框并丢弃待确认动作。 |
 
 * 安全约束
@@ -190,12 +243,31 @@ ebasecamp 把 Docker 环境按「项目 → 组 → 服务」三层管理：服�
 * 已知限制
 
 - 按 Compose 5.x 实测（本机 5.6.0），其他主版本的 =--format json= 键集可能不同；插件有 =docker compose version= 检测，不匹配时会告警。
-- shared 组没有插件侧清理入口：=销毁环境= 只覆盖 per-project，shared 容器需 =docker rm -f=，M4 计划提供 prune。
-- 容器状态是 3 秒轮询（仅界面可见时），状态最多滞后一个轮询周期。
-- 自定义网络的 external 语义无法表达；跨组同名服务静默保留首个，不报错。
+- 同一项目同一组只能 1 份配置：容器标签没有配置维度，同名服务会撞。
+- shared 组至多 1 份配置且 =:project= 必填：多宿主会互相覆盖 =_shared/compose.yaml= 与 =ebc-shared= 容器集合。
+- D4 之前导入的清单需重新导入：=env_file= 的清单形态已由 =((:source PATH :type env))= 改为路径字符串列表（=("./db.env")=）。
+- shared 组没有插件侧清理入口：=销毁环境= 只覆盖 per-project，shared 容器需 =docker rm -f=。
+- 容器状态是 3 秒轮询（仅界面可见时），状态最多滞后一个轮询周期；需要即时值点 =刷新=。
+- 自定义网络的 external 语义无法表达；跨组同名服务在 compose 生成时静默保留首个，不报错。
 - =:extra= 字段原样透传，清单层不做 schema 校验，写错字段会导致 =config -q= 失败。
 - 不做清单与项目 compose 的双向同步；导入是单向的，导出也是单向的。
 - =重启选中= 不补齐 shared 依赖分支（=启动选中= 才会自动先起 shared 批次）；=depends-on= 里的笔误也会被静默剔除。
+- 界面不做清单编辑：清单只能手工编辑 Elisp，改完 =M-x ebasecamp-reload=。
+- 端口冲突只在 =启动选中= 前检测；=unknown= 类探测失败只提示、不阻塞。
+- 组名与项目名只允许 =[a-z0-9_-]+=，其余字符在渲染时直接报错。
+
+* 排查：=M-x ebasecamp= 提示命令不存在
+
+最常见的原因是包没装进当前 Emacs，或 straight 装的是旧副本（改了代码没重建 build 目录），第三是 daemon 启动早于 build 完成。最小自查（在 *当前这个 Emacs* 里逐个求值）：
+
+#+begin_src elisp
+(locate-library "ebasecamp")   ; 期望指向仓库或 straight build 目录，nil 表示根本没装
+(fboundp 'ebasecamp)           ; 期望 t，nil 表示命令不存在
+#+end_src
+
+两条都对而 =M-x ebasecamp= 仍不可用 → 问题在安装而不是代码；=locate-library= 指的路径与你改的仓库不一致 → 是旧副本，重建后重启 Emacs。
+
+完整排查（三条原因的判别命令、straight 产物检查、stale =.elc= 陷阱、修法）见 [[file:docs/troubleshooting.org][排障手册]] 第 1 条「=M-x ebasecamp= 报命令不存在」。
 
 * 开发
 
@@ -215,14 +287,14 @@ ebasecamp 把 Docker 环境按「项目 → 组 → 服务」三层管理：服�
 make check EMACS=/path/to/emacs STRAIGHT_BUILD=/path/to/build-XX.X
 #+end_src
 
-修改 =Makefile= 后至少跑一次 =make check=。
+修改 =Makefile= 后至少跑一次 =make check=。batch 脚本里要读最新源码，首行加 =(setq load-prefer-newer t)=（防 stale =.elc=）。
 
 * 文档索引
 
+- [[file:docs/architecture.org][架构]]：模块分层、数据模型与「组内配置 → 项目引用」的物化机制、不变量清单。
+- [[file:docs/user-guide.org][用户指南]]：安装、清单写法、界面操作、常见任务、清单自检。
+- [[file:docs/compose-generation.org][compose 生成与导入导出规则]]：清单到 compose 的映射、导入映射表、导出物差异。
+- [[file:docs/troubleshooting.org][排障手册]]：命令不存在 / 界面空白 / 加载报错 / =config -q= 失败 / 导入导出异常 / 端口冲突 / 状态不刷新。
 - =docs/adr/0001-architecture.org=：架构决策（ADR）。
-- =docs/architecture.org=：模块分层与数据流（批次 5 · T5.2 待建）。
-- =docs/user-guide.org=：用户手册（批次 5 · T5.2 待建）。
-- =docs/compose-generation.org=：清单到 compose 的映射规则（批次 5 · T5.2 待建）。
-- =docs/troubleshooting.org=：排障（权限 / 端口冲突 / =config -q= 失败 / 版本不符）（批次 5 · T5.2 待建）。
 - =openspec/active/=：进行中的计划；=openspec/decisions.md=：决策日志；=openspec/tech-debt.md=：技术债。
 - =AGENTS.md=：仓库地图与不变量清单。
