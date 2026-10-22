@@ -1,0 +1,100 @@
+{
+  "name": "probe-app",
+  "networks": {
+    "backend": {
+      "driver": "bridge",
+      "name": "probe-app_backend"
+    }
+  },
+  "services": {
+    "api": {
+      "command": [
+        "sh",
+        "-c",
+        "run --port 8080"
+      ],
+      "depends_on": {
+        "cache": {
+          "condition": "service_started",
+          "required": true
+        }
+      },
+      "entrypoint": [
+        "/entry.sh"
+      ],
+      "env_file": [
+        {
+          "path": "./api.env",
+          "required": true
+        }
+      ],
+      "environment": {
+        "CACHE_URL": "redis://cache:6379/0",
+        "DB_HOST": "mysql",
+        "SECRET_DEFAULT": "${PROBE_OTHER:-fallback}",
+        "SECRET_REF": "${PROBE_SECRET}"
+      },
+      "healthcheck": {
+        "interval": "10s",
+        "retries": 3,
+        "test": [
+          "CMD",
+          "curl",
+          "-f",
+          "http://localhost/health"
+        ]
+      },
+      "image": "myapp/api:dev",
+      "labels": {
+        "com.docker.compose.project": "should-be-stripped",
+        "com.example.team": "backend",
+        "ebasecamp.managed": "true"
+      },
+      "networks": {
+        "backend": null
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "protocol": "tcp",
+          "published": "8080",
+          "target": 80
+        },
+        {
+          "host_ip": "127.0.0.1",
+          "mode": "ingress",
+          "protocol": "udp",
+          "published": "9090",
+          "target": 9090
+        }
+      ],
+      "restart": "unless-stopped",
+      "shm_size": "128m",
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "bind": {
+            "create_host_path": true
+          },
+          "read_only": true,
+          "source": "./src",
+          "target": "/app/src",
+          "type": "bind"
+        },
+        {
+          "source": "api-cache",
+          "target": "/cache",
+          "type": "volume",
+          "volume": {}
+        }
+      ],
+      "working_dir": "/app"
+    },
+    "cache": {
+      "image": "redis:7.4",
+      "networks": {
+        "backend": null
+      }
+    }
+  }
+}

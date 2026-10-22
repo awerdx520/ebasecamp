@@ -2,7 +2,8 @@
 
 ERT 测试套件，每个模块一个 `*-tests.el`：`ebasecamp-model` / `ebasecamp-config` /
 `ebasecamp-compose` / `ebasecamp-docker` / `ebasecamp-status` / `ebasecamp-data` /
-`ebasecamp-ui` / `ebasecamp-command`，外加包入口的 `ebasecamp-tests.el`。
+`ebasecamp-ui` / `ebasecamp-command` / `ebasecamp-import`，外加包入口的
+`ebasecamp-tests.el`。
 
 ## 运行
 
@@ -24,6 +25,8 @@ make check     # check-parens + compile + test（提交前必跑）
 | 文件 | 用途 | 引用测试 |
 |---|---|---|
 | `docker-ps-managed.jsonl` | Docker 29.9.1 `docker ps -a --no-trunc --format '{{json .}}'` 两行实测输出（各 16 键） | `ebasecamp-docker-tests.el` 的 `parse-ps-output-*` 系列 |
+| `compose-config-noint.yaml` | 覆盖多字段的探针 compose（`/tmp/ebc-import-probe/compose.yaml`，42 行，已清理） | `ebasecamp-import-tests.el` 中走真实 docker 的两项（`parse-real-docker`、`no-plaintext-with-env-set`） |
+| `compose-config-noint.json` | 上者的 `docker compose -f compose.yaml config --no-interpolate --no-env-resolution --no-path-resolution --format json` 实测输出（Compose 5.6.0 / Docker 29.9.1，99 行，2093 字节，sha256 `6e47d67e…02e56f93`） | `ebasecamp-import-tests.el` 的 `parse-json` / `suggest-name` / `environment` / `labels` / `ports` / `volumes` / `extra` 系列 |
 
 ## 新增测试
 

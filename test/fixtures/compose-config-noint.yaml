@@ -1,0 +1,42 @@
+name: probe-app
+services:
+  api:
+    image: "myapp/api:dev"
+    command: ["sh", "-c", "run --port 8080"]
+    entrypoint: ["/entry.sh"]
+    environment:
+      DB_HOST: mysql
+      CACHE_URL: "redis://cache:6379/0"
+      SECRET_REF: "${PROBE_SECRET}"
+      SECRET_DEFAULT: "${PROBE_OTHER:-fallback}"
+    labels:
+      com.example.team: backend
+      com.docker.compose.project: should-be-stripped
+      ebasecamp.managed: "true"
+    ports:
+      - "8080:80"
+      - "127.0.0.1:9090:9090/udp"
+    volumes:
+      - "./src:/app/src:ro"
+      - "api-cache:/cache"
+    env_file:
+      - ./api.env
+    depends_on:
+      - cache
+    networks:
+      - backend
+    working_dir: /app
+    user: "1000:1000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 10s
+      retries: 3
+    shm_size: 128m
+  cache:
+    image: "redis:7.4"
+    networks:
+      - backend
+networks:
+  backend:
+    driver: bridge
