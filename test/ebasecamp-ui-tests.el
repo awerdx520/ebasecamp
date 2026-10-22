@@ -947,10 +947,12 @@ dev → myapp（服务全 running）、prod → other（mysql-ro 未启动）。
         (should-not (ebasecamp-ui--busy-p session))
         (cl-labels ((capture ()
                       (let (seen)
+                        ;; C4 起 `--section-button' 多收一个 INSTANCE 参数
+                        ;; （按钮要把实例带进派发），这里记录 disabled 与实例
                         (cl-letf (((symbol-function
                                     'ebasecamp-ui--section-button)
-                                   (lambda (label action variant disabled)
-                                     (push (list label action disabled) seen)
+                                   (lambda (label action variant inst disabled)
+                                     (push (list label action disabled inst) seen)
                                      (etaf-view (etaf-label :text label)))))
                           (ebasecamp-ui-test--mount-text
                            (ebasecamp-ui--instance-section
@@ -972,6 +974,199 @@ dev → myapp（服务全 running）、prod → other（mysql-ro 未启动）。
           (should (ebasecamp-ui-test--contains-p text "启动选中"))
           (should (ebasecamp-ui-test--contains-p text "停止选中"))
           (should (ebasecamp-ui-test--contains-p text "重启选中")))))))
+
+;;; 12. 段内派发（C4）
+
+;; 段内按钮把「当前选中集合」派发到该段自己那份配置的项目上。这些用例全部
+;; 打桩 `ebasecamp-command-run'（真 docker 一次都不跑）与
+;; `ebasecamp-command-port-conflicts'，只断言调用参数与会话状态（busy / notice）。
+
+(defun ebasecamp-ui-test--instances (&optional group-key)
+  "建会话、选中 GROUP-KEY（默认 \"group/mysql\"）、刷新 state，返回该组实例列表。
+实例来自 state 的 `:instances'（与渲染期同一份数据），因此 project 字段与
+实际段头显示的一致。"
+  (let ((session (ebasecamp-ui-session)))
+    (ebasecamp-ui--select-key session (or group-key "group/mysql"))
+    (ebasecamp-ui-refresh nil t)
+    (plist-get (car (plist-get (etaf-value (ebasecamp-ui-session-state session))
+                              :groups))
+               :instances)))
+
+(defun ebasecamp-ui-test--reset-busy ()
+  "把当前会话的 busy 复位为 nil（等价于命令完成回调做的事）。"
+  (etaf-set-value (ebasecamp-ui-session-busy (ebasecamp-ui-session)) nil))
+
+(ert-deftest ebasecamp-ui-test-section-action-dispatches-with-instance-project ()
+  "段内「启动选中」把 ACTION / 实例项目 / 选中 keys 传给命令层。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let* ((instance (car (ebasecamp-ui-test--instances)))
+             (calls nil))
+        (ebasecamp-ui-test--select '("mysql/mysql" "mysql/mysql-ro"))
+        (cl-letf (((symbol-function 'ebasecamp-command-run)
+                   (lambda (&rest args) (push args calls)))
+                  ((symbol-function 'ebasecamp-command-port-conflicts)
+                   (lambda (&rest _) nil)))
+          (should (ebasecamp-ui--section-action 'start instance))
+          (should (= 1 (length calls)))
+          (let* ((args (car calls))
+                 (keys (nth 2 args)))
+            (should (eq 'start (nth 0 args)))
+            (should (equal "myapp" (nth 1 args)))
+            (should (equal 2 (length keys)))
+            (should (member "mysql/mysql" keys))
+            (should (member "mysql/mysql-ro" keys))
+            (should (functionp (plist-get (nthcdr 3 args) :on-complete))))
+          (should (ebasecamp-ui-test--busy)))))))
+
+(ert-deftest ebasecamp-ui-test-section-action-uses-own-project-per-instance ()
+  "同组两份配置（myapp / other）各派发到自己的项目，不串段。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let* ((instances (ebasecamp-ui-test--instances))
+             (dev (car instances))
+             (prod (cadr instances))
+             (projects nil))
+        (ebasecamp-ui-test--select '("mysql/mysql"))
+        (cl-letf (((symbol-function 'ebasecamp-command-run)
+                   (lambda (_action project _keys &rest _)
+                     (push project projects)))
+                  ((symbol-function 'ebasecamp-command-port-conflicts)
+                   (lambda (&rest _) nil)))
+          (should (ebasecamp-ui--section-action 'start dev))
+          (ebasecamp-ui-test--reset-busy)
+          (should (ebasecamp-ui--section-action 'start prod))
+          (should (equal '("myapp" "other") (reverse projects)))
+          (should (equal "myapp" (plist-get dev :project)))
+          (should (equal "other" (plist-get prod :project))))))))
+
+(ert-deftest ebasecamp-ui-test-section-action-rejects-when-busy ()
+  "busy 为真时段内派发被拒：不调用命令层，notice 为「操作进行中」。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let* ((instance (car (ebasecamp-ui-test--instances)))
+             (called 0))
+        (ebasecamp-ui-test--select '("mysql/mysql"))
+        (etaf-set-value (ebasecamp-ui-session-busy (ebasecamp-ui-session)) t)
+        (cl-letf (((symbol-function 'ebasecamp-command-run)
+                   (lambda (&rest _) (cl-incf called))))
+          (should-not (ebasecamp-ui--section-action 'start instance))
+          (should (= 0 called))
+          (let ((notice (ebasecamp-ui-test--notice)))
+            (should (eq 'info (plist-get notice :kind)))
+            (should (equal "操作进行中" (plist-get notice :title)))
+            (should (equal "请等待当前命令完成"
+                           (plist-get notice :message)))))))))
+
+(ert-deftest ebasecamp-ui-test-section-action-rejects-empty-selection ()
+  "未勾选服务时段内派发被拒：不派发并提示先勾选服务。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let* ((instance (car (ebasecamp-ui-test--instances)))
+             (called 0))
+        (cl-letf (((symbol-function 'ebasecamp-command-run)
+                   (lambda (&rest _) (cl-incf called))))
+          (should-not (ebasecamp-ui--section-action 'start instance))
+          (should (= 0 called))
+          (let ((notice (ebasecamp-ui-test--notice)))
+            (should (eq 'info (plist-get notice :kind)))
+            (should (equal "未选中服务" (plist-get notice :title)))
+            ;; 标题与正文其一含「请先勾选」，兼容后续文案微调
+            (should (ebasecamp-ui-test--contains-p
+                     (format "%s%s" (plist-get notice :title)
+                             (plist-get notice :message))
+                     "请先勾选"))))))))
+
+(ert-deftest ebasecamp-ui-test-section-action-blocks-on-port-conflict ()
+  "start 遇到阻塞类端口冲突（duplicate）：不派发，notice 为 error + 摘要。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let* ((instance (car (ebasecamp-ui-test--instances)))
+             (called 0)
+             (conflicts nil))
+        (ebasecamp-ui-test--select '("mysql/mysql" "mysql/mysql-ro"))
+        (cl-letf (((symbol-function 'ebasecamp-command-run)
+                   (lambda (&rest _) (cl-incf called)))
+                  ((symbol-function 'ebasecamp-command-port-conflicts)
+                   (lambda (project keys)
+                     (setq conflicts (list project keys))
+                     (list (list :kind 'duplicate :port 3306
+                                 :services '("mysql/mysql" "mysql/mysql-ro"))))))
+          (should-not (ebasecamp-ui--section-action 'start instance))
+          (should (= 0 called))
+          ;; 冲突检测用的是该段项目 + 当前选中 keys
+          (should (equal "myapp" (nth 0 conflicts)))
+          (should (equal 2 (length (nth 1 conflicts))))
+          (let ((notice (ebasecamp-ui-test--notice)))
+            (should (eq 'error (plist-get notice :kind)))
+            (should (equal "端口冲突" (plist-get notice :title)))
+            (should (ebasecamp-ui-test--contains-p
+                     (plist-get notice :message) "3306"))))))))
+
+(ert-deftest ebasecamp-ui-test-section-action-allows-soft-conflict ()
+  "start 遇到软冲突（unknown）：仍派发，notice 为 info「端口提示」。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let* ((instance (car (ebasecamp-ui-test--instances)))
+             (calls 0))
+        (ebasecamp-ui-test--select '("mysql/mysql"))
+        (cl-letf (((symbol-function 'ebasecamp-command-run)
+                   (lambda (&rest _) (cl-incf calls)))
+                  ((symbol-function 'ebasecamp-command-port-conflicts)
+                   (lambda (&rest _)
+                     (list (list :kind 'unknown :port 3306
+                                 :service "mysql/mysql"
+                                 :hint "端口探测不可用，已跳过")))))
+          (should (ebasecamp-ui--section-action 'start instance))
+          (should (= 1 calls))
+          (let ((notice (ebasecamp-ui-test--notice)))
+            (should (eq 'info (plist-get notice :kind)))
+            (should (equal "端口提示" (plist-get notice :title)))
+            (should (ebasecamp-ui-test--contains-p
+                     (plist-get notice :message) "3306"))))))))
+
+(ert-deftest ebasecamp-ui-test-section-action-double-click-dispatches-once ()
+  "连续两次段内派发只派发一次（第一次置 busy，第二次被挡）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let* ((instance (car (ebasecamp-ui-test--instances)))
+             (calls 0))
+        (ebasecamp-ui-test--select '("mysql/mysql"))
+        (cl-letf (((symbol-function 'ebasecamp-command-run)
+                   (lambda (&rest _) (cl-incf calls)))
+                  ((symbol-function 'ebasecamp-command-port-conflicts)
+                   (lambda (&rest _) nil)))
+          (should (ebasecamp-ui--section-action 'start instance))
+          (should-not (ebasecamp-ui--section-action 'start instance))
+          (should (= 1 calls)))))))
+
+(ert-deftest ebasecamp-ui-test-section-action-resets-busy-on-dispatch-error ()
+  "命令层 signal `ebasecamp-command-busy' 时 busy 复位为 nil 并写 notice。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let ((instance (car (ebasecamp-ui-test--instances))))
+        (ebasecamp-ui-test--select '("mysql/mysql"))
+        (cl-letf (((symbol-function 'ebasecamp-command-run)
+                   (lambda (&rest _)
+                     (signal 'ebasecamp-command-busy
+                             (list "项目 myapp 已有命令在执行"))))
+                  ((symbol-function 'ebasecamp-command-port-conflicts)
+                   (lambda (&rest _) nil)))
+          (should-not (ebasecamp-ui--section-action 'start instance))
+          (should-not (ebasecamp-ui-test--busy))
+          (let ((notice (ebasecamp-ui-test--notice)))
+            (should (eq 'error (plist-get notice :kind)))
+            (should (equal "命令派发失败" (plist-get notice :title)))
+            (should (ebasecamp-ui-test--contains-p
+                     (plist-get notice :message) "已有命令在执行"))))))))
 
 (provide 'ebasecamp-ui-tests)
 ;;; ebasecamp-ui-tests.el ends here

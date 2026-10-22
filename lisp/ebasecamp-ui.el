@@ -56,9 +56,10 @@
 ;; - 服务勾选的 key 形如 "组名/服务名"（`ebasecamp-ui--instance-key'）：
 ;;   同一组在不同项目实例下若服务同名，选中状态**跨段共享** —— 这是第一期
 ;;   语义（容器 ID 与项目名不参与 key，重启后选中仍稳定）。`selected-ref'
-;;   由 `ebasecamp-ui-selected-keys' 消费，经 `ebasecamp-ui-run-action' 派发
-;;   到命令层；段内按钮的派发留 C4（当前 `ebasecamp-ui--section-action' 是
-;;   占位），底栏与 notice 留 C5；
+;;   由 `ebasecamp-ui-selected-keys' 消费：段内按钮经
+;;   `ebasecamp-ui--section-action' 按**该段自己的** `:project' 派发到命令层
+;;   （C4）；旧的项目视图接口 `ebasecamp-ui-run-action' 仍走
+;;   `ebasecamp-ui--run-action'（C5 迁移到「选项目」语义）；底栏留 C5；
 ;; - 提示的呈现：`ebasecamp-ui--notice-view' 把 notice 渲染成 `etaf-alert'
 ;;   （`:detail' 以换行拼接进 message，`:dismissible' 的关闭按钮清空 notice）；
 ;;   成功 / 信息类提示在 `ebasecamp-ui-notice-timeout' 秒后自动清除，定时器
@@ -67,7 +68,8 @@
 ;;   Host），且 batch 下只画出标题、正文不可见，无法覆盖需要展示 stderr 的
 ;;   场景；
 ;; - `busy' 为真时操作条与段内按钮全部 `:disabled'，`ebasecamp-ui-run-action'
-;;   也直接拒绝（双保险：UI 不渲染可点按钮，函数层不被误调）。
+;;   与 `ebasecamp-ui--section-action' 也直接拒绝（双保险：UI 不渲染可点按钮，
+;;   函数层不被误调）。
 ;;
 ;; 渲染期读 ref（`etaf-value'）会建立渲染依赖：写 ref 即可让统计文案、树项、
 ;; 展开状态同步更新。注意 `etaf-button' 的 `:disabled' 只接受布尔值（传 ref
@@ -709,6 +711,8 @@ notice，绝不让界面卡在「执行中」。"
 
 (defun ebasecamp-ui--run-action (action confirmed)
   "`ebasecamp-ui-run-action' 的实现；CONFIRMED 非 nil 表示已通过销毁确认。
+旧的项目视图接口：项目取自 `ebasecamp-ui-current-project' 兼容层（而非某个
+配置实例），C5 将迁移到「选项目」语义；当前仅为旧调用点保留。
 返回值：t 表示已受理（已派发，或销毁动作已转入确认），nil 表示被拒。"
   (let* ((session (ebasecamp-ui-session))
          (project (ebasecamp-ui-current-project)))
@@ -740,6 +744,9 @@ notice，绝不让界面卡在「执行中」。"
          ((not (eq action 'start))
           (ebasecamp-ui--dispatch session action project keys))
          (t
+          ;; 端口冲突检测：**遗留调用点**（旧的项目视图接口）。C4 起段内
+          ;; 按钮走 `ebasecamp-ui--section-action'，那里是新的唯一主路径；
+          ;; C5 合并两条路径时本分支删除。
           (let* ((conflicts (ebasecamp-command-port-conflicts project keys))
                  (split (ebasecamp-ui--split-conflicts conflicts))
                  (blocking (car split))
@@ -758,6 +765,8 @@ notice，绝不让界面卡在「执行中」。"
 
 (defun ebasecamp-ui-run-action (action)
   "执行生命周期 ACTION（start / stop / restart / down），返回 t 或 nil。
+旧的项目视图接口：C5 将迁移到「选项目」语义；当前仅为旧调用点（操作条
+`ebasecamp-ui--action-bar'，C5 恢复）保留，**段内按钮不走本函数**。
 返回 t 表示已受理：start / stop / restart 已派发到命令层，down 已转入确认；
 返回 nil 表示被拒，并把原因写进会话的 notice。拒绝条件：
 - 会话 busy（已有命令在执行）；
@@ -770,6 +779,7 @@ notice，绝不让界面卡在「执行中」。"
 
 (defun ebasecamp-ui-confirm ()
   "执行确认框里待确认的动作（当前只有 down），返回 t 或 nil。
+旧的项目视图接口：C5 将迁移到「选项目」语义；当前仅为旧调用点保留。
 确认按钮与测试调用本函数；无论成功与否都先清空待确认状态，避免重复派发。"
   (interactive)
   (let* ((session ebasecamp-ui--session)
@@ -831,6 +841,7 @@ SESSION 的 busy 为真时按钮禁用（渲染期读 ref，写 ref 即触发重
 
 (defun ebasecamp-ui--confirm-dialog (session)
   "返回销毁环境的确认框：`:open' 绑在 SESSION 的 confirm ref 上。
+旧的项目视图接口：C5 将迁移到「选项目」语义；当前仅为旧调用点保留。
 `etaf-dialog' 的 `:open' 接受 ref（内部经 `etaf-ui--reactive-value' 读取并
 建立渲染依赖），因此写 ref 即可开关对话框。"
   (etaf-view
@@ -874,13 +885,14 @@ ref（展开状态由会话持有，重渲染后保持）；`:on-select' 写 sel
                  (etaf-set-value (ebasecamp-ui-session-expanded session) next))
     :on-select (lambda (key) (ebasecamp-ui--select-key session key)))))
 
-;;; 右栏段渲染（C3）
+;;; 右栏段渲染（C3）与段内派发（C4）
 
-;; 右栏是「选中组 → 每份配置一个 `etaf-panel' 段」的只读视图。段头含
+;; 右栏是「选中组 → 每份配置一个 `etaf-panel' 段」的视图。段头含
 ;; 配置名 → 项目、scope 徽标、running/total 徽标与三个生命周期按钮；
 ;; 段体是服务表（首列 checkbox，选中状态写进会话的 selected-ref）。
-;; 按钮的**派发**留 C4：本轮 `ebasecamp-ui--section-action' 是占位实现，
-;; 只保证渲染结构与 `:disabled' 绑定（busy 为真时全部禁用）。
+;; 段内按钮的派发（C4）走 `ebasecamp-ui--section-action'：把该段**自己的**
+;; `:project' 与当前选中集合交给命令层，不再经过 `ebasecamp-ui-current-project'
+;; 兼容层，因此同组多个实例不会串段。`:disabled' 仍由渲染期的 busy 求值。
 
 (defun ebasecamp-ui--busy-p (session)
   "SESSION 的 busy ref 当前是否为真（渲染期读取以建立渲染依赖）。"
@@ -916,14 +928,77 @@ SCOPE 为 scope 字符串（如 \"per-project\"）。"
               (plist-get instance :project)
               "")))
 
-(defun ebasecamp-ui--section-action (action)
-  "段内生命周期按钮的派发占位（C4 实现真正的段内派发），返回 nil。
-本轮（C3）只保证渲染结构与 disabled 绑定正确：点击按钮暂时什么都不做。"
-  (ignore action)
-  nil)
+(defun ebasecamp-ui--section-dispatch (session action project keys)
+  "把段内动作 ACTION（PROJECT + KEYS）派发到命令层，返回 t（已派发）或 nil。
+派发前置 busy；命令层 signal（含 `ebasecamp-command-busy'）时复位 busy 并写
+error notice「命令派发失败」，绝不让界面卡在「执行中」。
+与旧项目视图的 `ebasecamp-ui--dispatch' 的唯一差别：命令层的
+`ebasecamp-command-busy' 也归为「命令派发失败」（旧接口把这种情况提示为
+info「操作进行中」）；C5 合并两条路径时统一语义。"
+  (etaf-set-value (ebasecamp-ui-session-busy session) t)
+  (condition-case err
+      (progn
+        (ebasecamp-command-run
+         action project keys
+         :on-complete (ebasecamp-ui--on-complete session action))
+        t)
+    ((error quit)
+     (etaf-set-value (ebasecamp-ui-session-busy session) nil)
+     (ebasecamp-ui--set-notice session 'error "命令派发失败"
+                               (error-message-string err))
+     nil)))
 
-(defun ebasecamp-ui--section-button (label action variant disabled)
-  "返回段内生命周期按钮：文案 LABEL、语义 VARIANT，按下派发 ACTION。
+(defun ebasecamp-ui--section-action (action instance)
+  "对配置实例 INSTANCE 派发生命周期 ACTION。
+实例含 :config / :project / :records；keys 取会话选中集合（段内唯一：右栏只显示
+当前选中组的实例，故 \"组名/服务名\" 形式的 key 对该段全部有效）。
+判定顺序（任一命中即返回 nil 并写 notice，不派发）：
+1. 会话 busy → info「操作进行中」；
+2. 实例的 `:project' 为空 → info「该项目未定义」；
+3. 选中集合为空 → info「未选中服务」；
+4. ACTION 为 start 时先做端口冲突检测：`duplicate' / `busy' 阻塞（error
+   「端口冲突」），`unknown' 只提示（info「端口提示」）后继续；
+5. 派发 `ebasecamp-command-run'：前置 busy=t，命令层 signal 时复位 busy 并写
+   error「命令派发失败」。成功返回 t。
+完成回调沿用 `ebasecamp-ui--on-complete'（复位 busy → 刷新 → 报告结果）。"
+  (let* ((session (ebasecamp-ui-session))
+         (project (plist-get instance :project))
+         (keys (ebasecamp-ui-selected-keys)))
+    (cond
+     ((ebasecamp-ui--busy-p session)
+      (ebasecamp-ui--set-notice session 'info "操作进行中" "请等待当前命令完成")
+      nil)
+     ((or (null project) (and (stringp project) (string-empty-p project)))
+      (ebasecamp-ui--set-notice session 'info "该项目未定义"
+                                "这段配置指向的项目不在清单里，请先定义该项目")
+      nil)
+     ((null keys)
+      (ebasecamp-ui--set-notice session 'info "未选中服务"
+                                "请先勾选要操作的服务")
+      nil)
+     ((not (eq action 'start))
+      (ebasecamp-ui--section-dispatch session action project keys))
+     (t
+      (let* ((conflicts (ebasecamp-command-port-conflicts project keys))
+             (split (ebasecamp-ui--split-conflicts conflicts))
+             (blocking (car split))
+             (soft (cdr split)))
+        (if blocking
+            (progn
+              (ebasecamp-ui--set-notice
+               session 'error "端口冲突"
+               (ebasecamp-ui--conflict-summary blocking))
+              nil)
+          (when soft
+            (ebasecamp-ui--set-notice
+             session 'info "端口提示"
+             (ebasecamp-ui--conflict-summary soft)))
+          (ebasecamp-ui--section-dispatch session action project keys)))))))
+
+(defun ebasecamp-ui--section-button (label action variant instance disabled)
+  "返回段内生命周期按钮：文案 LABEL、语义 VARIANT，按下对 INSTANCE 派发 ACTION。
+INSTANCE 为 state 的段项 plist（`:config' / `:project' / `:records'）—— 按钮
+只绑定该段自己的项目，不读 `ebasecamp-ui-current-project' 兼容层。
 DISABLED 为真时禁用 —— `etaf-button' 的 `:disabled' 只接受布尔值，调用方
 必须在渲染期从 busy ref 取当前值传入（不能传 ref 对象）。"
   (etaf-view
@@ -931,7 +1006,7 @@ DISABLED 为真时禁用 —— `etaf-button' 的 `:disabled' 只接受布尔值
     :label label
     :variant variant
     :disabled (and disabled t)
-    :on-press (lambda () (ebasecamp-ui--section-action action)))))
+    :on-press (lambda () (ebasecamp-ui--section-action action instance)))))
 
 (defun ebasecamp-ui--instance-header (instance disabled)
   "返回段头：第一行 = 配置 → 项目（strong）+ scope 徽标 + running/total 徽标，
@@ -948,12 +1023,12 @@ DISABLED 为真时禁用 —— `etaf-button' 的 `:disabled' 只接受布尔值
          (etaf-badge :text (ebasecamp-ui--ratio-label running total)
                      :variant (ebasecamp-ui--ratio-variant running total)))
        (row :width 'stretch :cross-align 'center :item-gap '(ch 1)
-         (expr (ebasecamp-ui--section-button "启动选中" 'start 'primary
-                                             disabled))
-         (expr (ebasecamp-ui--section-button "停止选中" 'stop 'secondary
-                                             disabled))
-         (expr (ebasecamp-ui--section-button "重启选中" 'restart 'secondary
-                                             disabled)))))))
+         (expr (ebasecamp-ui--section-button
+                "启动选中" 'start 'primary instance disabled))
+         (expr (ebasecamp-ui--section-button
+                "停止选中" 'stop 'secondary instance disabled))
+         (expr (ebasecamp-ui--section-button
+                "重启选中" 'restart 'secondary instance disabled)))))))
 
 (defun ebasecamp-ui--service-table (session group-name instance)
   "返回段的服务表：列见 `ebasecamp-ui--columns'，行为实例的 `:records'。

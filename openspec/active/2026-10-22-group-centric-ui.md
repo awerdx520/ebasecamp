@@ -2,11 +2,11 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 批次 C 进行中（C0–C3 完成）
+- 阶段：Phase 3（Implement）· 批次 C 进行中（C0–C4 完成）
 - 已确认：方案 V3 ✅（用户 2026-10-22）、计划 ✅（用户 2026-10-22 确认；plan-reviewer 三轮审查通过）
-- 已完成：批次 A（加载修复）、批次 B（模型 + 物化 + 加载集成）、批次 D（导入/导出往返，含 D4 env_file 与 D5 渲染判据两个阻断缺陷修复）、C0（组为中心的会话与视图骨架）、C1/C2（`ebasecamp-data-group-instances` 组配置实例装配）、C3（段渲染：每份配置一个 `etaf-panel` + 服务表）
-- 测试基线：291 tests 全绿（C3 后 291，新增 6 项）
-- 下一步：C4 段内派发（勾选服务 → 段内按钮 → `ebasecamp-command-run`）→ C5 底栏 → C6 删数据适配 → C7 测试与目检
+- 已完成：批次 A（加载修复）、批次 B（模型 + 物化 + 加载集成）、批次 D（导入/导出往返，含 D4 env_file 与 D5 渲染判据两个阻断缺陷修复）、C0（组为中心的会话与视图骨架）、C1/C2（`ebasecamp-data-group-instances` 组配置实例装配）、C3（段渲染：每份配置一个 `etaf-panel` + 服务表）、C4（段内派发：段内按钮按该段自己的 project 派发到 `ebasecamp-command-run`）
+- 测试基线：299 tests 全绿（C4 后 299，新增 8 项；C3 后 291）
+- 下一步：C5 底栏（导入 / 导出 / 销毁环境，销毁走「选项目 + 二次确认」，并把旧的项目视图接口迁移到「选项目」语义、合并 `--dispatch` 与 `--section-dispatch`）→ C6 删数据适配 → C7 测试与目检
 - 待用户：A4 重启 Emacs 后 `M-x ebasecamp` 目检
 
 
@@ -157,8 +157,9 @@
 - [x] C3 段渲染：每份配置一个 `etaf-panel`（header 槽手搓 row：配置名 → 项目 + scope 徽标 + running/total + 三个按钮）+ `etaf-table` 服务行（首列 checkbox）
       （依赖：C2）验收：batch 断言 段头文案、服务行数、状态文案；无配置组显示「尚未关联任何项目」
       （完成：`ebasecamp-ui.el` 新增段渲染层 —— `--running-count` / `--instance-state`（`:config`/`:project`/`:project-title`/`:scope`/`:running`/`:total`/`:records`）/ `--config-state`（改由实例派生，树节点获得计数）/ `--group-service-names` / `--group-state`（`:instances` + 逐级汇总 `:running`/`:total` + `:service-names`，每组建**只装配一次** `group-instances`，配置项由实例派生）；树文案 `--group-caption` → `"MySQL  (2 配置 · 3/4 running)"`（无服务时省略计数）、`--config-caption` → `"dev → 示例项目  (2/2)"`；新增 `--instance-key`（段内 key `"组名/服务名"`，docstring 写明「同组多实例服务同名 → 选中跨段共享」的第一期语义）、`--busy-p`、`--scope-badge`（per-project→info / shared→warning）、`--ratio-variant`（0/total=0→neutral、全 running→success、其余→warning）、`--instance-caption`、`--section-action`（**占位**，C4 实现派发）、`--section-button`（`:disabled` 由渲染期 busy 求值）、`--instance-header`、`--service-table`、`--instance-section`、`--group-header-row`、`--empty-configs-view`、`--detail-view`（未选中→占位 / 无配置→空态+组定义服务名 / 有配置→组标题行 + 每份配置一段）；`--select-cell` 与 `--columns` 改收 `group-name` 并改用 `--instance-key`（旧的 `ebasecamp-data--item-key` 不再被 UI 使用，函数保留给 data 层）；`--command-key` 兼容两段形态；服务表列宽改为「镜像 / 端口用 `(fr 2)` 抢剩余宽度」——实测 80 列 batch 下右栏约 48 列，定宽相加会把「健康」列挤出可视区。计划外调整两处：段头拆成两行（标题行 + 按钮行），否则窄面板下「停止选中 / 重启选中」被裁切；服务表列宽由 3/9/10/9/10/8 改为 3/9/(fr 2)/8/(fr 2)/5。测试：新增 6 项（`build-state-includes-instances-and-counts`、`render-sections-for-selected-group`、`render-empty-configs-placeholder`、`render-checkbox-writes-selection`、`render-no-selected-group-shows-placeholder`、`header-buttons-disabled-when-busy`）；红阶段实测 291 项中 5 项 FAILED（第 6 项在 C0 骨架下天然绿，作回归护栏），转绿后 `make check` 退出码 0、291/291 全绿（check-parens OK 22 files、compile 零 warning）。batch 实测渲染文本含 `dev → 示例项目`／`prod → 另一项目`／`2/2`／`1/2`／`启动选中 停止选中 重启选中`／`RUNNING`／`STOPPED`／`服务 镜像 状态 端口 健康`）
-- [ ] C4 段内派发：勾选服务 → 段内按钮 → `ebasecamp-command-run action project keys`；busy 期间该段按钮 `:disabled`；失败走既有 notice（stderr 首行 + 详情）
+- [x] C4 段内派发：勾选服务 → 段内按钮 → `ebasecamp-command-run action project keys`；busy 期间该段按钮 `:disabled`；失败走既有 notice（stderr 首行 + 详情）
       （依赖：C3）验收：ERT 用 mock 断言派发的 project 与 keys 正确、双击只派发一次、busy 期间拒绝
+      （完成：`--section-action` 由占位改为 `(action instance)`，判定顺序严格为 busy（info「操作进行中」）→ 实例 `:project` 为空（info「该项目未定义」）→ 选中集合为空（info「未选中服务」/「请先勾选要操作的服务」）→ `start` 才做 `ebasecamp-command-port-conflicts`（`duplicate`/`busy` → error「端口冲突」+ 摘要并拒绝；`unknown` → info「端口提示」+ 摘要后继续）→ 派发；keys 取 `ebasecamp-ui-selected-keys`（段内 `"组名/服务名"`），project 取该实例自己的 `:project`（字符串），不经 `ebasecamp-ui-current-project` 兼容层，故同组多实例不串段。新增 `--section-dispatch`（复用 `--on-complete` 完成回调：复位 busy → 刷新 → `--report-result`；派发前置 busy=t，任何 error（含命令层 `ebasecamp-command-busy`）→ 复位 busy + error「命令派发失败」，未复用旧的 `--dispatch`——旧路径把命令层 busy 提示为 info「操作进行中」，C5 合并两条路径时统一）。`--section-button` 签名改为 `(label action variant instance disabled)`，`:on-press` 为 `(lambda () (ebasecamp-ui--section-action action instance))`，`:disabled` 仍由 `--busy-p` 在渲染期求值为布尔。旧接口全部保留并加 docstring 标注「C5 将迁移到「选项目」语义；当前仅为旧调用点保留」：`ebasecamp-ui-run-action` / `ebasecamp-ui-confirm` / `--run-action` / `--confirm-dialog`（旧链路 `--action-button` / `--action-bar` 未改）；`ebasecamp-command-port-conflicts` 旧调用点标注「遗留调用点」。测试新增 8 项（`section-action-dispatches-with-instance-project`、`-uses-own-project-per-instance`、`-rejects-when-busy`、`-rejects-empty-selection`、`-blocks-on-port-conflict`、`-allows-soft-conflict`、`-double-click-dispatches-once`、`-resets-busy-on-dispatch-error`），并把 C3 的 `header-buttons-disabled-when-busy` 按钮打桩改为 5 参（记录 instance）；红阶段实测 299 项中 9 项 FAILED（8 个新用例 + 该打桩项因 arity 变更），转绿后 `make check` 退出码 0、299/299 全绿（check-parens OK 22 files、compile 零 warning）。真实 docker 一次未跑，命令层与端口检测全部 `cl-letf` 打桩）
 - [ ] C5 底栏：导入 compose（沿用现有链路）、导出 compose（`completing-read` 选项目）、销毁环境（选项目 + `etaf-dialog` 二次确认）
       （依赖：C4）验收：batch 断言三个入口存在；`M-x` 调用时取消 `completing-read` 静默返回 nil
 - [ ] C6 清理数据适配层（放在 UI 重写之后，避免 `make compile` 空窗）：删除 `ebasecamp-data` 中 ETAF Data 适配（`ebasecamp-data-source`、`-controller`、`-refresh`、`--load`、`--query-records`、`--slice`、`--filter`、`--field-equal`），保留纯装配函数（`--name-string`、`--service-ports`、`--item-key`、`--group-ref-scope`、`--record-lessp`、`--service-record`、`ebasecamp-data-project-records`、`--status-index`、`--resolve-project`）；同步删除 `test/ebasecamp-data-tests.el` 中 ETAF 适配相关用例，并在报告中列出「保留用例清单」（须含 `project-records` / `service-ports` / `record-lessp` / `item-key` 的用例）
