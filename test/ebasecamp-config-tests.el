@@ -43,6 +43,28 @@ EXTRA 非 nil 时原样附加在项目名之后（用于构造非法关键字等
   "用 ACCESSOR 取出 OBJECTS 中的名字，返回名字列表。"
   (mapcar accessor objects))
 
+(defconst ebasecamp-config-test--mysql-group-source
+  (concat "(ebasecamp-define-group mysql\n"
+          "  :services ((mysql :image \"mysql:8.4\" :ports ((3306 . 3306)))))\n")
+  "定义一个名为 mysql 的组（无 :configs）的清单片段。")
+
+(defconst ebasecamp-config-test--redis-group-source
+  "(ebasecamp-define-group redis :services ((redis :image \"redis:7\")))\n"
+  "定义一个名为 redis 的组（无 :configs）的清单片段。")
+
+(defconst ebasecamp-config-test--mysql-dev-config-source
+  (concat "(ebasecamp-define-group mysql\n"
+          "  :services ((mysql :image \"mysql:8.4\" :ports ((3306 . 3306))))\n"
+          "  :configs ((dev :project myapp\n"
+          "                  :services ((mysql :ports ((3307 . 3306)))))))\n")
+  "定义 mysql 组并带一份指向项目 myapp 的配置 dev 的清单片段。")
+
+(defun ebasecamp-config-test--write-project (dir name extra)
+  "在 DIR/projects/NAME.el 写入定义项目 NAME 的清单，EXTRA 原样附加在项目名之后。"
+  (ebasecamp-config-test--write
+   (expand-file-name (concat "projects/" (symbol-name name) ".el") dir)
+   (ebasecamp-config-test--project-source (symbol-name name) extra)))
+
 ;;; 1. 目录不存在
 
 (ert-deftest ebasecamp-config-test-missing-directory-needs-bootstrap ()
@@ -285,6 +307,184 @@ EXTRA 非 nil 时原样附加在项目名之后（用于构造非法关键字等
                      (with-temp-buffer
                        (insert-file-contents marker)
                        (buffer-string)))))))
+
+;;; 13. B4 旧写法兼容
+
+(ert-deftest ebasecamp-config-test-legacy-groups-only-load-is-unchanged ()
+  "仅用旧 :groups 写法的清单：项目 groups 槽与 v0.1 逐字一致。
+加载期物化对无 :configs 的清单必须是零副作用（引用内容与顺序都不变）。"
+  (ebasecamp-config-test--with-dir
+    (ebasecamp-config-test--write (expand-file-name "groups.el" dir)
+                                  ebasecamp-config-test--mysql-group-source)
+    (ebasecamp-config-test--write-project
+     dir 'myapp
+     " :groups ((mysql :services ((mysql :ports ((3307 . 3306))))))")
+    (let* ((result (ebasecamp-config-load dir))
+           (project (ebasecamp-model-project 'myapp)))
+      (should-not (plist-get result :errors))
+      (should (equal '((:group mysql :scope nil
+                               :service-overrides
+                               ((mysql :ports ((3307 . 3306))))))
+                     (ebasecamp-project-groups project)))
+      ;; 返回值里的项目对象与注册表读到同一份 groups 槽
+      (should (equal (ebasecamp-project-groups project)
+                     (ebasecamp-project-groups
+                      (car (plist-get result :projects))))))))
+
+(ert-deftest ebasecamp-config-test-legacy-and-configs-coexist ()
+  "同一项目里旧 :groups 与配置侧共存：旧引用在前，物化结果在后。"
+  (ebasecamp-config-test--with-dir
+    (ebasecamp-config-test--write
+     (expand-file-name "groups.el" dir)
+     (concat ebasecamp-config-test--redis-group-source
+             ebasecamp-config-test--mysql-dev-config-source))
+    (ebasecamp-config-test--write-project dir 'myapp " :groups ((redis))")
+    (let* ((result (ebasecamp-config-load dir))
+           (groups (ebasecamp-project-groups
+                    (ebasecamp-model-project 'myapp))))
+      (should-not (plist-get result :errors))
+      (should (equal '((:group redis :scope nil :service-overrides nil)
+                       (:group mysql :scope per-project
+                               :service-overrides
+                               ((mysql :ports ((3307 . 3306))))))
+                     groups)))))
+
+(ert-deftest ebasecamp-config-test-legacy-duplicate-group-reference-is-error ()
+  "D2 行为变更：旧 :groups 内重复引用同一组时加载报错。
+v0.1 允许 `:groups ((mysql) (mysql))`（静默产生两个引用，下游 `cl-find`
+只取首个）；v0.2 起按 D2 统一报错，且错误指向项目定义文件。"
+  (ebasecamp-config-test--with-dir
+    (ebasecamp-config-test--write (expand-file-name "groups.el" dir)
+                                  ebasecamp-config-test--mysql-group-source)
+    (ebasecamp-config-test--write-project dir 'p " :groups ((mysql) (mysql))")
+    (let* ((result (ebasecamp-config-load dir))
+           (errors (plist-get result :errors))
+           (error (car errors)))
+      (should (= 1 (length errors)))
+      (should (equal (expand-file-name "projects/p.el" dir)
+                     (plist-get error :file)))
+      (should (string-match-p "重复引用" (plist-get error :message)))
+      (should (string-match-p "mysql" (plist-get error :message)))
+      (should (string-match-p "\\bp\\b" (plist-get error :message)))
+      (should (eq 'ebasecamp-config-duplicate-group-ref
+                  (car (plist-get error :condition))))
+      ;; 项目本身仍被加载（定义期错误不丢弃项目）
+      (should (ebasecamp-model-project 'p)))))
+
+;;; 14. B5 加载流程集成（物化接入）
+
+(ert-deftest ebasecamp-config-test-load-materializes-configs-into-projects ()
+  "groups.el 的 :configs 在 load 后物化为项目组引用，键为 :service-overrides。"
+  (ebasecamp-config-test--with-dir
+    (ebasecamp-config-test--write (expand-file-name "groups.el" dir)
+                                  ebasecamp-config-test--mysql-dev-config-source)
+    (ebasecamp-config-test--write-project dir 'myapp "")
+    (let* ((result (ebasecamp-config-load dir))
+           (groups (ebasecamp-project-groups
+                    (ebasecamp-model-project 'myapp))))
+      (should-not (plist-get result :errors))
+      (should (equal '((:group mysql :scope per-project
+                               :service-overrides
+                               ((mysql :ports ((3307 . 3306))))))
+                     groups))
+      ;; D6 键名不变量
+      (should (plist-member (car groups) :service-overrides))
+      (should-not (plist-member (car groups) :services)))))
+
+(ert-deftest ebasecamp-config-test-load-reports-link-errors-with-file ()
+  "配置指向未定义项目：错误进 :errors，:file 为 groups.el 的绝对路径。"
+  (ebasecamp-config-test--with-dir
+    (ebasecamp-config-test--write
+     (expand-file-name "groups.el" dir)
+     (concat "(ebasecamp-define-group mysql\n"
+             "  :services ((mysql :image \"mysql:8.4\"))\n"
+             "  :configs ((ghost :project nowhere)))\n"))
+    (let* ((result (ebasecamp-config-load dir))
+           (errors (plist-get result :errors))
+           (error (car errors)))
+      (should (= 1 (length errors)))
+      (should (equal (expand-file-name "groups.el" dir)
+                     (plist-get error :file)))
+      (should (string-suffix-p "groups.el" (plist-get error :file)))
+      (should (string-match-p "未定义的项目" (plist-get error :message)))
+      (should (eq 'ebasecamp-model-config-link-error
+                  (car (plist-get error :condition))))
+      ;; condition 携带 (CODE . (组名 . 项目名)) 形式的上下文
+      (should (equal '(:undefined-project (mysql . nowhere))
+                     (cdr (plist-get error :condition)))))))
+
+(ert-deftest ebasecamp-config-test-load-partial-success-keeps-good-configs ()
+  "一份配置错误 + 一份正确：正确的已物化，错误的只进 :errors。"
+  (ebasecamp-config-test--with-dir
+    (ebasecamp-config-test--write
+     (expand-file-name "groups.el" dir)
+     (concat "(ebasecamp-define-group mysql\n"
+             "  :services ((mysql :image \"mysql:8.4\" :ports ((3306 . 3306))))\n"
+             "  :configs ((ghost :project nowhere)\n"
+             "            (dev   :project myapp\n"
+             "                   :services ((mysql :ports ((3307 . 3306)))))))\n"))
+    (ebasecamp-config-test--write-project dir 'myapp "")
+    (let ((result (ebasecamp-config-load dir)))
+      (should (= 1 (length (plist-get result :errors))))
+      (should (string-match-p "未定义的项目"
+                              (plist-get (car (plist-get result :errors))
+                                         :message)))
+      (should (equal '((:group mysql :scope per-project
+                               :service-overrides
+                               ((mysql :ports ((3307 . 3306))))))
+                     (ebasecamp-project-groups
+                      (ebasecamp-model-project 'myapp)))))))
+
+(ert-deftest ebasecamp-config-test-load-is-idempotent ()
+  "连续两次 load 结果一致，物化不重复追加引用。"
+  (ebasecamp-config-test--with-dir
+    (ebasecamp-config-test--write
+     (expand-file-name "groups.el" dir)
+     (concat ebasecamp-config-test--redis-group-source
+             ebasecamp-config-test--mysql-dev-config-source))
+    (ebasecamp-config-test--write-project dir 'myapp " :groups ((redis))")
+    (let* ((first-result (ebasecamp-config-load dir))
+           (first (ebasecamp-project-groups
+                   (ebasecamp-model-project 'myapp)))
+           (second-result (ebasecamp-config-load dir))
+           (second (ebasecamp-project-groups
+                    (ebasecamp-model-project 'myapp))))
+      (should-not (plist-get first-result :errors))
+      (should-not (plist-get second-result :errors))
+      (should (= 2 (length first)))
+      (should (equal first second))
+      (should (= 2 (length second))))))
+
+(ert-deftest ebasecamp-config-test-load-directory-missing-still-works ()
+  "目录不存在时仍返回空清单 + bootstrap-needed，物化步骤不介入、无错误。"
+  (ebasecamp-config-test--with-dir
+    (let* ((target (expand-file-name "missing" dir))
+           (result (ebasecamp-config-load target)))
+      (should-not (file-exists-p target))
+      (should (eq t (plist-get result :bootstrap-needed)))
+      (should-not (plist-get result :groups))
+      (should-not (plist-get result :projects))
+      (should-not (plist-get result :errors))
+      (should-not (ebasecamp-model-projects)))))
+
+(ert-deftest ebasecamp-config-test-load-groups-syntax-error-still-collected ()
+  "groups.el 语法错时错误仍被收集，项目照常加载，物化不额外报错。"
+  (ebasecamp-config-test--with-dir
+    (ebasecamp-config-test--write
+     (expand-file-name "groups.el" dir)
+     (concat ebasecamp-config-test--mysql-group-source "(\n"))
+    (ebasecamp-config-test--write-project dir 'a "")
+    (let* ((result (ebasecamp-config-load dir))
+           (errors (plist-get result :errors)))
+      (should (= 1 (length errors)))
+      (should (equal (expand-file-name "groups.el" dir)
+                     (plist-get (car errors) :file)))
+      (should-not (plist-get result :groups))
+      (should (equal '(a)
+                     (ebasecamp-config-test--names
+                      (plist-get result :projects) #'ebasecamp-project-name)))
+      (should-not (ebasecamp-project-groups
+                   (ebasecamp-model-project 'a))))))
 
 (provide 'ebasecamp-config-tests)
 ;;; ebasecamp-config-tests.el ends here

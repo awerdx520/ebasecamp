@@ -2,10 +2,12 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 批次 A 完成，等待用户重启目检
+- 阶段：Phase 3（Implement）· 批次 B 完成（B1–B6），等待批次 D
 - 已确认：方案 V3 ✅（用户 2026-10-22）、计划 ✅（用户 2026-10-22 确认；plan-reviewer 三轮审查通过）
-- 已完成：A0–A3（recipe 指向本地仓库 + 真实构建树重建 + 临时 daemon 冒烟）、A5（tech-debt #18/#19）
-- 下一步：A4 用户重启 Emacs 后目检 → 批次 B（模型层 TDD）
+- 已完成：A0–A3、A5；批次 B 全部（B1 模型测试 → B2 `:configs` 解析与访问器 → B3 物化 + 交叉校验 → B4 旧写法兼容 → B5 加载流程集成 → B6 全量回归）
+- 测试基线：267 tests（B 批次起点 234 → model 层测试后 258 → config 层 9 项后 267），`make check` 全绿
+- 下一步：A4 用户重启 Emacs 后目检 → 批次 D（导入适配，D1 先写失败测试）
+- 兼容性注意：D2 把「同一项目重复引用同一组」从 v0.1 的静默允许改为加载报错（错误类型 `ebasecamp-config-duplicate-group-ref`，`:file` 指向项目文件）
 
 ## 目标
 
@@ -29,7 +31,7 @@
 - **D3**：旧写法（项目侧 `:groups ((mysql) ...)`）保留兼容，视作「匿名配置」，配置名 = 组名；加载时先登记项目侧引用，再物化配置侧。
 - **D4**：版本号 0.2.0（模型扩展，向后兼容旧写法）。
 - **D5**：导出与销毁环境改为用 `completing-read` 选项目 + 确认，不再依赖「当前项目」。
-- **D6 物化（materialize）**：配置在组侧声明，加载完成后由 `ebasecamp-model--link-configs` 转换成**与 `ebasecamp-model--group-ref-from-spec` 完全同构**的组引用 plist，并入 `PROJECT.groups` 槽。
+- **D6 物化（materialize）**：配置在组侧声明，加载完成后由 `ebasecamp-model-link-configs` 转换成**与 `ebasecamp-model--group-ref-from-spec` 完全同构**的组引用 plist，并入 `PROJECT.groups` 槽。
   - **键名不变量（新增）**：物化产物必须是 `(:group SYMBOL :scope SCOPE :service-overrides ALIST)`，**不得**写 `:services`。依据：`ebasecamp-model.el:314` 产出 `:service-overrides`，`ebasecamp-model.el:498`（`resolve-services`）与 `ebasecamp-import.el:441` 均按该键读取；写错会导致覆盖静默丢失。
   - 下游因此零改动的读取点（已核实）：`ebasecamp-compose-render`（compose.el:478 经 `--group-refs`）、`ebasecamp-command--selection`（command.el:176）、`ebasecamp-data-project-records`（data.el:146）、`ebasecamp-export--per-project-refs`（export.el:105）、`ebasecamp-compose--ref-scope`（compose.el:202）。
 - **D7 界面刷新**：单一 `state ref` + 3s 轮询写 ref；根函数视图读 ref → 整树 patch。段内行用 `etaf-table`（不绑 controller）；**不使用** `etaf-data-grid`（无分组能力，已实测）。
@@ -59,7 +61,7 @@
 - 配置名须为 symbol 且组内唯一。
 - 物化后每份配置产出一个 ref：`(:group 组名 :scope 组scope :service-overrides 归一化覆盖)`。
 
-### 加载期物化算法（`ebasecamp-model--link-configs`）
+### 加载期物化算法（`ebasecamp-model-link-configs`）
 
 1. 遍历全部组的全部配置，逐份解析 `:project`（symbol）→ 查项目对象。
 2. 校验（任一命中即记入 `:errors`，**不中断**其余项）：
@@ -108,14 +110,17 @@
       （依赖：无）验收：新增用例此时全部失败（红）
 - [x] B2 实现 `:configs` 解析与访问器：`ebasecamp-group` 增加 configs 槽；`ebasecamp-model-group-configs`、`ebasecamp-model-config`（按 组+配置名 定位）、`ebasecamp-model-config-project`；`ebasecamp-define-group` 接受 `:configs` 并校验
       （依赖：B1）验收：B1 用例转绿；`make compile` 零 warning
-- [x] B3 物化 + 交叉校验：实现 `ebasecamp-model--link-configs`（算法见「加载期物化算法」节），产物键名必须是 `:service-overrides`（D6 不变量）
+- [x] B3 物化 + 交叉校验：实现 `ebasecamp-model-link-configs`（算法见「加载期物化算法」节），产物键名必须是 `:service-overrides`（D6 不变量）
       （依赖：B2）验收：ERT 覆盖 物化结果结构（含键名断言）、旧 `:groups` + 配置共存顺序（项目侧在前）、四类错误各自命中（缺 project / 项目不存在 / 同项目同组重复 / shared 多配置）；断言错误发生后其余项仍被加载
-- [ ] B4 旧写法兼容：`ebasecamp-define-project :groups` 保留；仅用旧写法的清单加载结果与 v0.1 完全一致
+- [x] B4 旧写法兼容：`ebasecamp-define-project :groups` 保留；仅用旧写法的清单加载结果与 v0.1 完全一致
       （依赖：B3）验收：用现有测试夹具对照 `ebasecamp-model-projects` / `project-groups` 结果完全相等；先确认现有夹具中**没有**「同一项目重复引用同一组」的形态（D2 现已将其改为报错），若存在需先修夹具并在报告说明
-- [ ] B5 加载流程改造：`ebasecamp-config-load` 顺序改为「清空注册表 → 加载 groups.el → 加载 projects/*.el → link-configs → 汇总错误」；任一步错误收集不中断
+      （完成：`legacy-groups-only-load-is-unchanged` / `legacy-and-configs-coexist` 锁定物化零副作用与「旧引用在前」；`legacy-duplicate-group-reference-is-error` 锁定 D2 行为变更，错误由 `ebasecamp-config--validate-projects` 报出、`:file` 指向项目文件。现有夹具无重复引用形态，无需改夹具）
+- [x] B5 加载流程改造：`ebasecamp-config-load` 顺序改为「清空注册表 → 加载 groups.el → 加载 projects/*.el → link-configs → 汇总错误」；任一步错误收集不中断
       （依赖：B3）验收：ERT 覆盖 目录缺失、groups 语法错、项目引用未定义组、配置引用未定义项目、link 阶段错
-- [ ] B6 全量回归：`make check` 全绿；报告测试总数（新增项使基线高于 234，需在报告中给出新数字）
+      （完成：顺序为 文件加载 → `--validate-projects` → `--link-configs`，错误按定义期在前、物化期在后汇总；link 错误的 `:file` 统一补填 `<dir>/groups.el`）
+- [x] B6 全量回归：`make check` 全绿；报告测试总数（新增项使基线高于 234，需在报告中给出新数字）
       （依赖：B1–B5）验收：退出码 0，无 unexpected
+      （完成：`make check` 退出码 0，`check-parens OK (22 files)`，`make test` 267/267，`make compile` 零 warning）
 
 ### 批次 D：导入适配（前移到 C 之前）
 

@@ -21,11 +21,16 @@
 ;;   不中断后续文件；
 ;; - 模型注册表只支持追加，所以某文件加载失败时用「重置 + 重放已成功
 ;;   文件」回滚，保证失败文件的定义不会残留在清单中；
-;; - 全部加载后校验项目的组引用，引用未定义组时追加一条错误。
+;; - 全部加载后校验项目的组引用（未定义组、同组重复引用），引用未定义组
+;;   或重复引用时追加错误；
+;; - 最后进入物化阶段 `ebasecamp-model-link-configs`，把组内 :configs 并入
+;;   项目的 groups 槽，物化错误同样记入 :errors（定义期错误的条目在前，
+;;   物化期在后）。
 ;;
 ;; 错误项结构：(:file PATH :condition CONDITION-DATA :message STRING)。
-;; :file 为定义所在文件的绝对路径，无法定位时为 nil；:message 是人类可读
-;; 描述，便于界面直接展示。
+;; :file 为定义所在文件的绝对路径，无法定位时为 nil；物化阶段的错误由本层
+;; 统一补填为 groups.el 的绝对路径（配置只能定义在 groups.el）。:message 是
+;; 人类可读描述，便于界面直接展示。
 ;;
 ;; 本文件不读取、不插值、不落盘任何密钥值。
 
@@ -37,6 +42,9 @@
 (define-error 'ebasecamp-config-error "Invalid ebasecamp config")
 (define-error 'ebasecamp-config-missing-group
   "Project references an undefined group"
+  'ebasecamp-config-error)
+(define-error 'ebasecamp-config-duplicate-group-ref
+  "Project references the same group more than once"
   'ebasecamp-config-error)
 
 (defcustom ebasecamp-config-directory (expand-file-name "~/.config/ebasecamp/")
@@ -127,10 +135,13 @@ ORIGINS 是 hash 表（项目名 -> 定义所在文件路径）。加载成功�
 ;;; 引用校验
 
 (defun ebasecamp-config--validate-projects (origins)
-  "校验每个项目的组引用都已注册，返回错误 plist 列表。
+  "校验每个项目的组引用，返回错误 plist 列表。
+两类错误依次排列：先「引用了未定义的组」，后「同一项目重复引用同一组」
+（D2：同一项目 + 同一组只允许 1 个引用，容器标签无配置维度，服务名会撞）。
 ORIGINS 为项目名到定义文件的 hash 表；项目无法定位到文件时 :file 为 nil，
 message 中仍包含项目名与组名。错误按项目与组引用的顺序排列。"
-  (let ((errors nil))
+  (let ((errors nil)
+        (duplicates nil))
     (dolist (project (ebasecamp-model-projects))
       (let ((project-name (ebasecamp-project-name project))
             (file (gethash (ebasecamp-project-name project) origins)))
@@ -145,7 +156,38 @@ message 中仍包含项目名与组名。错误按项目与组引用的顺序排
                                            (or file "定义文件未知")
                                            group-name))
                     errors))))))
-    (nreverse errors)))
+    (setq errors (nreverse errors))
+    (dolist (project (ebasecamp-model-projects))
+      (let ((project-name (ebasecamp-project-name project))
+            (file (gethash (ebasecamp-project-name project) origins))
+            (seen nil))
+        (dolist (reference (ebasecamp-project-groups project))
+          (let ((group-name (plist-get reference :group)))
+            (if (memq group-name seen)
+                (push (list :file file
+                            :condition
+                            (list 'ebasecamp-config-duplicate-group-ref
+                                  project-name group-name file)
+                            :message (format "项目 %s（%s）重复引用组 %s"
+                                             project-name
+                                             (or file "定义文件未知")
+                                             group-name))
+                      duplicates)
+              (push group-name seen))))))
+    (append errors (nreverse duplicates))))
+
+;;; 加载期物化
+
+(defun ebasecamp-config--link-configs (directory)
+  "物化组内配置，并把错误项的 :file 补填为 <DIRECTORY>/groups.el。
+`ebasecamp-model-link-configs' 只在 :condition 里携带
+\(CODE . (组名 . 项目名)) 上下文（模型层不感知文件），而配置定义只能写在
+groups.el，因此这里统一把 :file 指向该文件的绝对路径，不留 nil。返回补填后
+的错误列表；模型层的部分成功语义保持不变（成功物化的配置仍生效）。"
+  (let ((groups-file (expand-file-name "groups.el" directory)))
+    (mapcar (lambda (error)
+              (plist-put error :file groups-file))
+            (ebasecamp-model-link-configs))))
 
 ;;; 加载入口
 
@@ -157,9 +199,16 @@ GROUPS 与 PROJECTS 是本次加载后的注册表内容；ERRORS 是错误 plis
 每项形如 (:file PATH :condition CONDITION-DATA :message STRING)，按发生顺序
 排列；BOOL 在目录不存在时为 t，此时不创建目录、ERRORS 为空。
 
-加载规则：先清空注册表（重新加载幂等），再依次加载 `groups.el' 与
-`projects/' 下的 *.el（按文件名字典序）；单个文件出错时记录错误、丢弃该
-文件已产生的定义并继续加载后续文件；全部加载后校验项目对组的引用。"
+加载顺序（任一步出错都只记错误、不中断后续步骤）：
+1. 清空注册表（重新加载幂等）；
+2. 依次加载 `groups.el' 与 `projects/' 下的 *.el（按文件名字典序），单文件
+   出错时记录错误、丢弃该文件已产生的定义并按重放回滚；
+3. 校验项目对组的引用（未定义组、同组重复引用）；
+4. 物化组内 :configs 到项目 groups 槽（`ebasecamp-model-link-configs'），
+   错误的 :file 补填为 groups.el。
+
+错误顺序为「文件加载 → 项目引用校验 → 物化」，即定义期在前、物化期在后。
+物化阶段的部分成功语义：出错的配置只记错误，其余配置照常物化并生效。"
   (let* ((dir (ebasecamp-config--directory directory))
          (origins (make-hash-table :test #'eq))
          (loaded nil)
@@ -175,7 +224,10 @@ GROUPS 与 PROJECTS 是本次加载后的注册表内容；ERRORS 是错误 plis
                 (ebasecamp-config--reload (reverse loaded) origins))
             (push file loaded))))
       (setq errors (nreverse errors))
-      (setq errors (append errors (ebasecamp-config--validate-projects origins))))
+      ;; 定义期校验：项目对组的引用（未定义组 / 同组重复引用）
+      (setq errors (append errors (ebasecamp-config--validate-projects origins)))
+      ;; 物化期：组内配置并入项目 groups 槽（错误的 :file 由本层补填）
+      (setq errors (append errors (ebasecamp-config--link-configs dir))))
     (list :groups (ebasecamp-model-groups)
           :projects (ebasecamp-model-projects)
           :errors errors
