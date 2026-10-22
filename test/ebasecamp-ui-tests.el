@@ -18,6 +18,7 @@
 (require 'cl-lib)
 (require 'ert)
 (require 'ebasecamp-model)
+(require 'ebasecamp-command)
 (require 'ebasecamp-ui)
 
 ;;; 测试脚手架
@@ -221,6 +222,181 @@
           (should (ebasecamp-ui-test--contains-p text "cache  (0/1)"))
           (should (ebasecamp-ui-test--contains-p text "redis"))
           (should-not (ebasecamp-ui-test--contains-p text "mysql  (0/2)")))))))
+
+;;; 8. 操作条与并发控制（T3.2）
+
+(defun ebasecamp-ui-test--select (keys)
+  "把 KEYS（\"project/group/service\" 列表）全部勾选到当前会话里。"
+  (let ((session (ebasecamp-ui-session)))
+    (dolist (key keys)
+      (ebasecamp-ui--toggle-selected session key t))))
+
+(defun ebasecamp-ui-test--notice ()
+  "返回当前会话的 notice 值。"
+  (etaf-value (ebasecamp-ui-session-notice (ebasecamp-ui-session))))
+
+(defun ebasecamp-ui-test--busy ()
+  "返回当前会话的 busy 值。"
+  (etaf-value (ebasecamp-ui-session-busy (ebasecamp-ui-session))))
+
+(ert-deftest ebasecamp-ui-test-renders-action-bar ()
+  "主界面渲染四个生命周期操作按钮文案。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (ebasecamp-ui-open)
+      (let ((text (ebasecamp-ui-test--buffer-text)))
+        (should (ebasecamp-ui-test--contains-p text "启动选中"))
+        (should (ebasecamp-ui-test--contains-p text "停止选中"))
+        (should (ebasecamp-ui-test--contains-p text "重启选中"))
+        (should (ebasecamp-ui-test--contains-p text "销毁环境"))))))
+
+(ert-deftest ebasecamp-ui-test-run-action-requires-selection ()
+  "无选中服务时 start 被拒：不派发命令，notice 为 info。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (ebasecamp-ui-open)
+      (let ((called 0))
+        (cl-letf (((symbol-function 'ebasecamp-command-run)
+                   (lambda (&rest _) (cl-incf called))))
+          (should-not (ebasecamp-ui-run-action 'start))
+          (should (= 0 called))
+          (let ((notice (ebasecamp-ui-test--notice)))
+            (should (eq 'info (plist-get notice :kind)))
+            (should (equal "未选中服务" (plist-get notice :title)))
+            (should (equal "请先勾选要操作的服务"
+                           (plist-get notice :message)))))))))
+
+(ert-deftest ebasecamp-ui-test-run-action-blocks-on-port-conflict ()
+  "start 遇到 duplicate 端口冲突：不派发，notice 为 error 并汇总冲突。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (ebasecamp-ui-open)
+      (ebasecamp-ui-test--select '("myapp/mysql/mysql"))
+      (let ((called 0))
+        (cl-letf (((symbol-function 'ebasecamp-command-run)
+                   (lambda (&rest _) (cl-incf called)))
+                  ((symbol-function 'ebasecamp-command-port-conflicts)
+                   (lambda (&rest _)
+                     (list (list :kind 'duplicate :port 3306
+                                 :services '("mysql/mysql" "mysql/mysql-ro"))))))
+          (should-not (ebasecamp-ui-run-action 'start))
+          (should (= 0 called))
+          (let ((notice (ebasecamp-ui-test--notice)))
+            (should (eq 'error (plist-get notice :kind)))
+            (should (equal "端口冲突" (plist-get notice :title)))
+            (should (ebasecamp-ui-test--contains-p
+                     (plist-get notice :message) "3306"))))))))
+
+(ert-deftest ebasecamp-ui-test-run-action-dispatches-start ()
+  "start 有选中且无冲突：派发一次，ACTION/项目/keys/on-complete 齐全。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (ebasecamp-ui-open)
+      (ebasecamp-ui-test--select '("myapp/mysql/mysql"))
+      (let ((calls nil))
+        (cl-letf (((symbol-function 'ebasecamp-command-run)
+                   (lambda (&rest args) (push args calls)))
+                  ((symbol-function 'ebasecamp-command-port-conflicts)
+                   (lambda (&rest _) nil)))
+          (should (ebasecamp-ui-run-action 'start))
+          (should (= 1 (length calls)))
+          (let ((args (car calls)))
+            (should (eq 'start (nth 0 args)))
+            (should (eq 'myapp (nth 1 args)))
+            (should (equal '("mysql/mysql") (nth 2 args)))
+            (should (functionp (plist-get (nthcdr 3 args) :on-complete)))))))))
+
+(ert-deftest ebasecamp-ui-test-run-action-stop-skips-conflict-check ()
+  "stop 直接派发且不调用端口冲突检测。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (ebasecamp-ui-open)
+      (ebasecamp-ui-test--select '("myapp/mysql/mysql-ro"))
+      (let ((calls nil)
+            (conflict-called 0))
+        (cl-letf (((symbol-function 'ebasecamp-command-run)
+                   (lambda (&rest args) (push args calls)))
+                  ((symbol-function 'ebasecamp-command-port-conflicts)
+                   (lambda (&rest _)
+                     (cl-incf conflict-called)
+                     nil)))
+          (should (ebasecamp-ui-run-action 'stop))
+          (should (= 0 conflict-called))
+          (should (= 1 (length calls)))
+          (should (eq 'stop (nth 0 (car calls))))
+          (should (equal '("mysql/mysql-ro") (nth 2 (car calls)))))))))
+
+(ert-deftest ebasecamp-ui-test-run-action-down-needs-confirmation ()
+  "down 先开确认框不派发；确认后以 keys=nil 派发 down。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (ebasecamp-ui-open)
+      (ebasecamp-ui-test--select '("myapp/mysql/mysql"))
+      (let ((calls nil))
+        (cl-letf (((symbol-function 'ebasecamp-command-run)
+                   (lambda (&rest args) (push args calls))))
+          (should (ebasecamp-ui-run-action 'down))
+          (should-not calls)
+          (should (etaf-value (ebasecamp-ui-session-confirm
+                               (ebasecamp-ui-session))))
+          (should (eq 'down (ebasecamp-ui-session-confirm-action
+                             (ebasecamp-ui-session))))
+          (should (ebasecamp-ui-confirm))
+          (should (= 1 (length calls)))
+          (should (eq 'down (nth 0 (car calls))))
+          (should (null (nth 2 (car calls))))
+          (should-not (etaf-value (ebasecamp-ui-session-confirm
+                                   (ebasecamp-ui-session))))
+          (should-not (ebasecamp-ui-session-confirm-action
+                       (ebasecamp-ui-session))))))))
+
+(ert-deftest ebasecamp-ui-test-run-action-rejected-while-busy ()
+  "busy 期间再次 run-action 返回 nil，且命令只派发一次。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (ebasecamp-ui-open)
+      (ebasecamp-ui-test--select '("myapp/mysql/mysql"))
+      (let ((calls nil))
+        (cl-letf (((symbol-function 'ebasecamp-command-run)
+                   (lambda (&rest args) (push args calls)))
+                  ((symbol-function 'ebasecamp-command-port-conflicts)
+                   (lambda (&rest _) nil)))
+          (should (ebasecamp-ui-run-action 'start))
+          (should (ebasecamp-ui-test--busy))
+          (should-not (ebasecamp-ui-run-action 'start))
+          (should (= 1 (length calls)))
+          (let ((notice (ebasecamp-ui-test--notice)))
+            (should (eq 'info (plist-get notice :kind)))
+            (should (equal "操作进行中" (plist-get notice :title)))))))))
+
+(ert-deftest ebasecamp-ui-test-on-complete-clears-busy ()
+  "on-complete 回调把 busy 复位为 nil 并写 notice。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (ebasecamp-ui-open)
+      (ebasecamp-ui-test--select '("myapp/mysql/mysql"))
+      (let ((complete nil))
+        (cl-letf (((symbol-function 'ebasecamp-command-run)
+                   (lambda (&rest args)
+                     (setq complete (plist-get (nthcdr 3 args) :on-complete))))
+                  ((symbol-function 'ebasecamp-command-port-conflicts)
+                   (lambda (&rest _) nil)))
+          (should (ebasecamp-ui-run-action 'start))
+          (should (ebasecamp-ui-test--busy))
+          (funcall complete (list :action 'start :project 'myapp :ok t :results nil))
+          (should-not (ebasecamp-ui-test--busy))
+          (let ((notice (ebasecamp-ui-test--notice)))
+            (should (eq 'info (plist-get notice :kind)))
+            (should (ebasecamp-ui-test--contains-p
+                     (plist-get notice :message) "完成"))))))))
 
 (provide 'ebasecamp-ui-tests)
 ;;; ebasecamp-ui-tests.el ends here
