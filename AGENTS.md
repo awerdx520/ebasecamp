@@ -2,10 +2,13 @@
 
 ## 项目概述
 
-ebasecamp 是 Emacs 的 Docker 环境分组管理插件：定义可复用的基础组件组，把组绑定到项目（可覆盖端口/环境变量/卷），在界面中按服务多选启动/停止/重启，并与项目 compose 文件做单向导入/导出。
+ebasecamp 是 Emacs 的 Docker 环境分组管理插件：定义可复用的基础组件组（**组**），在组内为具体项目声明一份**配置**（可覆盖端口/环境变量/卷），把配置关联到**项目**，在界面中按服务多选启动/停止/重启，并与项目 compose 文件做单向导入/导出。
+
+三层结构：**组 → 配置 → 项目**。组是全局第一等对象（不依赖任何项目即可见）；配置挂在组侧、关联一个项目；项目文件只描述项目自身。
 
 - UI 层使用 **etaf / etaf-ui**（Elisp UI 框架，在 Emacs buffer 内渲染）。
-- 清单（组与项目定义）以 **Elisp** 形式持久化在 `~/.config/ebasecamp/`（`groups.el` 与 `projects/*.el`）。
+- 清单（组与项目定义）以 **Elisp** 形式持久化在 `~/.config/ebasecamp/`：`groups.el` 用 `:configs` 声明「本组给了哪些项目」（元素 `(配置名 :project 项目名 :services 覆盖)`），`projects/*.el` 只写 `:title` / `:root`，不写 `:groups`。
+- 加载期物化：`ebasecamp-model-link-configs` 把每份配置转成 `(:group SYMBOL :scope SCOPE :service-overrides ALIST)` 组引用并入项目的 `groups` 槽，下游模块按既有 ref 语义读取。
 - 清单是唯一事实源，compose 文件是由清单派生的生成物。
 - 零外部依赖（除 etaf / etaf-ui）；YAML 只写不解析。
 
@@ -43,6 +46,7 @@ LOAD_PATH         = -L . -L lisp $(ELPA_LOAD_PATH)
 ```
 
 - `-L lisp` 让 `ebasecamp.el` 能直接 `require` `lisp/` 下的模块。
+- 单跑 ERT 时先 `(setq load-prefer-newer t)`（或 `make clean`），否则会加载目录里残留的旧 `.elc`，看到的是上一次编译的代码。
 - 所有验证均走 `emacs -Q --batch`，**不加载用户 init**；需要换 Emacs 版本或路径时用变量覆盖：`make check EMACS=/path/to/emacs STRAIGHT_BUILD=/path/to/build-XX.X`。
 - 修改 `Makefile` 后至少跑一次 `make check`，确认三个子目标行为未变。
 
@@ -58,12 +62,15 @@ LOAD_PATH         = -L . -L lisp $(ELPA_LOAD_PATH)
 6. **清单只保存引用**：`${VAR}` 引用与相对路径原样保留；插件不读取、不打印、不落盘任何密钥值。
 7. **`docker ps` 解析必须带 `--no-trunc`**：否则容器 ID 被截断，标签与状态归属判定失效。
 8. **`config -q` 校验须同时检查退出码与 stderr**：退出码 0 不足以判定通过（存在 stderr 有输出但退出码为 0 的情形）。
+9. **组与项目的关联只在组侧声明**（`:configs` 的 `:project`）；项目文件不再写 `:groups` 关联（旧写法保留兼容，但同一项目对同一组重复引用一律加载报错 `ebasecamp-config-duplicate-group-ref`，不做静默合并）。
+10. **shared 组至多 1 份配置，且该配置的 `:project` 必填**（宿主，仅作渲染上下文与容器标签归属，非业务绑定）；多份直接报加载错误。
+11. **物化产物键名必须为 `:service-overrides`**（形态 `(:group SYMBOL :scope SCOPE :service-overrides ALIST)`）——写 `:services` 会导致覆盖被 `ebasecamp-model-resolve-services` / `ebasecamp-compose-render` / `ebasecamp-import` 静默丢弃。
 
 ## 当前状态
 
-- 进行中计划：`openspec/active/ebasecamp-m1-m3.md`（含任务清单与「## 当前状态」区块）
+- 进行中计划：`openspec/active/2026-10-22-group-centric-ui.md`（含任务清单与「## 当前状态」区块）。v0.2 已完成批次 A–E（A/B/D/C/E1–E5），C7 目检待用户确认。
 - 决策日志：`openspec/decisions.md`
-- 架构决策：`docs/adr/0001-architecture.org`
+- 架构决策：`docs/adr/0001-architecture.org`（分层与同步模型）、`docs/adr/0002-group-configs.org`（组内配置与加载期物化）
 - 技术债：`openspec/tech-debt.md`
 
 每批次完成必须更新计划文件的「## 当前状态」区块。

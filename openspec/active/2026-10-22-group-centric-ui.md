@@ -2,11 +2,11 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 批次 E 进行中（E1–E3 完成）· C7 待做
+- 阶段：Phase 3（Implement）· 批次 E 完成（E1–E5）· C7 待做
 - 已确认：方案 V3 ✅（用户 2026-10-22）、计划 ✅（用户 2026-10-22 确认；plan-reviewer 三轮审查通过）
-- 已完成：批次 A（加载修复）、批次 B（模型 + 物化 + 加载集成）、批次 D（导入/导出往返，含 D4 env_file、D5 渲染判据、D6 同名桶合并三个阻断缺陷修复）、C0（组为中心的会话与视图骨架）、C1/C2（`ebasecamp-data-group-instances` 组配置实例装配）、C3（段渲染：每份配置一个 `etaf-panel` + 服务表）、C4（段内派发：段内按钮按该段自己的 project 派发到 `ebasecamp-command-run`）、C5（底栏导入/导出/销毁 + 派发路径统一 + 旧项目视图接口迁移）、C6（删除 ETAF Data 适配层，`ebasecamp-data` 收敛为纯装配层）、E1（文档批次：`architecture.org` / `user-guide.org` / `compose-generation.org` 重写、`troubleshooting.org` 新建，共 1389 行）、E2（`Readme.org` 全量重写）、E3（`CHANGELOG.md` 0.2.0 + 三处版本/注释漂移收敛）
-- 测试基线：299 tests 全绿（E2–E3 只改文档/注释/版本号，用例数与 299 一致）
-- 下一步：E4（`docs/adr/0002-group-configs.md` + `openspec/decisions.md`）、E5（`openspec/tech-debt.md` 三条）、E6（归档）；C7（界面测试重写 + 用户目检）仍未完成
+- 已完成：批次 A（加载修复）、批次 B（模型 + 物化 + 加载集成）、批次 D（导入/导出往返，含 D4 env_file、D5 渲染判据、D6 同名桶合并三个阻断缺陷修复）、C0（组为中心的会话与视图骨架）、C1/C2（`ebasecamp-data-group-instances` 组配置实例装配）、C3（段渲染：每份配置一个 `etaf-panel` + 服务表）、C4（段内派发：段内按钮按该段自己的 project 派发到 `ebasecamp-command-run`）、C5（底栏导入/导出/销毁 + 派发路径统一 + 旧项目视图接口迁移）、C6（删除 ETAF Data 适配层，`ebasecamp-data` 收敛为纯装配层）、E1（文档批次：`architecture.org` / `user-guide.org` / `compose-generation.org` 重写、`troubleshooting.org` 新建，共 1389 行）、E2（`Readme.org` 全量重写）、E3（`CHANGELOG.md` 0.2.0 + 三处版本/注释漂移收敛）、E4（`docs/adr/0002-group-configs.org` + `decisions.md` 决策与 4 条否决备选 + `AGENTS.md` 三层描述/不变量 9–11/当前状态 + `Version:` 头统一 0.2.0）、E5（`tech-debt.md` #24–#26）
+- 测试基线：299 tests 全绿（E2–E5 只改文档/注释/版本号，用例数与 299 一致）
+- 下一步：仅剩 C7（界面测试重写 + 用户目检）与 E6（归档）两步
 - 待用户：A4 重启 Emacs 后 `M-x ebasecamp` 目检
 
 
@@ -186,10 +186,12 @@
 - [x] E3 `CHANGELOG.md` 追加 0.2.0：模型新增 `:configs`、界面改为组为中心、旧写法兼容、加载修复说明
       （依赖：E1）验收：条目按 Keep a Changelog 分类
       （完成 2026-10-23）`CHANGELOG.md` 新增 `## [0.2.0] - 2026-10-23`（0.1.0 条目原文保持不动），按 Keep a Changelog 分五节：*新增*（`:configs` 模型与访问器、加载期物化与五类物化期校验、组为中心主界面、`ebasecamp-data-group-instances`、段内派发、底栏与 `completing-read` 选项目、导入落盘改组内配置写法、文档批次）、*变更*（关联方向反转、界面骨架、导出/销毁选项目、`ebasecamp-data` 收敛为纯装配层并删 9 个 ETAF Data 适配定义、`--mapping-p` 判据收紧、入口注释与版本号）、*修复*（D5 绑定宿主 IP 端口导出失败、D4 `env_file` 往返失败、D6 `ports`/`volumes` 重复键、重复引用同组改报错、批次 A `M-x ebasecamp` 命令不存在）、*移除*（项目 tab / 操作条 / 旧项目视图接口 11 个符号 / ETAF Data 适配 / `ebasecamp-import--imported-group-title`）、*兼容性*（旧 `:groups` 可用；重复引用同组改报错；D4 前导入的清单需重新导入；同项目同组单配置；shared 单配置且 `:project` 必填；配置不覆盖 scope；示例清单仍是旧写法）。附带收敛三处漂移（只改注释/版本号，零逻辑变更）：① `ebasecamp.el` `Version: 0.1.0 → 0.2.0`，Commentary 由「项目 → 组 → 服务」改述为「组 → 配置 → 项目」、常用命令表补 `ebasecamp-ui-close` 与底栏三入口、`ebasecamp` 命令 docstring 同步；② `lisp/ebasecamp-ui.el` Commentary（1–60 行区段）改写为当前布局（含底栏 / 提示区 / 确认框）、`state` ref 刷新、段内派发与底栏派发路径，删除 `ebasecamp-ui-run-action` / `ebasecamp-ui--run-action` / 「底栏留 C5」等已删符号叙述；③ 同文件行内注释与 docstring（原 813 / 900 行附近及 346 / 687 / 735 / 1195 行的 `（C4）`/`（C5）`/`（D5）` 阶段标记、`ebasecamp-ui-current-project` 兼容层引用、`操作条` 字样）改为当前语义。`make check` 全绿 299/299（check-parens OK 22 files、compile 零 warning）
-- [ ] E4 `docs/adr/0002-group-configs.md` + `openspec/decisions.md`：记录「配置挂组侧 + 加载期物化」的决策与备选方案（虚拟项目、配置独立第三类清单）及否决理由
+- [x] E4 `docs/adr/0002-group-configs.org` + `openspec/decisions.md`：记录「配置挂组侧 + 加载期物化」的决策与备选方案（虚拟项目、配置独立第三类清单）及否决理由
       （依赖：E1）验收：ADR 含 Context/Decision/Consequences
-- [ ] E5 `openspec/tech-debt.md`：新增 shared 组多配置、同项目多实例、UI 无清单编辑器
+      （完成 2026-10-23）① 新建 `docs/adr/0002-group-configs.org`（对齐 0001 的 `#+title` / `#+date` / `#+status` 头 + 中文标题体），章节为「背景 / 决策 / 后果 / 备选方案与否决理由 / 状态」：背景写 v0.1 项目侧 `:groups` 的两个问题（组只有被引用才可见、覆盖散落无法从组视角读）；决策 5 条（配置挂组侧 `:configs ((NAME :project P :services …))`、`ebasecamp-model-link-configs` 加载期物化、下游五个读取点零改动并以表格逐个给出 `file:line`（`compose.el:244` `--group-refs` / `compose.el:208` `--ref-scope` / `command.el:176` `--selection` / `data.el:135` `project-records` / `export.el:105` `--per-project-refs`）、关联方向单一、五类加载期校验）；后果分正面 5 条（组为全局第一等对象、关联方向单一、覆盖集中、下游零改动、旧清单可用）与负面/约束 4 条（同项目同组 1 份、shared 1 份且 `:project` 必填、配置无 `:scope` 的 D9 表达力不对称、旧清单需迁移提示）；备选方案 A–D 逐个写清否决理由（保持现状 / 虚拟项目 / 独立第三类清单 `configs.el` / 只改 UI）；状态 Accepted（2026-10-23），相关 D2/D4/D6 与技术债 #21–#23。文件扩展名按 `decisions.md` 2026-10-22 条「`docs/` 统一 `.org`」的约定取 `.org`（计划原文写 `.md`，以该约定为准）。② `openspec/decisions.md` 追加 5 行（2026-10-23）：主决策行（决策 = 组内配置 + 加载期物化；理由 3 条 = 组为第一等对象 / 关联方向单一覆盖集中 / 物化同构使五个读取点零改动；详见 ADR-0002）+ 4 行否决备选（一行一条，逐条给否决理由，均指向 ADR-0002），沿用现有四列表格。③ `AGENTS.md` 四处更新：项目概述改「组 → 配置 → 项目」三层并补 `:configs` 与 `projects/*.el` 只写 `:title`/`:root`；不变量清单顺延补第 9–11 条；当前状态指向 `2026-10-22-group-centric-ui.md` 并记「A–E 已完成、C7 待目检」、架构决策补 0002；开发命令补 `(setq load-prefer-newer t)` 提示。④ 统一 `Version:` 头：`lisp/*.el` 10 个文件 `0.1.0 → 0.2.0`（`ebasecamp.el` 原已 0.2.0，未改），`git diff` 每文件仅 1 行，零逻辑变更
+- [x] E5 `openspec/tech-debt.md`：新增 shared 组多配置、同项目多实例、UI 无清单编辑器
       （依赖：E1）验收：三条均含影响与触发条件
+      （完成 2026-10-23）追加 #24 / #25 / #26（承接原最大编号 #23）：#24 shared 组多配置表达（影响：只能拆组或退回旧 `:groups`；处置：M4 评估「配置级容器命名维度」后再放开）；#25 同一项目对同一组的多实例（标签缺配置/实例维度，需新增 `ebasecamp.config` 与容器命名规则属破坏性变更，须给迁移或 `ebasecamp-prune` 清理路径；处置：M4 与 #24 合并设计）；#26 界面不做清单编辑（`groups.el` / `projects/*.el` 只能手工改、未关联项目只读展示；处置：M4 视需求提供「新增配置 / 改 `:project` 与 `:services`」的最小能力，落盘走既有自校验路径，不做全量编辑器）。另按验收核对既有条目：#20（flaky `run-sync-captures-streams`）在原表内且编号与内容一致，无需修正；#21–#23 均为「已修复（D5/D4 遗留/D6）」形态，与 ADR 0002 的「相关」指涉一致
 - [ ] E6 归档：本计划移入 `openspec/completed/`；`openspec/active/ebasecamp-m1-m3.md` 的 T5.2 标注「由 v0.2 计划 E1 承接」并归档
       （依赖：E1–E5）验收：`openspec/active/` 为空；两个计划都在 `completed/`
 

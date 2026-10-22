@@ -240,9 +240,10 @@ ebasecamp 是 Emacs 里的 Docker 环境分组管理插件。v0.2 起，模型�
 * 相关文档
 
 - [[file:adr/0001-architecture.org][ADR-0001 架构与同步模型]]
+- [[file:adr/0002-group-configs.org][ADR-0002 组内配置与加载期物化]]
 - [[file:compose-generation.org][compose 生成与导入导出规则]]
 - [[file:user-guide.org][用户指南]]
-- [[file:troubleshooting.org][故障排查]]（E1 后半待写）
+- [[file:troubleshooting.org][故障排查]]
 - [[file:../AGENTS.md][AGENTS.md 仓库地图与不变量]]
 - [[file:../openspec/active/2026-10-22-group-centric-ui.md][v0.2 组为中心计划（设计决策 D1–D9）]]
 - [[file:../openspec/tech-debt.md][技术债清单]]

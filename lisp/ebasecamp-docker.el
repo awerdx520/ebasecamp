@@ -1,7 +1,7 @@
 ;;; ebasecamp-docker.el --- ebasecamp docker CLI 进程封装与输出解析 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 

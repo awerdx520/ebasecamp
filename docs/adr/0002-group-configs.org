@@ -1,0 +1,94 @@
+#+title: ADR-0002 组内配置（group-side configs）与加载期物化
+#+date: 2026-10-23
+#+status: 已接受
+
+* 背景
+
+v0.1 把「组 → 项目」的关联写在*项目侧*：组的复用与项目级覆盖都在 =projects/*.el= 里，形如
+
+#+begin_src elisp
+(ebasecamp-define-project myapp
+  :title "示例项目"
+  :root "~/Workspace/myapp"
+  :groups ((mysql :services ((mysql :ports ((3307 . 3306)))))))
+#+end_src
+
+这种写法带来两个具体问题：
+
+1. *组只有被项目引用才可见*。组定义好后若没有任何项目引用它，界面上无从发现，用户也无法回答「我定义了哪些可复用组件」。组的可见性取决于别人的文件，与「组是复用单元」的定位矛盾。
+2. *覆盖散落、无法从组视角读出*。同一个组在不同项目里的覆盖（端口、环境变量、卷）分散在各项目文件中，「这个组给了哪些项目、各自的覆盖是什么」只能靠人肉 grep 汇总。
+
+v0.2 的产品目标是把主界面由「项目 → 组 → 服务」反转为「*组 → 配置 → 项目*」。这要求组成为全局第一等对象（不依赖任何项目即可见），且关联信息集中到组侧可读。因此数据模型必须调整关联方向。
+
+* 决策
+
+1. *配置挂在组侧*：=ebasecamp-define-group= 新增 =:configs=，元素为 =(配置名 . plist)=；plist 允许的键仅 =:project=（必填）与 =:services=（服务覆盖，格式与既有组引用的 =:services= 完全一致）。
+
+#+begin_src elisp
+(ebasecamp-define-group mysql
+  :title "MySQL"
+  :scope per-project
+  :services ((mysql :image "mysql:8.4"
+                    :ports ((3306 . 3306))
+                    :environment (("MYSQL_ROOT_PASSWORD"
+                                   . "${EBASECAMP_MYSQL_ROOT_PASSWORD}"))))
+  :configs ((dev  :project myapp :services ((mysql :ports ((3307 . 3306)))))
+            (test :project other :services ((mysql :ports ((3308 . 3306)))))))
+
+(ebasecamp-define-project myapp
+  :title "示例项目"
+  :root "~/Workspace/myapp")
+#+end_src
+
+2. *加载期物化（materialize）*：=ebasecamp-config-load= 在加载完 =groups.el= 与 =projects/*.el= 之后调用 =ebasecamp-model-link-configs=，把每份通过校验的配置转换成与 =ebasecamp-model--group-ref-from-spec= *完全同构*的组引用
+
+#+begin_src elisp
+(:group SYMBOL :scope SCOPE :service-overrides ALIST)
+#+end_src
+
+并 =append= 到对应项目的 =groups= 槽末尾。旧写法（项目侧 =:groups=）保留兼容，视作「匿名配置」，加载时先登记项目侧引用、再物化配置侧，因此物化结果恒为「项目侧在前、配置侧在后」。
+
+3. *下游零改动*：物化产物与旧 ref 同构，下游读取点无需任何修改（已逐个核实）：
+
+| 读取点 | 位置 | 读什么 |
+|---+---+---|
+| =ebasecamp-compose-render= → =ebasecamp-compose--group-refs= | =lisp/ebasecamp-compose.el:244= | 遍历 =PROJECT.groups= 取 ref |
+| =ebasecamp-compose--ref-scope= | =lisp/ebasecamp-compose.el:208= | ref 的 =:scope= |
+| =ebasecamp-command--selection= | =lisp/ebasecamp-command.el:176= | =cl-find … :group= 取首个 ref 的覆盖 |
+| =ebasecamp-data-project-records= | =lisp/ebasecamp-data.el:135= | ref 的 =:service-overrides= |
+| =ebasecamp-export--per-project-refs= | =lisp/ebasecamp-export.el:105= | ref 的 =:group= / =:scope= |
+
+4. *关联方向单一*：关联只在组侧声明（=:configs= 的 =:project=）；=projects/*.el= 只写 =:title= / =:root=。导入落盘同样遵守此约定（=ebasecamp-import--apply= 写 =:configs= 而不写 =:groups=）。
+5. *约束由加载期校验兑现*（任一条命中即记入 =:errors=，不中断其余项）：
+   - 同一项目 + 同一组只允许 *1 个引用*（=ebasecamp-config-duplicate-group-ref=）；
+   - =shared= 组至多 1 份配置，且该配置的 =:project= 必填（宿主语义）；
+   - 配置不提供 =:scope=（scope 恒等于组定义值）；
+   - 配置覆盖的服务名必须在组内存在。
+
+* 后果
+
+** 正面
+
+- *组成为全局第一等对象*：未关联任何项目的组也能在左栏列出（只读展示其默认服务），组的可见性不再取决于别人的文件。
+- *关联方向单一*：一处声明、一处可读。要回答「这个组给了哪些项目」，读 =:configs= 即可，无需跨文件汇总。
+- *覆盖集中*：同一组的各项目覆盖并列在组定义内，差异一眼可见、便于对齐。
+- *下游零改动*：物化把新模型收敛在 model / config 两个模块内，compose / command / data / export 完全复用既有 ref 语义，风险面最小。
+- *旧清单可用*：项目侧 =:groups= 保留兼容，迁移可增量进行。
+
+** 负面 / 约束
+
+- *同一项目同一组只允许 1 份配置*。容器标签只有 =ebasecamp.project/group/service/scope=，没有配置维度，服务名会撞；=ebasecamp-command--selection= 与 =ebasecamp-compose-render= 都是「取首个」，双引用会让后一份覆盖静默丢失，因此改为加载即报错（D2）。同一项目要多套同名服务需等 M4 引入 =ebasecamp.config= 标签（见技术债 #25）。
+- *=shared= 至多 1 份配置且 =:project= 必填*。共享生成物恒为 =_shared/compose.yaml= 与 compose 项目名 =ebc-shared=，多宿主会互相覆盖生成物与容器集合；=:project= 仅作渲染上下文与容器标签归属，非业务绑定。无法表达「同一 shared 组在不同项目需要不同覆盖」（见技术债 #24）。
+- *配置不提供 =:scope=*（D9，表达力不对称）。ref 级 =:scope= 覆盖在旧写法（项目侧 =:groups=）中仍可用，因此「同一组在不同项目需要不同 scope」需走旧写法或拆成两个组。这是有意的取舍：彻底消除「配置 scope 与组 scope 不一致」的歧义，代价是能力上的一处不对称，迁移时不得当作能力倒退。
+- *旧清单需迁移提示*：仍在项目侧写 =:groups= 的清单能加载，但组视角看不到配置名（只显示匿名配置）；导入落盘的 v0.1 清单需重新导入才转成组内配置写法（见 =docs/troubleshooting.org=）。
+
+* 备选方案与否决理由
+
+- *A. 保持现状（项目侧 =:groups=）*：否决。关联方向与产品目标相反 —— 组的可见性仍然取决于是否被引用，「从组视角看覆盖」无法实现，v0.2 的界面反转失去数据基础。
+- *B. 引入「虚拟项目」承载无宿主的 shared 配置*：否决。为了让 =:project= 可省略而造一个隐式概念，渗入 model / compose / command / data / ui 全部模块（要到处判断「这是真实项目还是虚拟项目」），复杂度收益比极差；改用「=:project= 必填 + 文案说明宿主仅作渲染与标签归属」即可覆盖同一场景。
+- *C. 配置独立成第三类清单（=configs.el=）*：否决。组、配置、项目三张表要互相对齐，加载顺序与引用完整性校验复杂度上升（组侧表 + 配置侧表 + 项目侧表的三方校验），而配置天然从属于组（配置名在组内唯一、覆盖的是该组的服务），拆表没有带来任何表达力收益。
+- *D. 只改 UI 不改模型（把项目侧 ref 当配置展示）*：否决。界面能显示「配置」条目，但用户写清单时仍必须从项目出发组织，无法先定义组再挂项目；展示层语义与清单层语义错位，等于把模型缺陷留给用户记忆承担。
+
+* 状态
+
+*已接受*（2026-10-23）。相关：D2 / D4 / D6 缺陷修复（同一项目重复引用同组改报错、=env_file= 形态变更、同名 =ports=/=volumes= 桶合并），技术债 #21–#23（=--mapping-p= 判据收紧、=env_file= 对象字段、同名桶合并）。完整算法与校验列表见 =openspec/active/2026-10-22-group-centric-ui.md= 的「加载期物化算法」节。

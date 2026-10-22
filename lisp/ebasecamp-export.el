@@ -1,7 +1,7 @@
 ;;; ebasecamp-export.el --- ebasecamp 导出（清单 → 部署用 compose） -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
