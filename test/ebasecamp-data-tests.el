@@ -1,8 +1,10 @@
-;;; ebasecamp-data-tests.el --- ebasecamp ETAF Data 适配层测试 -*- lexical-binding: t; -*-
+;;; ebasecamp-data-tests.el --- ebasecamp 清单 ∪ 状态记录装配层测试 -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 
-;; T2.3：Data 层改为「清单 ∪ 状态」语义后的 ERT 测试。
+;; T2.3：「清单 ∪ 状态」记录装配的 ERT 测试。C6 起 ETAF Data 适配层
+;; （source / controller / load / 过滤 / 分页）已删除，本套测试只覆盖纯装配
+;; API：记录装配、组配置实例装配与纯函数辅助。
 ;;
 ;; 记录来源不再是 `docker ps' 的产物，而是**清单里定义的服务**：清单有定义
 ;; 但未启动的服务必须出现，且 `:state' 为 "stopped"。因此每个用例都先构造
@@ -20,14 +22,13 @@
 ;;
 ;; 记录总数 5；项目名字典序 myapp < other < site。
 ;;
-;; 定时器纪律：本模块不持有轮询（轮询归 `ebasecamp-status'），测试只需保证
-;; 每个 controller 都被 `etaf-data-stop' 收尾。
+;; 纯函数纪律：本模块不持有轮询、不起定时器、不加载 UI 框架；测试全部是
+;; 对纯装配函数及其辅助函数的直接调用。
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'ert)
-(require 'etaf)
 (require 'ebasecamp-model)
 (require 'ebasecamp-data)
 
@@ -88,9 +89,11 @@ PROJECT / GROUP / SERVICE 为标签值，STATE / HEALTH 为容器状态，ID 为
            (ebasecamp-status--last-error nil))
        ,@body)))
 
-(defun ebasecamp-data-test--load-function ()
-  "取 `ebasecamp-data-source' 的 `:load' 回调。"
-  (plist-get (etaf-data-source-capabilities (ebasecamp-data-source)) :load))
+(defun ebasecamp-data-test--by-group (records group)
+  "返回 RECORDS 中 `:group' 等于 GROUP 的记录（保持原顺序）。"
+  (cl-remove-if-not
+   (lambda (record) (equal group (plist-get record :group)))
+   records))
 
 (defun ebasecamp-data-test--services (records)
   "返回 RECORDS 的服务名字符串列表。"
@@ -110,18 +113,7 @@ PROJECT / GROUP / SERVICE 为标签值，STATE / HEALTH 为容器状态，ID 为
            :key (lambda (record) (plist-get record :service))
            :test #'equal))
 
-;;; 1. source 对象
-
-(ert-deftest ebasecamp-data-test-source-shape ()
-  "source 是合法 ETAF Data source：`:load' / `:item-key' 为函数、provider 为 ebasecamp。"
-  (let* ((source (ebasecamp-data-source))
-         (capabilities (etaf-data-source-capabilities source)))
-    (should (etaf-data-source-p source))
-    (should (functionp (plist-get capabilities :load)))
-    (should (functionp (plist-get capabilities :item-key)))
-    (should (eq (plist-get capabilities :provider) 'ebasecamp))))
-
-;;; 2. 清单 ∪ 状态：清单有定义、docker 无容器
+;;; 1. 清单 ∪ 状态：清单有定义、docker 无容器
 
 (ert-deftest ebasecamp-data-test-manifest-only-services-are-stopped ()
   "清单有 2 个服务但 docker 无任何容器 → 2 条记录，state 均为 \"stopped\"。"
@@ -129,7 +121,7 @@ PROJECT / GROUP / SERVICE 为标签值，STATE / HEALTH 为容器状态，ID 为
     (ebasecamp-data-test--with-status nil
       (let* ((records (ebasecamp-data-project-records 'myapp))
              ;; myapp 引用 mysql（2 服务）+ redis（1 服务），这里只取 mysql 组
-             (group (ebasecamp-data--filter records '(:group "mysql"))))
+             (group (ebasecamp-data-test--by-group records "mysql")))
         (should (= 2 (length group)))
         (should (equal '("mysql" "mysql-ro")
                        (ebasecamp-data-test--services group)))
@@ -148,7 +140,7 @@ PROJECT / GROUP / SERVICE 为标签值，STATE / HEALTH 为容器状态，ID 为
         (list (ebasecamp-data-test--container "myapp" "mysql" "mysql"
                                               "running" "healthy" "abc123"))
       (let* ((records (ebasecamp-data-project-records 'myapp))
-             (group (ebasecamp-data--filter records '(:group "mysql")))
+             (group (ebasecamp-data-test--by-group records "mysql"))
              (running (cl-find "mysql" group
                                :key (lambda (r) (plist-get r :service))
                                :test #'equal))
@@ -164,7 +156,7 @@ PROJECT / GROUP / SERVICE 为标签值，STATE / HEALTH 为容器状态，ID 为
         (should (equal "stopped" (plist-get stopped :state)))
         (should (null (plist-get stopped :id)))))))
 
-;;; 3. desired-ports 渲染
+;;; 2. desired-ports 渲染
 
 (ert-deftest ebasecamp-data-test-desired-ports ()
   "desired-ports 由服务 ports 渲染：单端口 \"A:B\"，多端口逗号连接，无端口为 nil。"
@@ -183,7 +175,7 @@ PROJECT / GROUP / SERVICE 为标签值，STATE / HEALTH 为容器状态，ID 为
         (should (equal "8080:80,8443:443"
                        (plist-get (car site) :desired-ports)))))))
 
-;;; 4. 排序稳定
+;;; 3. 排序稳定
 
 (ert-deftest ebasecamp-data-test-project-records-order ()
   "project-records 先按 group 字典序、再按 service 字典序排序。"
@@ -195,159 +187,57 @@ PROJECT / GROUP / SERVICE 为标签值，STATE / HEALTH 为容器状态，ID 为
         ;; 幂等：重复调用顺序完全一致
         (should (equal records (ebasecamp-data-project-records 'myapp)))))))
 
-;;; 5. load 回调的 query 语义
-
-(ert-deftest ebasecamp-data-test-load-all ()
-  "query 为 nil 时返回所有项目的记录（按项目名字典序），并带分页字段。"
-  (ebasecamp-data-test--with-manifest
-    (ebasecamp-data-test--with-status nil
-      (let* ((load (ebasecamp-data-test--load-function))
-             (result (funcall load nil 1 20)))
-        (should (= 5 (length (plist-get result :items))))
-        (should (= 5 (plist-get result :total)))
-        (should (= 1 (plist-get result :page)))
-        (should (= 20 (plist-get result :page-size)))
-        (should (equal '("myapp" "myapp" "myapp" "other" "site")
-                       (mapcar (lambda (r) (plist-get r :project))
-                               (plist-get result :items))))))))
-
-(ert-deftest ebasecamp-data-test-load-project-string ()
-  "query 为字符串时取该项目记录（清单顺序 → group/service 排序）。"
-  (ebasecamp-data-test--with-manifest
-    (ebasecamp-data-test--with-status nil
-      (let* ((load (ebasecamp-data-test--load-function))
-             (result (funcall load "myapp" 1 20)))
-        (should (equal 3 (length (plist-get result :items))))
-        (should (= 3 (plist-get result :total)))
-        (should (equal '("mysql" "mysql-ro" "redis")
-                       (ebasecamp-data-test--services
-                        (plist-get result :items))))))))
-
-(ert-deftest ebasecamp-data-test-load-project-symbol ()
-  "query 为 symbol 时同样按项目名取记录。"
-  (ebasecamp-data-test--with-manifest
-    (ebasecamp-data-test--with-status nil
-      (let* ((load (ebasecamp-data-test--load-function))
-             (result (funcall load 'other 1 20)))
-        (should (equal '("redis")
-                       (ebasecamp-data-test--services
-                        (plist-get result :items))))))))
-
-(ert-deftest ebasecamp-data-test-load-plist-query ()
-  "query 为 plist 时先按 `:project' 取项目，再按其余键逐条过滤。"
-  (ebasecamp-data-test--with-manifest
-    (ebasecamp-data-test--with-status nil
-      (let ((load (ebasecamp-data-test--load-function)))
-        (let ((result (funcall load '(:project "myapp" :group "mysql") 1 20)))
-          (should (equal 2 (length (plist-get result :items))))
-          (should (= 2 (plist-get result :total))))
-        (let ((result (funcall load '(:project "myapp" :group "redis") 1 20)))
-          (should (equal 1 (length (plist-get result :items)))))
-        (let ((result (funcall load '(:project "myapp" :group "nope") 1 20)))
-          (should (null (plist-get result :items)))
-          (should (= 0 (plist-get result :total))))
-        ;; 不给 :project 时跨项目过滤
-        (let ((result (funcall load '(:group "redis") 1 20)))
-          (should (equal 2 (length (plist-get result :items))))
-          (should (equal '("myapp" "other")
-                         (mapcar (lambda (r) (plist-get r :project))
-                                 (plist-get result :items)))))))))
-
-(ert-deftest ebasecamp-data-test-load-unknown-project ()
-  "query 指向不存在的项目时返回空结果，不报错。"
-  (ebasecamp-data-test--with-manifest
-    (let* ((load (ebasecamp-data-test--load-function))
-           (result (funcall load 'nope 1 20)))
-      (should (null (plist-get result :items)))
-      (should (= 0 (plist-get result :total))))))
-
-(ert-deftest ebasecamp-data-test-load-paging ()
-  "分页参数生效：page-size 为 1、page 为 2 时返回第二条记录。"
-  (ebasecamp-data-test--with-manifest
-    (ebasecamp-data-test--with-status nil
-      (let* ((load (ebasecamp-data-test--load-function))
-             (result (funcall load nil 2 1)))
-        (should (equal 1 (length (plist-get result :items))))
-        (should (equal '("mysql-ro")
-                       (ebasecamp-data-test--services
-                        (plist-get result :items))))
-        (should (= 5 (plist-get result :total)))))))
-
-;;; 6. controller 集成
-
-(ert-deftest ebasecamp-data-test-controller-load ()
-  "controller 加载后 items / total 与清单一致，set-query 后重载生效。"
-  (ebasecamp-data-test--with-manifest
-    (ebasecamp-data-test--with-status nil
-      (let ((controller (etaf-data-controller (ebasecamp-data-source)
-                                              :auto-load nil)))
-        (unwind-protect
-            (progn
-              (should (etaf-data-load controller))
-              (should (= 5 (length (etaf-value (etaf-data-items controller)))))
-              (should (= 5 (etaf-value (etaf-data-total controller))))
-              (etaf-data-set-query controller "myapp")
-              (should (etaf-data-load controller))
-              (should (= 3 (length (etaf-value (etaf-data-items controller)))))
-              (should (= 3 (etaf-value (etaf-data-total controller)))))
-          (etaf-data-stop controller))))))
-
-;;; 7. refresh 走最新快照
-
-(ert-deftest ebasecamp-data-test-refresh-picks-new-snapshot ()
-  "refresh 采新快照后重载：容器从 0 个变 1 个 running，记录状态同步变化。"
-  (ebasecamp-data-test--with-manifest
-    (let ((containers nil))
-      (cl-letf (((symbol-function 'ebasecamp-docker-ps)
-                 (lambda () containers)))
-        (let ((controller (etaf-data-controller (ebasecamp-data-source)
-                                                :auto-load nil))
-              (ebasecamp-status--last-records nil)
-              (ebasecamp-status--last-error nil))
-          (unwind-protect
-              (progn
-                (should (etaf-data-load controller))
-                (should (= 5 (length (etaf-value (etaf-data-items controller)))))
-                (let ((stopped (etaf-value (etaf-data-items controller))))
-                  (should (cl-every (lambda (record)
-                                      (equal "stopped" (plist-get record :state)))
-                                    stopped)))
-                (setq containers
-                      (list (ebasecamp-data-test--container
-                             "myapp" "mysql" "mysql" "running" "healthy"
-                             "abc123")))
-                (should (ebasecamp-data-refresh controller))
-                (let ((loaded (etaf-value (etaf-data-items controller)))
-                      (running nil))
-                  (should (= 5 (length loaded)))
-                  (dolist (record loaded)
-                    (when (equal "running" (plist-get record :state))
-                      (setq running record)))
-                  (should running)
-                  (should (equal "myapp/mysql/mysql"
-                                 (ebasecamp-data--item-key running)))
-                  (should (equal "abc123" (plist-get running :id)))))
-            (etaf-data-stop controller)))))))
-
-;;; 8. item-key 稳定性
+;;; 4. item-key 稳定性
 
 (ert-deftest ebasecamp-data-test-item-key ()
   "item-key 为 \"project/group/service\"，同服务稳定、不同服务可区分。"
   (ebasecamp-data-test--with-manifest
     (ebasecamp-data-test--with-status nil
-      (let* ((source (ebasecamp-data-source))
-             (item-key (plist-get (etaf-data-source-capabilities source)
-                                  :item-key))
-             (records (ebasecamp-data-project-records 'myapp))
+      (let* ((records (ebasecamp-data-project-records 'myapp))
              (first (nth 0 records))
              (second (nth 1 records)))
-        (should (functionp item-key))
-        (should (equal "myapp/mysql/mysql" (funcall item-key first)))
-        (should (equal (funcall item-key first) (funcall item-key first)))
-        (should-not (equal (funcall item-key first)
-                           (funcall item-key second)))))))
+        (should (equal "myapp/mysql/mysql"
+                       (ebasecamp-data--item-key first)))
+        (should (equal (ebasecamp-data--item-key first)
+                       (ebasecamp-data--item-key first)))
+        (should-not (equal (ebasecamp-data--item-key first)
+                           (ebasecamp-data--item-key second)))))))
 
-;;; 9. 组配置实例装配
+;;; 5. 纯函数辅助：scope 回退 / 项目解析
+
+(ert-deftest ebasecamp-data-test-group-ref-scope ()
+  "组引用显式 `:scope' 优先，其次回退组定义的 scope，都没有时按 per-project。"
+  (ebasecamp-data-test--with-manifest
+    ;; 显式 scope 优先（mysql 定义为 shared，这里显式给 per-project）
+    (should (equal "per-project"
+                   (ebasecamp-data--group-ref-scope
+                    '(:group mysql :scope per-project))))
+    (should (equal "shared"
+                   (ebasecamp-data--group-ref-scope
+                    '(:group mysql :scope "shared"))))
+    ;; 无 `:scope' → 回退组定义（mysql = shared，redis = per-project）
+    (should (equal "shared"
+                   (ebasecamp-data--group-ref-scope '(:group mysql))))
+    (should (equal "per-project"
+                   (ebasecamp-data--group-ref-scope '(:group redis))))
+    ;; 组不存在 → 按 per-project
+    (should (equal "per-project"
+                   (ebasecamp-data--group-ref-scope
+                    '(:group no-such-group))))))
+
+(ert-deftest ebasecamp-data-test-resolve-project ()
+  "对象 / symbol / 字符串都解析到同一 ebasecamp-project；无法解析时 nil。"
+  (ebasecamp-data-test--with-manifest
+    (let ((object (ebasecamp-model-project 'myapp)))
+      (should (eq object (ebasecamp-data--resolve-project object)))
+      (should (eq object (ebasecamp-data--resolve-project 'myapp)))
+      (should (eq object (ebasecamp-data--resolve-project "myapp"))))
+    (should (null (ebasecamp-data--resolve-project nil)))
+    (should (null (ebasecamp-data--resolve-project 'no-such-project)))
+    (should (null (ebasecamp-data--resolve-project "no-such-project")))
+    (should (null (ebasecamp-data--resolve-project 42)))))
+
+;;; 6. 组配置实例装配
 
 ;; `ebasecamp-data-group-instances' 把「组 → 配置」翻译成 UI 可渲染的
 ;; 「组 → 配置实例」：每份配置一项，每项的 `:records' 与
@@ -429,8 +319,8 @@ PROJECT / GROUP / SERVICE 为标签值，STATE / HEALTH 为容器状态，ID 为
         (should (equal "c-sentinel" (plist-get sentinel :id)))
         ;; 对照：按 project 过滤的 project-records 看不到那条 running
         (let* ((project-records
-                (ebasecamp-data--filter
-                 (ebasecamp-data-project-records 'myapp) '(:group "cache")))
+                (ebasecamp-data-test--by-group
+                 (ebasecamp-data-project-records 'myapp) "cache"))
                (project-redis (ebasecamp-data-test--record-of
                                project-records "redis")))
           (should (equal "stopped" (plist-get project-redis :state))))))))
@@ -481,8 +371,8 @@ PROJECT / GROUP / SERVICE 为标签值，STATE / HEALTH 为容器状态，ID 为
       (let* ((instance (car (ebasecamp-data-group-instances 'cache)))
              (instance-records (plist-get instance :records))
              (project-records
-              (ebasecamp-data--filter
-               (ebasecamp-data-project-records 'myapp) '(:group "cache"))))
+              (ebasecamp-data-test--by-group
+               (ebasecamp-data-project-records 'myapp) "cache")))
         (should (= 2 (length project-records)))
         (should (= 2 (length instance-records)))
         (should (equal project-records instance-records))

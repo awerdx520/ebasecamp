@@ -1,4 +1,4 @@
-;;; ebasecamp-data.el --- ebasecamp 清单 ∪ 状态的 ETAF Data 适配 -*- lexical-binding: t; -*-
+;;; ebasecamp-data.el --- ebasecamp 清单 ∪ 状态记录的纯装配 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
 ;; Version: 0.1.0
@@ -7,11 +7,10 @@
 
 ;;; Commentary:
 
-;; 本模块把「清单」与「容器状态」合并成 UI 可直接消费的记录，并适配为
-;; ETAF Data 层的 source 与 controller（`etaf-data-grid' 等组件直接消费）。
-;; 只使用 etaf 的公开 API：`etaf-data-source' / `etaf-data-controller' /
-;; `etaf-data-load' / `etaf-data-set-query' / `etaf-data-items' /
-;; `etaf-data-total' / `etaf-data-stop'，不触碰 `etaf-data--' 私有函数。
+;; 本模块把「清单」与「容器状态」装配成 UI 可直接消费的记录。它是纯装配
+;; 层：不依赖任何 UI 框架，不做加载 / 查询 / 分页 / 轮询，也不持有全局资源。
+;; 界面层直接调用 `ebasecamp-data-project-records' 或
+;; `ebasecamp-data-group-instances' 取 plist 记录后自行渲染。
 ;;
 ;; 数据语义（T2.3 修正）：表格展示的是**清单里定义的服务**，而不是
 ;; `docker ps' 里恰好存在的容器。清单有定义但未启动的服务必须出现在表里，
@@ -35,19 +34,10 @@
 ;;
 ;; 职责边界：
 ;;
-;; - source 的 `:load' **只读**「最近一次成功快照」，不主动执行
-;;   `docker ps'。轮询归 `ebasecamp-status'：UI 在轮询回调里调
-;;   `etaf-data-load'，本模块不重复采集（避免一次刷新跑两次 docker ps）；
-;; - **本模块不起轮询**，controller 由 UI 持有（`:auto-load' 为 nil，
-;;   显式 load），销毁时调 `etaf-data-stop'；source 的 `:dispose' 为空 ——
-;;   没有任何全局资源。
-;;
-;; query 语义（`etaf-data-set-query' 可传的值）：
-;;
-;; - nil —— 所有项目的记录按项目名字典序拼接；
-;; - 字符串或 symbol —— 按项目名取该项目记录；
-;; - plist（如 `(:project "myapp" :group "mysql")'）—— 先按 `:project'
-;;   取得项目记录，再按其余键逐条 AND 过滤。
+;; - 记录只读「最近一次成功快照」（`ebasecamp-status-last-records'），不主动
+;;   执行 `docker ps'：轮询归 `ebasecamp-status'，本模块不重复采集（避免一次
+;;   刷新跑两次 docker ps）；
+;; - 除读快照外无 IO，不起定时器、不持 buffer、不缓存。
 ;;
 ;; item-key 为 "project/group/service"：容器 ID 在重启后变化，而三元组是
 ;; 选择状态的稳定身份（也是记录与状态记录的匹配键）。
@@ -55,7 +45,6 @@
 ;;; Code:
 
 (require 'cl-lib)
-(require 'etaf)
 (require 'ebasecamp-model)
 (require 'ebasecamp-status)
 
@@ -306,116 +295,6 @@ GROUP 可为 ebasecamp-group 对象、symbol 或字符串组名；组不存在�
                                 group-object project config-plist indexes))
                 instances)))
       (nreverse instances))))
-
-(defun ebasecamp-data--all-records ()
-  "返回所有项目记录的拼接，项目按名字典序排列。纯函数。"
-  (let ((names (sort (delq nil (mapcar
-                                (lambda (project)
-                                  (ebasecamp-data--name-string
-                                   (ebasecamp-project-name project)))
-                                (ebasecamp-model-projects)))
-                     #'string<))
-        (records nil))
-    (dolist (name names)
-      (setq records (append records (ebasecamp-data-project-records name))))
-    records))
-
-;;; 过滤与分页
-
-(defun ebasecamp-data--field-equal (key record value)
-  "记录 RECORD 的 KEY 字段是否等于 VALUE。
-KEY 为 `:project' / `:group' / `:service' 时按字符串比较（清单侧是 symbol），
-其余键用 `equal'。"
-  (if (memq key '(:project :group :service))
-      (equal (ebasecamp-data--name-string (plist-get record key))
-             (ebasecamp-data--name-string value))
-    (equal (plist-get record key) value)))
-
-(defun ebasecamp-data--filter (records query)
-  "按 QUERY 过滤记录列表 RECORDS，返回子列表（保持原顺序）。
-QUERY 为 nil 时不过滤；plist 时按给定键逐条 AND 过滤。"
-  (if (null query)
-      records
-    (cl-remove-if-not
-     (lambda (record)
-       (cl-loop for (key value) on query by #'cddr
-                always (ebasecamp-data--field-equal key record value)))
-     records)))
-
-(defun ebasecamp-data--slice (items page page-size)
-  "从 ITEMS 中取出 PAGE（1 起）与 PAGE-SIZE 指定的切片。纯函数。"
-  (let* ((page (max 1 (or page 1)))
-         (page-size (max 1 (or page-size 20)))
-         (start (* (1- page) page-size))
-         (end (+ start page-size))
-         (length (length items)))
-    (cl-subseq items (min start length) (min end length))))
-
-(defun ebasecamp-data--query-records (query)
-  "按 QUERY 取出候选记录列表（过滤与分页之前）。纯函数。
-nil 取全部项目；字符串/symbol 取单个项目；plist 先按 `:project' 取值
-（缺省时取全部），再由调用方按其余键过滤。"
-  (cond
-   ((null query) (ebasecamp-data--all-records))
-   ((or (stringp query) (symbolp query))
-    (ebasecamp-data-project-records query))
-   ((listp query)
-    (let ((project (plist-get query :project)))
-      (if project
-          (ebasecamp-data-project-records project)
-        (ebasecamp-data--all-records))))
-   (t (ebasecamp-data--all-records))))
-
-(defun ebasecamp-data--load (query page page-size)
-  "source 的 `:load' 实现：按 QUERY 取记录后分页。
-返回 `(:items RECORDS :total N :page PAGE :page-size PAGE-SIZE)'，
-其中 `:total' 是过滤后的总条数（分页前）。"
-  (let* ((candidates (ebasecamp-data--query-records query))
-         (filtered (if (and (listp query) (not (stringp query)))
-                       (ebasecamp-data--filter
-                        candidates
-                        (cl-loop for (key value) on query by #'cddr
-                                 unless (eq key :project)
-                                 append (list key value)))
-                     candidates)))
-    (list :items (ebasecamp-data--slice filtered page page-size)
-          :total (length filtered)
-          :page (max 1 (or page 1))
-          :page-size (max 1 (or page-size 20)))))
-
-;;; source 与 controller
-
-(defun ebasecamp-data-source ()
-  "创建服务表的 ETAF Data source。
-capabilities：`:load'（见 `ebasecamp-data--load'）、`:item-key'（稳定身份）、
-`:provider' 为 `ebasecamp'。`:dispose' 刻意不提供 —— 本 source 不持有任何
-全局资源（轮询归 `ebasecamp-status'）。"
-  (etaf-data-source
-   :name 'ebasecamp-services
-   :provider 'ebasecamp
-   :item-key #'ebasecamp-data--item-key
-   :load #'ebasecamp-data--load))
-
-(defun ebasecamp-data-controller ()
-  "创建服务表的 ETAF Data controller（`:auto-load' 为 nil）。
-由 UI 持有，加载用 `etaf-data-load'（或 `ebasecamp-data-refresh'），销毁用
-`etaf-data-stop'。"
-  (etaf-data-controller (ebasecamp-data-source)
-                        :auto-load nil
-                        :name 'ebasecamp-services))
-
-(defun ebasecamp-data-refresh (controller)
-  "用最新快照刷新 CONTROLLER。
-先调 `ebasecamp-status-snapshot' 采一次新数据（成功则覆盖 last-records），再
-`etaf-data-load' 让 CONTROLLER 重新走 source 的 `:load'。返回同步加载结果
-（`(:items … :total …)'），controller 已停止或加载失败时返回 nil。"
-  (condition-case err
-      (progn
-        (ebasecamp-status-snapshot)
-        (etaf-data-load controller))
-    ((error quit)
-     (message "ebasecamp: 刷新状态数据失败：%S" err)
-     nil)))
 
 (provide 'ebasecamp-data)
 ;;; ebasecamp-data.el ends here
