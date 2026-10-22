@@ -14,7 +14,10 @@
 ;; - 清单定义宏：ebasecamp-define-group、ebasecamp-define-project
 ;; - 进程内注册表与访问器：ebasecamp-model-group、ebasecamp-model-project、
 ;;   ebasecamp-model-groups、ebasecamp-model-projects、ebasecamp-model-reset
+;; - 组内配置访问器：ebasecamp-model-group-configs、ebasecamp-model-config、
+;;   ebasecamp-model-config-project
 ;; - 项目覆盖合并：ebasecamp-model-resolve-services
+;; - 加载期物化：ebasecamp-model-link-configs（把组内配置并入项目 groups 槽）
 ;;
 ;; 字段约定：
 ;; - name 为 symbol
@@ -29,6 +32,11 @@
 ;;   (:group SYMBOL :scope nil|shared|per-project :service-overrides ALIST)
 ;; 其中 ALIST 形如 ((SERVICE-NAME . PLIST) ...)。
 ;;
+;; 组的 configs 槽保存组内配置，形如 ((CONFIG-NAME . PLIST) ...)：
+;;   :project  必填 symbol，指向关联的项目（存在性在物化阶段校验）
+;;   :services 可选，覆盖格式与项目组引用完全一致
+;; 配置不允许 :scope（D9）——配置的 scope 恒等于组定义的 scope。
+;;
 ;; 安全约定：清单只保存 ${VAR} 引用与相对路径；本模块不读取、不插值、
 ;; 不落盘任何密钥值。
 
@@ -37,6 +45,9 @@
 (require 'cl-lib)
 
 (define-error 'ebasecamp-model-error "Invalid ebasecamp model")
+(define-error 'ebasecamp-model-config-link-error
+  "Config materialization error"
+  'ebasecamp-model-error)
 
 (defun ebasecamp-model--fail (format-string &rest args)
   "以 ebasecamp-model-error 报告清单错误。
@@ -52,8 +63,9 @@ FORMAT-STRING 与 ARGS 组成人类可读的错误描述。"
   depends-on networks working-dir user restart extra)
 
 (cl-defstruct (ebasecamp-group (:constructor ebasecamp-group-create))
-  "服务组定义。SCOPE 为 shared 或 per-project。"
-  name title scope services)
+  "服务组定义。SCOPE 为 shared 或 per-project。
+CONFIGS 为 ((CONFIG-NAME . PLIST) ...)，按定义顺序排列。"
+  name title scope services configs)
 
 (cl-defstruct (ebasecamp-project (:constructor ebasecamp-project-create))
   "项目定义。GROUPS 为归一化后的组引用 plist 列表。"
@@ -62,8 +74,13 @@ FORMAT-STRING 与 ARGS 组成人类可读的错误描述。"
 ;;; 允许的关键字
 
 (defconst ebasecamp-model--group-keywords
-  '(:title :scope :services)
+  '(:title :scope :services :configs)
   "组定义允许的关键字。")
+
+(defconst ebasecamp-model--config-keywords
+  '(:project :services)
+  "组内配置允许的关键字。
+配置的 scope 恒等于组定义的 scope（D9），因此不允许 :scope。")
 
 (defconst ebasecamp-model--service-keywords
   '(:image :command :entrypoint :environment :labels :ports :volumes
@@ -90,10 +107,16 @@ FORMAT-STRING 与 ARGS 组成人类可读的错误描述。"
 (defvar ebasecamp-model--projects nil
   "已注册的项目，按定义顺序排列，元素为 ebasecamp-project 对象。")
 
+(defvar ebasecamp-model--legacy-groups (make-hash-table :test #'eq)
+  "物化前的项目组引用基线：项目名 -> 引用列表。
+`ebasecamp-model-link-configs' 首次处理某项目时把它的 groups 槽记在这里，
+之后的每次物化都以该基线为起点重算，因此重复调用不会累积重复引用。")
+
 (defun ebasecamp-model-reset ()
   "清空组与项目注册表，供清单重新加载前调用。"
   (setq ebasecamp-model--groups nil
-        ebasecamp-model--projects nil))
+        ebasecamp-model--projects nil)
+  (clrhash ebasecamp-model--legacy-groups))
 
 (defun ebasecamp-model-groups ()
   "返回已注册的组列表，顺序为定义顺序。"
@@ -112,6 +135,31 @@ FORMAT-STRING 与 ARGS 组成人类可读的错误描述。"
   "返回名为 NAME 的项目对象，不存在时返回 nil。"
   (cl-find name ebasecamp-model--projects
            :key #'ebasecamp-project-name :test #'eq))
+
+(defun ebasecamp-model--as-group (value context)
+  "把 VALUE（组对象或已注册的组名）解析为 ebasecamp-group 对象。
+CONTEXT 用于错误消息。"
+  (cond
+   ((ebasecamp-group-p value) value)
+   ((and value (symbolp value))
+    (or (ebasecamp-model-group value)
+        (ebasecamp-model--fail "%s: 组 %S 未注册" context value)))
+   (t
+    (ebasecamp-model--fail "%s: 期望组对象或组名，得到 %S" context value))))
+
+(defun ebasecamp-model-group-configs (group)
+  "返回 GROUP 的组内配置，形如 ((CONFIG-NAME . PLIST) ...)。
+顺序为定义顺序；GROUP 可为组对象或已注册的组名。无配置时返回 nil。"
+  (ebasecamp-group-configs (ebasecamp-model--as-group group "组配置")))
+
+(defun ebasecamp-model-config (group config-name)
+  "返回 GROUP 中名为 CONFIG-NAME 的配置 plist，不存在时返回 nil。
+GROUP 可为组对象或已注册的组名。"
+  (cdr (assq config-name (ebasecamp-model-group-configs group))))
+
+(defun ebasecamp-model-config-project (config-plist)
+  "返回配置 PLIST 关联的项目名（symbol）。"
+  (plist-get config-plist :project))
 
 ;;; 校验助手
 
@@ -260,6 +308,73 @@ CONTEXT 用于错误消息。"
        :restart (plist-get plist :restart)
        :extra (plist-get plist :extra)))))
 
+(defun ebasecamp-model--normalize-service-overrides (overrides context)
+  "把服务覆盖列表 OVERRIDES 归一化为 ((SERVICE-NAME . PLIST) ...)。
+格式与项目组引用的 :services 完全一致。CONTEXT 用于错误消息。"
+  (unless (or (null overrides) (proper-list-p overrides))
+    (ebasecamp-model--fail "%s: :services 必须是列表，得到 %S"
+                           context overrides))
+  (mapcar (lambda (override)
+            (unless (consp override)
+              (ebasecamp-model--fail
+               "%s: 服务覆盖必须是 (NAME 属性...)，得到 %S"
+               context override))
+            (let ((service-name (car override))
+                  (plist (cdr override)))
+              (ebasecamp-model--check-name service-name context)
+              (let ((service-context
+                     (format "%s.%s" context service-name)))
+                (ebasecamp-model--check-plist
+                 plist ebasecamp-model--service-keywords service-context)
+                (ebasecamp-model--check-service-values
+                 plist service-context)
+                (cons service-name plist))))
+          overrides))
+
+(defun ebasecamp-model--config-from-spec (spec context)
+  "校验配置定义 SPEC 并返回 (CONFIG-NAME . PLIST)。
+SPEC 形如 (CONFIG-NAME :project PROJECT :services 覆盖...)；配置不允许
+:scope（D9）。:project 指向的项目是否存在留到物化阶段校验，因为项目
+文件可能后加载。CONTEXT 用于错误消息。"
+  (unless (consp spec)
+    (ebasecamp-model--fail "%s: 配置定义必须是 (NAME 属性...)，得到 %S"
+                           context spec))
+  (let ((name (car spec)))
+    (ebasecamp-model--check-name name (format "%s 的配置名" context))
+    (let ((config-context (format "%s.%s" context name))
+          (plist (cdr spec)))
+      (when (plist-member plist :scope)
+        (ebasecamp-model--fail
+         "%s: 配置不允许 :scope（只允许 :project 与 :services）"
+         config-context))
+      (ebasecamp-model--check-plist plist ebasecamp-model--config-keywords
+                                    config-context)
+      (let ((project (plist-get plist :project)))
+        (cond
+         ((null project)
+          (ebasecamp-model--fail "%s: 配置缺少 :project" config-context))
+         ((not (symbolp project))
+          (ebasecamp-model--fail "%s: :project 必须是 symbol，得到 %S"
+                                 config-context project))))
+      ;; 覆盖格式复用处：服务名是否存在同样留到物化阶段校验
+      (ebasecamp-model--normalize-service-overrides
+       (plist-get plist :services) config-context)
+      (cons name plist))))
+
+(defun ebasecamp-model--configs-from-specs (configs context)
+  "把配置定义列表 CONFIGS 解析为 ((CONFIG-NAME . PLIST) ...)。
+保持定义顺序，同组内配置名重复时报错。CONTEXT 用于错误消息。"
+  (let ((parsed nil)
+        (seen nil))
+    (dolist (spec configs)
+      (let* ((config (ebasecamp-model--config-from-spec spec context))
+             (config-name (car config)))
+        (when (memq config-name seen)
+          (ebasecamp-model--fail "%s: 配置名 %S 重复" context config-name))
+        (push config-name seen)
+        (setq parsed (append parsed (list config)))))
+    parsed))
+
 (defun ebasecamp-model--group-from-spec (name plist context)
   "由组名 NAME 与属性 PLIST 构造 ebasecamp-group 对象。
 CONTEXT 用于错误消息。"
@@ -268,7 +383,8 @@ CONTEXT 用于错误消息。"
     (ebasecamp-model--check-plist plist ebasecamp-model--group-keywords context)
     (let ((title (plist-get plist :title))
           (scope (plist-get plist :scope))
-          (services (plist-get plist :services)))
+          (services (plist-get plist :services))
+          (configs (plist-get plist :configs)))
       (when (and title (not (stringp title)))
         (ebasecamp-model--fail "%s: :title 必须是字符串，得到 %S"
                                context title))
@@ -277,6 +393,9 @@ CONTEXT 用于错误消息。"
       (unless (or (null services) (proper-list-p services))
         (ebasecamp-model--fail "%s: :services 必须是列表，得到 %S"
                                context services))
+      (unless (or (null configs) (proper-list-p configs))
+        (ebasecamp-model--fail "%s: :configs 必须是列表，得到 %S"
+                               context configs))
       (dolist (spec services)
         (unless (consp spec)
           (ebasecamp-model--fail
@@ -288,7 +407,8 @@ CONTEXT 用于错误消息。"
        :services (mapcar (lambda (spec)
                            (ebasecamp-model--service-from-spec
                             (car spec) (cdr spec) context))
-                         services)))))
+                         services)
+       :configs (ebasecamp-model--configs-from-specs configs context)))))
 
 (defun ebasecamp-model--group-ref-from-spec (spec context)
   "把项目里的组引用 SPEC 归一化为 plist。
@@ -306,29 +426,10 @@ CONTEXT 用于错误消息。"
             (overrides (plist-get (cdr spec) :services)))
         (when scope
           (ebasecamp-model--check-scope scope context))
-        (unless (or (null overrides) (proper-list-p overrides))
-          (ebasecamp-model--fail "%s: :services 必须是列表，得到 %S"
-                                 context overrides))
         (list :group name
               :scope scope
               :service-overrides
-              (mapcar (lambda (override)
-                        (unless (consp override)
-                          (ebasecamp-model--fail
-                           "%s: 服务覆盖必须是 (NAME 属性...)，得到 %S"
-                           context override))
-                        (let ((service-name (car override))
-                              (plist (cdr override)))
-                          (ebasecamp-model--check-name service-name context)
-                          (let ((service-context
-                                 (format "%s.%s" context service-name)))
-                            (ebasecamp-model--check-plist
-                             plist ebasecamp-model--service-keywords
-                             service-context)
-                            (ebasecamp-model--check-service-values
-                             plist service-context)
-                            (cons service-name plist))))
-                      overrides))))))
+              (ebasecamp-model--normalize-service-overrides overrides context))))))
 
 (defun ebasecamp-model--project-from-spec (name plist context)
   "由项目名 NAME 与属性 PLIST 构造 ebasecamp-project 对象。
@@ -391,8 +492,10 @@ CONTEXT 用于错误消息。"
 
 (defmacro ebasecamp-define-group (name &rest args)
   "定义服务组 NAME，属性见 ARGS。
-ARGS 允许的关键字为 :title、:scope、:services，:scope 取值 shared 或
-per-project，缺省 per-project。展开后注册到组注册表并返回组名。"
+ARGS 允许的关键字为 :title、:scope、:services、:configs，:scope 取值
+shared 或 per-project，缺省 per-project。:configs 每项形如
+\(CONFIG-NAME :project PROJECT :services 覆盖...)，配置不允许 :scope。
+展开后注册到组注册表并返回组名。"
   (declare (indent 1))
   (unless (symbolp name)
     (ebasecamp-model--fail "组名必须是 symbol，得到 %S" name))
@@ -510,6 +613,166 @@ service 均为新对象，不修改组内已有对象。"
                   (copy-ebasecamp-service service))
                 result)))
       (nreverse result))))
+
+;;; 加载期物化
+
+(defun ebasecamp-model--legacy-groups-of (project)
+  "返回 PROJECT 物化前的组引用列表。
+首次调用某项目时把它的 groups 槽记为基线缓存，之后每次返回基线的浅拷贝，
+使 `ebasecamp-model-link-configs' 可以「从基线重算」实现幂等。"
+  (let* ((name (ebasecamp-project-name project))
+         (snapshot (gethash name ebasecamp-model--legacy-groups
+                            'ebasecamp-model--unset)))
+    (when (eq snapshot 'ebasecamp-model--unset)
+      (setq snapshot (copy-sequence (ebasecamp-project-groups project)))
+      (puthash name snapshot ebasecamp-model--legacy-groups))
+    (copy-sequence snapshot)))
+
+(defun ebasecamp-model--link-error (code pair format-string &rest args)
+  "构造一条物化错误项，形如 `ebasecamp-config-load' 的 :errors 元素。
+CODE 为标识错误类别的关键字，PAIR 为 (组名 . 项目名) 上下文（供上层定位
+定义文件），FORMAT-STRING 与 ARGS 组成人类可读描述。:file 恒为 nil，
+由调用方补填。"
+  (list :file nil
+        :condition (list 'ebasecamp-model-config-link-error code pair)
+        :message (apply #'format format-string args)))
+
+(defun ebasecamp-model--config-ref (group config)
+  "把 GROUP 的配置 CONFIG 转为项目组引用 plist。
+CONFIG 形如 (CONFIG-NAME . PLIST)。返回
+\(:group SYMBOL :scope SCOPE :service-overrides ALIST)（D6 键名不变量：
+只写 :service-overrides，绝不写 :services）；覆盖项非法时以
+`ebasecamp-model-error' 报错。"
+  (let ((group-name (ebasecamp-group-name group)))
+    (list :group group-name
+          :scope (ebasecamp-group-scope group)
+          :service-overrides
+          (ebasecamp-model--normalize-service-overrides
+           (plist-get (cdr config) :services)
+           (format "配置 %s/%s" group-name (car config))))))
+
+(defun ebasecamp-model--unknown-override (services overrides)
+  "返回 OVERRIDES 中未在 SERVICES 里定义的首个服务名，全部存在时返回 nil。"
+  (let (unknown)
+    (while (and overrides (null unknown))
+      (unless (cl-find (car (car overrides)) services
+                       :key #'ebasecamp-service-name :test #'eq)
+        (setq unknown (car (car overrides))))
+      (setq overrides (cdr overrides)))
+    unknown))
+
+(defun ebasecamp-model-link-configs ()
+  "把所有组的 :configs 物化进对应项目的 groups 槽。
+返回错误列表，每项与 `ebasecamp-config-load' 的 :errors 元素同形
+\(:file PATH :condition CONDITION-DATA :message STRING)，其中 :file 恒为
+nil（模型层不感知文件），由调用方补填定义文件。本函数不 signal：单份配置
+失败只记一条错误，其余配置继续物化。
+
+物化规则：每份配置产出一个组引用
+\(:group GROUP :scope GROUP-SCOPE :service-overrides ALIST)，ALIST 由
+`ebasecamp-model--normalize-service-overrides' 归一化（D6：不写 :services）。
+项目侧旧 :groups 引用保持在前，物化结果按「组定义顺序 → 配置定义顺序」
+追加在后。
+
+校验（任一命中即记错误并跳过该配置，不中断其余项）：
+- 配置引用的项目未定义；
+- 同项目同组已有引用（来自旧 :groups 或另一份配置）；
+- shared 组配置份数超过 1（整组跳过，无法判定哪份生效）；
+- 覆盖了组内不存在的服务；
+- 覆盖项本身非法（`ebasecamp-model-error'，B2 已校验，此处兜底）。
+
+幂等：首次调用时把每个项目的 groups 槽记为基线，之后每次调用都从基线
+重算并重新追加，因此连续调用不会产生重复引用。不调用本函数时，项目
+groups 槽保持定义时的原样（v0.1 行为不变）。"
+  (let ((sources (make-hash-table :test #'equal))
+        (errors nil))
+    ;; 1. 项目 groups 槽回到物化前基线，并登记旧引用的来源
+    (dolist (project (ebasecamp-model-projects))
+      (let ((project-name (ebasecamp-project-name project))
+            (baseline (ebasecamp-model--legacy-groups-of project)))
+        (dolist (reference baseline)
+          (puthash (cons project-name (plist-get reference :group))
+                   "旧 :groups" sources))
+        (setf (ebasecamp-project-groups project) baseline)))
+    ;; 2. 逐组逐份配置校验并物化
+    (dolist (group (ebasecamp-model-groups))
+      (let* ((group-name (ebasecamp-group-name group))
+             (configs (ebasecamp-group-configs group))
+             (services (ebasecamp-group-services group)))
+        (cond
+         ((null configs) nil)
+         ;; E3：shared 组至多 1 份配置
+         ((and (eq (ebasecamp-group-scope group) 'shared)
+               (> (length configs) 1))
+          (push (ebasecamp-model--link-error
+                 :shared-multiple-configs (cons group-name nil)
+                 "shared 组 %s 至多 1 份配置（实际 %d 份）"
+                 group-name (length configs))
+                errors))
+         (t
+          (dolist (config configs)
+            (let* ((config-name (car config))
+                   (project-name
+                    (ebasecamp-model-config-project (cdr config)))
+                   (project (and project-name
+                                 (ebasecamp-model-project project-name))))
+              (cond
+               ;; E1：配置引用了未定义的项目
+               ((null project)
+                (push (ebasecamp-model--link-error
+                       :undefined-project (cons group-name project-name)
+                       "配置 %s/%s 引用了未定义的项目 %s"
+                       group-name config-name project-name)
+                      errors))
+               ;; E2：同项目同组已有引用（旧 :groups 或先前物化的配置）
+               ((cl-find group-name (ebasecamp-project-groups project)
+                         :key (lambda (reference)
+                                (plist-get reference :group))
+                         :test #'eq)
+                (push (ebasecamp-model--link-error
+                       :duplicate-group (cons group-name project-name)
+                       "项目 %s 重复引用组 %s（来源：%s）"
+                       project-name group-name
+                       (or (gethash (cons project-name group-name) sources)
+                           "另一份配置"))
+                      errors))
+               (t
+                (let ((reference nil)
+                      (failure nil))
+                  (condition-case err
+                      (setq reference (ebasecamp-model--config-ref
+                                       group config))
+                    (ebasecamp-model-error
+                     (setq failure err)))
+                  (cond
+                   ;; E5：覆盖项本身非法（B2 已校验，此处兜底）
+                   (failure
+                    (push (ebasecamp-model--link-error
+                           :invalid-services (cons group-name project-name)
+                           "配置 %s/%s 的 :services 非法：%s"
+                           group-name config-name
+                           (error-message-string failure))
+                          errors))
+                   (t
+                    (let ((unknown
+                           (ebasecamp-model--unknown-override
+                            services
+                            (plist-get reference :service-overrides))))
+                      (if unknown
+                          ;; E4：覆盖了组内不存在的服务
+                          (push (ebasecamp-model--link-error
+                                 :unknown-service
+                                 (cons group-name project-name)
+                                 "配置 %s/%s 覆盖了不存在的服务 %s"
+                                 group-name config-name unknown)
+                                errors)
+                        (setf (ebasecamp-project-groups project)
+                              (append (ebasecamp-project-groups project)
+                                      (list reference)))
+                        (puthash (cons project-name group-name)
+                                 (format "配置 %s" config-name)
+                                 sources))))))))))))))
+    (nreverse errors)))
 
 (provide 'ebasecamp-model)
 ;;; ebasecamp-model.el ends here

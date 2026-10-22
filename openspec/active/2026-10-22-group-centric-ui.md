@@ -104,11 +104,11 @@
 
 ### 批次 B：模型层（TDD）
 
-- [ ] B1 先写失败测试：`test/ebasecamp-model-tests.el` 新增 `:configs` 用例 —— 合法解析、配置名重复报错、`:project` 缺失报错、`:services` 覆盖格式复用、配置不允许 `:scope`（D9）、组内多配置顺序保持、`:configs` 非 proper-list 报错、配置名非 symbol 报错、`:configs` 缺省或空列表视为「无配置组」而非报错
+- [x] B1 先写失败测试：`test/ebasecamp-model-tests.el` 新增 `:configs` 用例 —— 合法解析、配置名重复报错、`:project` 缺失报错、`:services` 覆盖格式复用、配置不允许 `:scope`（D9）、组内多配置顺序保持、`:configs` 非 proper-list 报错、配置名非 symbol 报错、`:configs` 缺省或空列表视为「无配置组」而非报错
       （依赖：无）验收：新增用例此时全部失败（红）
-- [ ] B2 实现 `:configs` 解析与访问器：`ebasecamp-group` 增加 configs 槽；`ebasecamp-model-group-configs`、`ebasecamp-model-config`（按 组+配置名 定位）、`ebasecamp-model-config-project`；`ebasecamp-define-group` 接受 `:configs` 并校验
+- [x] B2 实现 `:configs` 解析与访问器：`ebasecamp-group` 增加 configs 槽；`ebasecamp-model-group-configs`、`ebasecamp-model-config`（按 组+配置名 定位）、`ebasecamp-model-config-project`；`ebasecamp-define-group` 接受 `:configs` 并校验
       （依赖：B1）验收：B1 用例转绿；`make compile` 零 warning
-- [ ] B3 物化 + 交叉校验：实现 `ebasecamp-model--link-configs`（算法见「加载期物化算法」节），产物键名必须是 `:service-overrides`（D6 不变量）
+- [x] B3 物化 + 交叉校验：实现 `ebasecamp-model--link-configs`（算法见「加载期物化算法」节），产物键名必须是 `:service-overrides`（D6 不变量）
       （依赖：B2）验收：ERT 覆盖 物化结果结构（含键名断言）、旧 `:groups` + 配置共存顺序（项目侧在前）、四类错误各自命中（缺 project / 项目不存在 / 同项目同组重复 / shared 多配置）；断言错误发生后其余项仍被加载
 - [ ] B4 旧写法兼容：`ebasecamp-define-project :groups` 保留；仅用旧写法的清单加载结果与 v0.1 完全一致
       （依赖：B3）验收：用现有测试夹具对照 `ebasecamp-model-projects` / `project-groups` 结果完全相等；先确认现有夹具中**没有**「同一项目重复引用同一组」的形态（D2 现已将其改为报错），若存在需先修夹具并在报告说明
