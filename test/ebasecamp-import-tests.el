@@ -389,11 +389,75 @@ compose 读取由 `ebasecamp-docker--run-sync-function' 伪造为实测 fixture�
       (should (string-match-p "lexical-binding: t" content))
       (should (string-match-p "^(ebasecamp-define-group probe-app$" content))
       (should (string-match-p "^(ebasecamp-define-project probe-app$" content))
-      ;; 中文注释头保留
-      (should (string-match-p "由 ebasecamp 从 compose 导入生成" content))
+      ;; 注释头对齐 create-sample-config 的模板，并交代来源与安全约定
+      (should (string-match-p "^;;; probe-app\\.el --- ebasecamp 清单" content))
+      (should (string-match-p "由 M-x ebasecamp-import-file 从 " content))
+      (should (string-match-p "安全约定：只保存" content))
       ;; 末尾单个换行
       (should (string-suffix-p ")\n" content))
       (should-not (string-suffix-p "\n\n" content)))))
+
+;;; 12.1 v0.2 落盘格式：组内 :configs
+
+(ert-deftest ebasecamp-import-test-apply-writes-configs ()
+  "落盘文本用组内 :configs 表达项目归属，且配置名与组名/项目名一致。
+配置名取项目名是为了让「哪个项目用了这份组定义」在清单里直接可读，也便于
+物化后按 (组名 . 项目名) 定位来源。"
+  (ebasecamp-import-test--with-manifest "compose.yaml"
+    (let ((content (ebasecamp-import-test--read
+                    (ebasecamp-import-apply compose-file "probe-app"))))
+      (should (string-match-p (regexp-quote ":configs ((") content))
+      (should (string-match-p (regexp-quote ":project probe-app") content))
+      (should (string-match-p
+               (regexp-quote "((probe-app :project probe-app))") content)))))
+
+(ert-deftest ebasecamp-import-test-apply-does-not-write-project-groups ()
+  "项目定义段不再写 :groups：组引用改由组内 :configs 在加载期物化。
+旧写法（项目侧 :groups）仍被模型兼容，但导入不再产出它，避免同一项目
+里出现「旧引用 + 配置引用」两份来源。"
+  (ebasecamp-import-test--with-manifest "compose.yaml"
+    (let* ((content (ebasecamp-import-test--read
+                     (ebasecamp-import-apply compose-file "probe-app")))
+           (start (string-match "(ebasecamp-define-project probe-app" content)))
+      (should start)
+      (should-not (string-match-p ":groups" (substring content start)))
+      ;; 全文都不该出现 :groups（服务定义进组 :services，不进项目）
+      (should-not (string-match-p ":groups" content)))))
+
+(ert-deftest ebasecamp-import-test-apply-roundtrip-loadable ()
+  "落盘文件加载零错误，且项目 groups 槽里有带 :service-overrides 键的 ref。
+`:service-overrides' 是物化产物的键名不变量（D6）：ref 必须由配置物化
+而来，而不是退回旧 :groups 写法。"
+  (ebasecamp-import-test--with-manifest "compose.yaml"
+    (ebasecamp-import-apply compose-file "probe-app")
+    (let* ((status (ebasecamp-config-load config-dir))
+           (project (ebasecamp-model-project 'probe-app))
+           (refs (and project (ebasecamp-project-groups project)))
+           (ref (and refs (cl-find 'probe-app refs
+                                   :key (lambda (item) (plist-get item :group))))))
+      (should (null (plist-get status :errors)))
+      (should project)
+      (should (= 1 (length refs)))
+      (should ref)
+      (should (plist-member ref :service-overrides))
+      (should (eq 'per-project (plist-get ref :scope))))))
+
+(ert-deftest ebasecamp-import-test-apply-keeps-var-references ()
+  "落盘文本保留 `${VAR}' 原文，且不含环境里给的探针明文。
+导入链路只搬运 `compose config --no-interpolate' 的输出，任何一层插值都会
+在清单里留下明文，因此落盘后必须逐字核对。"
+  (ebasecamp-import-test--with-manifest "compose.yaml"
+    (let* ((process-environment
+            (cons "PROBE_SECRET=fake-manifest-secret"
+                  (cons "PROBE_OTHER=fake-manifest-other" process-environment)))
+           (content (ebasecamp-import-test--read
+                     (ebasecamp-import-apply compose-file "probe-app"))))
+      (should (string-match-p (regexp-quote "${PROBE_SECRET}") content))
+      (should (string-match-p (regexp-quote "${PROBE_OTHER:-fallback}") content))
+      (should-not (string-match-p "fake-manifest-secret" content))
+      (should-not (string-match-p "fake-manifest-other" content))
+      ;; 不应被转义成 \$ 形式（那样 compose 侧就取不到变量了）
+      (should-not (string-match-p (regexp-quote "\\${PROBE_SECRET}") content)))))
 
 (ert-deftest ebasecamp-import-test-apply-loadable ()
   "生成的文件能被 `ebasecamp-config-load' 加载：无错误、1 组 1 项目。"

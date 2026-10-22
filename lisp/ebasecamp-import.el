@@ -21,6 +21,13 @@
 ;; 上；组名与项目同名既保证项目内组引用唯一，也让不同项目的同名服务不会在
 ;; 注册表里冲突（每个项目文件各自带一个同名组）。
 ;;
+;; 落盘格式（v0.2「组内配置」写法）：服务定义写在 `ebasecamp-define-group' 的
+;; `:services'，项目归属写在同一个组的 `:configs'（配置名 = 项目名、
+;; `:project' 同值、覆盖留空）；`ebasecamp-define-project' 只写 `:title' 与
+;; `:root'，**不写** `:groups' —— 项目侧的组引用由加载期的
+;; `ebasecamp-model-link-configs' 从 `:configs' 物化而来，两处都写会构成
+;; 「同项目同组双引用」而被加载层报错。
+;;
 ;; 读取命令固定为
 ;;
 ;;   docker compose -f <file> config --no-interpolate --no-env-resolution \
@@ -489,9 +496,6 @@ JSON 非法、缺 services、服务字段无法映射时 signal `ebasecamp-impor
 networks → healthcheck → restart → extra 的相对顺序在此保持不变；契约示例未
 列出的 entrypoint / labels / working-dir / user 插在语义相邻处。")
 
-(defconst ebasecamp-import--imported-group-title "Imported from compose"
-  "导入生成的组标题（固定文案，不随项目名变化）。")
-
 (defconst ebasecamp-import--manifest-form-count 2
   "导入生成的清单文件应含的顶层 form 数：一个组定义 + 一个项目定义。")
 
@@ -538,41 +542,50 @@ networks → healthcheck → restart → extra 的相对顺序在此保持不变
 
 (defun ebasecamp-import--group-form (name services)
   "渲染 `ebasecamp-define-group' 形式的多行字符串。
-NAME 为组名 symbol，SERVICES 为 ((SERVICE . PLIST) ...) alist。"
+NAME 为组名 symbol（同时是项目名），SERVICES 为 ((SERVICE . PLIST) ...)
+alist。服务定义写在组的 `:services'，项目归属写在组内 `:configs'：
+配置名取项目名、`:project' 同值，覆盖留空（服务定义已在组侧，无需重复）。
+加载期由 `ebasecamp-model-link-configs' 把它物化成项目的组引用。"
   (let ((blocks (mapcar (lambda (pair)
                           (ebasecamp-import--service-form
                            (car pair) (cdr pair)))
-                        services)))
+                        services))
+        (group (symbol-name name)))
     (concat
-     "(ebasecamp-define-group " (symbol-name name) "\n"
-     "  :title "
-     (ebasecamp-import--literal ebasecamp-import--imported-group-title) "\n"
+     "(ebasecamp-define-group " group "\n"
+     "  :title " (ebasecamp-import--literal group) "\n"
      "  :scope per-project\n"
      (if blocks
          (concat "  :services\n  ("
                  (mapconcat #'identity blocks "\n   ")
-                 ")")
-       "  :services nil")
-     ")\n")))
+                 ")\n")
+       "  :services nil\n")
+     ;; 配置名 = 项目名：物化后的组引用可追溯到导入来源，也满足
+     ;; 「同项目同组至多 1 个引用」的校验
+     "  :configs ((" group " :project " group ")))\n")))
 
 (defun ebasecamp-import--project-form (name root)
   "渲染 `ebasecamp-define-project' 形式的多行字符串。
-NAME 为项目名 symbol（同时是它引用的组名），ROOT 为项目根目录字符串。"
+NAME 为项目名 symbol，ROOT 为项目根目录字符串。
+不写 `:groups'：项目对组的引用由组内 `:configs' 在加载期物化而来，两处都写
+会构成「同项目同组双引用」而报加载错误。"
   (concat
    "(ebasecamp-define-project " (symbol-name name) "\n"
    "  :title " (ebasecamp-import--literal (symbol-name name)) "\n"
-   "  :root " (ebasecamp-import--literal root) "\n"
-   "  :groups ((" (symbol-name name) ")))\n"))
+   "  :root " (ebasecamp-import--literal root) ")\n"))
 
 (defun ebasecamp-import--manifest-content (name source root services)
   "生成清单文件全文。
 NAME 为项目名 symbol（同时是组名），SOURCE 为 compose 文件绝对路径，ROOT 为
-项目根目录，SERVICES 为导入的服务 alist。文件以单个换行结尾。"
+项目根目录，SERVICES 为导入的服务 alist。文件以单个换行结尾。
+版式对齐 `ebasecamp-create-sample-config' 的模板：首行文件局部变量、第二行
+文件说明、空行后两行注释交代来源与安全约定。"
   (concat
    ";;; -*- lexical-binding: t; -*-\n"
-   ";;; 由 ebasecamp 从 compose 导入生成，请勿手工维护注释头。\n"
-   ";;; 来源文件：" source "\n"
-   ";;; 重新导入会覆盖本文件（需确认）。\n"
+   ";;; " (symbol-name name) ".el --- ebasecamp 清单（由 compose 导入）\n"
+   "\n"
+   ";; 由 M-x ebasecamp-import-file 从 " source " 导入。\n"
+   ";; 安全约定：只保存 ${VAR} 引用，不保存密钥明文。\n"
    "\n"
    (ebasecamp-import--group-form name services)
    "\n"
@@ -618,17 +631,20 @@ NAME 为项目名（string 或 symbol），须匹配 `[a-z0-9_-]+'，否则 sign
 
 生成文件为 `ebasecamp-config-project-file' 指向的路径
 \\(<DIRECTORY>/projects/<name>.el'，DIRECTORY 省略时用
-`ebasecamp-config-directory'），内容为一份 `ebasecamp-define-group' 服务定义
-加一份 `ebasecamp-define-project' 项目定义，带来源文件注释头。
+`ebasecamp-config-directory'），内容为一份 `ebasecamp-define-group'（`:services'
+放服务定义、`:configs' 放项目归属）加一份 `ebasecamp-define-project'
+（`:title' 与 `:root'，不写 `:groups'），带来源文件注释头。
 
 FORCE 为 nil 且目标已存在时 signal `ebasecamp-import-error'（不动原文件）；
 非 nil 时覆盖。ROOT 为项目根目录字符串，省略时用 FILE 所在目录（去掉尾部
 斜杠）。
 
 写盘后自校验：先读回全部顶层 form 确认可解析且数量为
-`ebasecamp-import--manifest-form-count'，再用 `ebasecamp-config-load' 确认无
-错误且新项目已注册；任一步失败都回滚（原来有文件则恢复原内容，否则删除新
-文件）并 signal。清单只保存 `${VAR}' 引用与相对路径，不读写任何密钥值。"
+`ebasecamp-import--manifest-form-count'；再用 `ebasecamp-config-load' 确认
+\(1) 零错误、(2) 新项目已注册、(3) 组内 `:configs' 已物化出带
+`:service-overrides' 键的组引用。任一步失败都回滚（原来有文件则恢复原内容，
+否则删除新文件）并 signal。清单只保存 `${VAR}' 引用与相对路径，不读写任何
+密钥值。"
   (let* ((project-name (ebasecamp-import--normalize-name name))
          (target (ebasecamp-config-project-file
                   project-name
@@ -659,19 +675,35 @@ FORCE 为 nil 且目标已存在时 signal `ebasecamp-import-error'（不动原�
                          "%s 自校验失败：期望 %d 个顶层 form，实际 %d 个"
                          target ebasecamp-import--manifest-form-count
                          (length forms))))))
-      ;; 自校验 2：清单层能加载且新项目已注册
+      ;; 自校验 2：清单层能加载、新项目已注册，且组内 :configs 已物化为
+      ;; 带 :service-overrides 键的组引用（v0.2 格式的落地判据）
       (let* ((status (ebasecamp-config-load directory))
-             (errors (plist-get status :errors)))
-        (unless (and (null errors) (ebasecamp-model-project project-name))
+             (errors (plist-get status :errors))
+             (project (ebasecamp-model-project project-name))
+             (ref (and project
+                       (cl-find project-name
+                                (ebasecamp-project-groups project)
+                                :key (lambda (reference)
+                                       (plist-get reference :group))
+                                :test #'eq)))
+             (failure nil))
+        (cond
+         (errors
+          (setq failure
+                (mapconcat (lambda (item) (plist-get item :message))
+                           errors "；")))
+         ((null project)
+          (setq failure "写入后新项目未出现在清单注册表中"))
+         ((null ref)
+          (setq failure (format "组内 :configs 未物化出指向组 %s 的引用"
+                                project-name)))
+         ((null (plist-member ref :service-overrides))
+          (setq failure "物化出的组引用缺少 :service-overrides 键")))
+        (when failure
           (ebasecamp-import--restore-file target backup)
           (signal 'ebasecamp-import-error
-                  (list (format "%s 自校验失败：%s" target
-                                (if errors
-                                    (mapconcat (lambda (item)
-                                                 (plist-get item :message))
-                                               errors "；")
-                                  "写入后新项目未出现在清单注册表中")))))
-      target))))
+                  (list (format "%s 自校验失败：%s" target failure)))))
+      target)))
 
 ;;;###autoload
 (defun ebasecamp-import-file (file &optional name)
