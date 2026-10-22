@@ -1,0 +1,35 @@
+#+title: ADR-0001 ebasecamp 架构与同步模型
+#+date: 2026-10-22
+#+status: 已接受
+
+* 背景
+
+本地开发需要一组协作服务（数据库、缓存、消息队列）。同一套「基础组件」要被多个项目复用，且启停粒度需细到单个服务。现有 Emacs Docker 工具（如 docker.el）以「容器列表」为中心，无法表达「模板组 → 项目绑定 → 实例隔离」的结构，也无法把配置同步为可部署的 compose 文件。
+
+* 决策
+
+1. *分层架构*：=model= / =config=（纯数据，不依赖 etaf）→ =compose= / =import= / =export=（渲染与解析）→ =docker=（进程与解析）→ =command= / =status=（生命周期语义）→ =ui=（etaf）。
+2. *清单是唯一事实源*：Elisp 数据文件位于 =~/.config/ebasecamp/=（=groups.el= 定义可复用组，=projects/*.el= 定义项目绑定）。compose 文件永远是派生产物。
+3. *复用语义显式声明*：组定义带 =:scope shared | per-project=。=shared= 组以固定 compose 项目名 =ebc-shared= 运行一份；=per-project= 组以 =ebc-<project>= 每项目一份。所有容器加入 external network =ebasecamp=，使项目容器可通过服务名访问 shared 服务。
+4. *同步单向*：=import=（项目已有 compose → 清单，一次性迁移）与 =export=（清单 → 项目 compose 文件，供部署）都不做回写合并，避免事实源冲突与格式损耗。
+5. *零 YAML 解析依赖*：读取 compose 一律调用 =docker compose -f <file> config --no-interpolate --no-env-resolution --no-path-resolution --format json=，由 docker 完成解析；写出使用自写最小序列化器。
+6. *容器归属靠标签*：所有托管容器注入 =ebasecamp.managed=true=、=ebasecamp.project=、=ebasecamp.group=、=ebasecamp.service=、=ebasecamp.scope=，状态采集以此为依据，不依赖容器名猜测。
+7. *密钥与路径不落盘*：清单只保存 =${VAR}= 引用与相对路径；导入与校验一律使用 =--no-interpolate --no-env-resolution --no-path-resolution=，禁止把插值后的明文或绝对路径写入任何文件或输出。
+
+* 后果
+
+- 优点：清单可复用、生成物可重建、无外部依赖、各层可独立单测。
+- 代价：需维护 compose 渲染与导入映射两套规则；Compose 5.6.0 的 JSON 结构变化需在边界层适配。
+- 约束：禁止在 UI 层直接拼 docker 命令；禁止把清单内容写回项目 compose（除显式 export）。
+
+* 已验证的环境事实（2026-10-22 实测）
+
+- Docker 29.9.1 / Docker Compose 5.6.0
+- =config --format json=（不带保护 flag）会做环境变量插值（${SECRET} → 明文，未设时静默置空，退出码仍为 0），因此读取时必须使用决策 5 的三 flag 形式
+- =config --no-interpolate --format json= 原样保留 =${VAR}= / =${VAR:-default}= / =$${...}=，且与环境变量是否设置无关
+- =--no-interpolate= 输出的模型字段比常规 config 少（无 =command: null=、=entrypoint: null=、=ipam: {}=）
+- =config -q= 可校验，但须同时检查退出码与 stderr
+- =docker ps --format '{{json .}}'= 默认截断长字段，必须 =--no-trunc=；=Labels= 为逗号拼接字符串
+- =up -d --dry-run= 可用且无副作用，但输出为成功语态，不能作为执行判据
+- =--no-env-resolution= 阻止 env_file 内容合并进 environment（实测：env_file 仅保留为路径引用，探针值零出现）；=--no-interpolate= 单独也会顺带阻断，但属实现连带效应，不作为契约依赖
+- =--no-path-resolution= 阻止相对路径被绝对化（实测：=./probe.env= 保持相对；未开时被改写为 =/tmp/.../probe.env=）
