@@ -215,18 +215,109 @@ extra 的 \"ports\" 桶保留原始对象。"
     (should (equal 3 (plist-get healthcheck :retries)))))
 
 (ert-deftest ebasecamp-import-test-extra-env-file-and-unknown-fields ()
-  "env_file 以 (:source PATH :type env) 放进 extra，路径相对；未识别字段原样进 extra。"
+  "env_file 以相对路径字符串列表放进 extra；未识别字段原样进 extra。"
   (let* ((api (ebasecamp-import-service-plist (ebasecamp-import-test--project) "api"))
          (extra (plist-get api :extra))
          (env-file (cdr (assoc "env_file" extra))))
-    (should (equal '((:source "./api.env" :type env)) env-file))
-    (should-not (string-prefix-p "/" (plist-get (car env-file) :source)))
+    (should (equal '("./api.env") env-file))
+    (should-not (string-prefix-p "/" (car env-file)))
     (should (equal "128m" (cdr (assoc "shm_size" extra))))
     ;; 已识别的字段不得出现在 extra 中
     (dolist (key '("image" "command" "entrypoint" "environment" "labels"
                    "volumes" "networks" "depends_on" "healthcheck"
                    "working_dir" "user" "restart"))
       (should-not (assoc key extra)))))
+
+;;; 7.1 D4：env_file 往返（回归：含 env_file 的项目必须能导出并通过校验）
+
+(ert-deftest ebasecamp-import-test-env-file-maps-to-path-string-list ()
+  "env_file 归一为相对路径字符串列表，不带 volumes 语义的 `:source' / `:type'。
+D3 缺陷：旧实现返回 ((:source PATH :type env) …)，该 plist 列表被渲染层
+`ebasecamp-compose--mapping-p' 误判为映射，导出产出 compose 无法解析的 YAML。"
+  (let* ((api (ebasecamp-import-service-plist (ebasecamp-import-test--project) "api"))
+         (env-file (cdr (assoc "env_file" (plist-get api :extra)))))
+    (should (equal '("./api.env") env-file))
+    ;; 相对路径未被绝对化（--no-path-resolution）
+    (should-not (string-prefix-p "/" (car env-file)))
+    ;; 不含任何关键字/嵌套结构：volumes 语义残留会让渲染层走映射分支
+    (should-not (cl-some (lambda (item)
+                           (or (keywordp item) (consp item)))
+                         env-file))))
+
+(ert-deftest ebasecamp-import-test-env-file-object-form-keeps-path ()
+  "对象形态（{path, required}）归一为路径字符串列表，保持顺序并丢弃无 path 项。"
+  (let* ((json (concat "{\"services\":{\"api\":{\"image\":\"x:1\","
+                       "\"env_file\":[{\"path\":\"./x.env\"}]}}}"))
+         (api (ebasecamp-import-service-plist
+               (ebasecamp-import-parse-json json) "api")))
+    (should (equal '("./x.env")
+                   (cdr (assoc "env_file" (plist-get api :extra))))))
+  ;; 混合形态（字符串 + 带 path 的对象 + 无 path 的对象）按原序保留、无 path 丢弃
+  (let* ((json (concat "{\"services\":{\"api\":{\"image\":\"x:1\","
+                       "\"env_file\":[\"./a.env\","
+                       "{\"path\":\"./x.env\",\"required\":false},"
+                       "{\"required\":true}]}}}"))
+         (api (ebasecamp-import-service-plist
+               (ebasecamp-import-parse-json json) "api")))
+    (should (equal '("./a.env" "./x.env")
+                   (cdr (assoc "env_file" (plist-get api :extra)))))))
+
+(defun ebasecamp-import-test--env-file-section (lines start)
+  "返回 LINES 中第 START 行（`env_file:' 所在行）之后的序列条目行。
+条目行判定：以 6 个空格 + `- ' 开头；遇到其它行即结束。"
+  (let ((rest (nthcdr (1+ start) lines))
+        (section nil))
+    (while (and rest (string-prefix-p "      - " (car rest)))
+      (setq section (append section (list (car rest))))
+      (setq rest (cdr rest)))
+    section))
+
+(ert-deftest ebasecamp-import-test-env-file-export-roundtrip-renders-string-list ()
+  "导入 → 导出的 compose 文本中，`env_file' 之下是 `- ./api.env' 字符串列表。
+不得出现映射语义残留（`source:' / `\":type\"'），段落总行数 ≤5。
+渲染层按需加引号（`ebasecamp-compose--quote-required-p'），纯路径不需要引号。"
+  (ebasecamp-import-test--with-manifest "compose.yaml"
+    (let* ((_manifest (ebasecamp-import-apply compose-file "probe-app"))
+           (status (ebasecamp-config-load config-dir))
+           (project (ebasecamp-model-project 'probe-app))
+           (text (ebasecamp-export--content project))
+           (lines (split-string text "\n"))
+           (start (cl-position-if
+                   (lambda (line) (string-match-p "\\` +env_file:\\'" line))
+                   lines))
+           (section nil))
+      (should (null (plist-get status :errors)))
+      (should (integerp start))
+      (setq section (ebasecamp-import-test--env-file-section lines start))
+      (should (= 1 (length section)))
+      (should (string-match-p "\\`      - \"?\\./api\\.env\"?\\'" (car section)))
+      (should (<= (+ 1 (length section)) 5))
+      (let ((section-text (mapconcat #'identity section "\n")))
+        (should-not (string-match-p "source:" section-text))
+        (should-not (string-match-p (regexp-quote ":type") section-text))))))
+
+(ert-deftest ebasecamp-import-test-env-file-export-passes-check ()
+  "含 env_file 的项目能导出落盘（打桩 compose 校验，不依赖 docker 守护进程）。"
+  (ebasecamp-import-test--with-manifest "compose.yaml"
+    (let* ((_manifest (ebasecamp-import-apply compose-file "probe-app"))
+           (_status (ebasecamp-config-load config-dir))
+           (project (ebasecamp-model-project 'probe-app))
+           (checked nil)
+           (target nil))
+      (cl-letf (((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (file)
+                   (push file checked)
+                   (list :ok t :exit 0 :stderr ""))))
+        (setq target (ebasecamp-export-project project :force t)))
+      (should (stringp target))
+      (should (file-exists-p target))
+      ;; 校验对象是临时文件，通过后原子替换目标
+      (should (equal (list (concat target ".tmp")) checked))
+      (should-not (file-exists-p (concat target ".tmp")))
+      (let ((text (ebasecamp-import-test--read target)))
+        (should (string-match-p "env_file:" text))
+        (should (string-match-p "- \"?\\./api\\.env\"?" text))
+        (should-not (string-match-p "source:" text))))))
 
 ;;; 8. suggest-name
 

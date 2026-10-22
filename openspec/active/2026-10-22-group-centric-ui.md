@@ -2,12 +2,12 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 批次 B 完成（B1–B6）+ 批次 D 的 D1–D2 完成，下一步 D3
+- 阶段：Phase 3（Implement）· 批次 B 完成（B1–B6）+ 批次 D 的 D1–D2、D4 完成，D3 待重跑（需真实 docker）
 - 已确认：方案 V3 ✅（用户 2026-10-22）、计划 ✅（用户 2026-10-22 确认；plan-reviewer 三轮审查通过）
-- 已完成：A0–A3、A5；批次 B 全部（B1 模型测试 → B2 `:configs` 解析与访问器 → B3 物化 + 交叉校验 → B4 旧写法兼容 → B5 加载流程集成 → B6 全量回归）；D1 失败测试 → D2 落盘改「组内 `:configs`」
-- 测试基线：271 tests（267 + D1 新增 4 项），`make check` 全绿
-- 下一步：A4 用户重启 Emacs 后目检 → D3 往返（导入 → 加载 → 导出 → `docker compose config -q`，需真实 docker）
-- 兼容性注意：D2 把「同一项目重复引用同一组」从 v0.1 的静默允许改为加载报错（错误类型 `ebasecamp-config-duplicate-group-ref`，`:file` 指向项目文件）
+- 已完成：A0–A3、A5；批次 B 全部（B1 模型测试 → B2 `:configs` 解析与访问器 → B3 物化 + 交叉校验 → B4 旧写法兼容 → B5 加载流程集成 → B6 全量回归）；D1 失败测试 → D2 落盘改「组内 `:configs`」→ D3 实测暴露 `env_file` 往返断链 → D4 修导入层（`env_file` 归一为相对路径字符串列表）
+- 测试基线：275 tests（271 + D4 新增 4 项；另改写 1 项旧断言），`make check` 退出码 0、零 warning
+- 下一步：A4 用户重启 Emacs 后目检 → D3 重跑（导入 → 加载 → 导出 → `docker compose config -q`，需真实 docker；注意技术债 #21 的 `ports` extra 渲染问题可能先暴露）
+- 兼容性注意：D2 把「同一项目重复引用同一组」从 v0.1 的静默允许改为加载报错（错误类型 `ebasecamp-config-duplicate-group-ref`，`:file` 指向项目文件）；D4 把 `env_file` 的清单形态从 `((:source PATH :type env) …)` 改为 `("./x.env")`，**已导入的旧清单需重新导入**（旧形态导出必然失败）
 
 ## 目标
 
@@ -132,6 +132,10 @@
       （完成：`ebasecamp-import--group-form` 生成 `:title <组名>` + `:scope per-project` + `:services` + `:configs ((<组名> :project <组名>))`（配置名 = 组名 = 项目名，覆盖留空不写 `:services`）；`ebasecamp-import--project-form` 去掉 `:groups`（两处都写会命中 D2 的「同项目同组双引用」加载错误）；`ebasecamp-import--manifest-content` 注释头对齐 `ebasecamp-create-sample-config` 模板（`;;; <name>.el --- ...` + 来源 + 安全约定两行）；自校验新增「加载零错误 + 项目已注册 + groups 槽存在指向本组的 ref 且带 `:service-overrides` 键」，失败仍回滚；删除已无用的常量 `ebasecamp-import--imported-group-title`。`make check` 全绿（271/271），落盘示例见执行日志）
 - [ ] D3 往返：导入 → 加载 → 导出 → `docker compose config -q`（退出码 + stderr 双判据）
       （依赖：D2）验收：导出物通过校验；`${VAR}` 原样保留；无明文密钥
+      （D3 实测结论（2026-10-23）：含 `env_file` 的服务导入成功、**导出失败** —— `未通过 compose 校验（退出码 1）：services.db.env_file must be a string`。根因三处：①`ebasecamp-import--env-file` 把 `env_file` 当 volumes 语义返回 `((:source PATH :type env) …)`；②该值经 `ebasecamp-import--extra` 进 `:extra` 的 `"env_file"`；③渲染层 `ebasecamp-compose--mapping-p` 判据 `(and (consp value) (consp (car value)))` 对「单元素 plist 列表」返回 t → 走映射分支 → 产出 `source:` / `":type"` 垃圾键。已拆出计划外任务 D4 修复导入层，`--mapping-p` 另记技术债（#21）。修后由下一轮重跑本任务）
+- [x] D4 修复 env_file 往返缺陷（计划外新增）：`ebasecamp-import--env-file` 归一为**相对路径字符串列表**，去掉 volumes 语义的 `:source` / `:type`
+      （依赖：D3 实测）验收：新增 ERT 先红后绿；含 `env_file` 的项目导出文本为 `- ./<name>.env` 形态、段落 ≤5 行且不含 `source:` / `":type"`；导出经打桩校验可落盘
+      （完成：`ebasecamp-import--env-file` 改为「字符串原样 / 对象取 `path` / 无 path 项丢弃、保持顺序」，返回如 `("./api.env")`；`ebasecamp-import--extra` 结构不变（仍放 `"env_file"` 键），渲染层走序列分支输出 `- ./api.env`（纯路径不触发引号）。**未改** `ebasecamp-compose--mapping-p`（影响所有渲染路径，风险大；该误判另记技术债 #21）。测试：新增 4 项（`env-file-maps-to-path-string-list`、`env-file-object-form-keeps-path`、`env-file-export-roundtrip-renders-string-list`、`env-file-export-passes-check`）+ 改写 1 项旧断言（`extra-env-file-and-unknown-fields` 由 `((:source "./api.env" :type env))` 改为 `("./api.env")` —— 旧断言固化的正是缺陷形态）。红阶段实测 5 项 FAILED（4 新 + 1 改写）；转绿后 `make test` 275/275、`make check` 退出码 0（check-parens OK 22 files、compile 零 warning）。残留：`ports` 的 `:extra` 载荷（非 tcp / 绑定宿主 IP 的端口）仍会被 `--mapping-p` 误判，见技术债 #21）
 
 ### 批次 C：界面重写
 

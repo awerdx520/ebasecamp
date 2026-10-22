@@ -43,8 +43,12 @@
 ;; - `ports' 只保留「tcp + 有 published + 未绑定特定宿主 IP」的条目，映射为
 ;;   (PUBLISHED . TARGET) 整数对；无法用当前 model 表达的端口原样进 `:extra'
 ;;   的 "ports" 桶（含 udp 等非 tcp 协议、缺 published、绑定到具体宿主 IP）；
-;; - `env_file' 以 (:source PATH :type env) 形式进 `:extra' 的 "env_file" 桶，
-;;   路径保持相对（依赖 `--no-path-resolution'）；
+;; - `env_file' 归一为**相对路径字符串列表**（`(\"./db.env\")'）进 `:extra' 的
+;;   "env_file" 桶；对象形态只取 `path'（`required' / `format' 暂丢弃，见
+;;   openspec/tech-debt.md），路径保持相对（依赖 `--no-path-resolution'）。
+;;   不用 volumes 语义的 (:source PATH :type env)：`env_file' 只接受字符串或
+;;   字符串列表，且「单元素 plist 列表」会被渲染层的 mapping 判据误判，
+;;   导出产出 compose 无法解析的 YAML（D3 实测缺陷，D4 修复）；
 ;; - 其余未识别字段原样进 `:extra'（键为字符串），供导出时回写。
 ;;
 ;; JSON 解析：用 `json-parse-string' 的 `:object-type hash-table'。默认的 alist
@@ -303,17 +307,23 @@ tmpfs 等其它类型进 EXTRAS 原始对象列表。"
       plist)))
 
 (defun ebasecamp-import--env-file (value)
-  "把 compose 的 env_file VALUE 映射为 ((:source PATH :type env) ...)。
-只保留路径引用，不读取文件内容；路径保持 compose 中的相对形式。"
+  "把 compose 的 env_file VALUE 归一为相对路径字符串列表。
+只保留路径引用，不读取文件内容；路径保持 compose 中的相对形式。
+compose 的 env_file 合法形态为字符串 / 字符串列表 / {path, required, …} 对象：
+字符串原样保留，对象只取 `path' 字段，无 path 的项丢弃（顺序保持不变）。
+不用 volumes 语义的 (:source PATH :type env)：`env_file' 不接受该形态，而
+「单元素 plist 列表」还会被渲染层 `ebasecamp-compose--mapping-p' 误判为映射，
+导出产出 compose 无法解析的 YAML（D3 实测缺陷）。字符串列表则渲染为合法序列
+（`- ./db.env'，纯路径不触发引号）。"
   (delq nil
         (mapcar (lambda (item)
-                  (let ((path (cond
-                               ((stringp item) item)
-                               ((consp item) (ebasecamp-import--string-field
-                                              item "path")))))
-                    (when path
-                      (list :source path :type 'env))))
-                (and (listp value) value))))
+                  (cond
+                   ((stringp item) item)
+                   ((consp item) (ebasecamp-import--string-field item "path"))))
+                (cond
+                 ((stringp value) (list value))
+                 ((listp value) value)
+                 (t nil)))))
 
 (defun ebasecamp-import--extra (object ports-extras volumes-extras env-file)
   "组装服务的 `:extra' alist：未识别字段 + 无法表达的 ports / volumes / env_file。"
