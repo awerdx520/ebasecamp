@@ -8,3 +8,4 @@
 | 4 | 容器状态采用 3s 轮询（仅 UI 可见时） | 状态延迟最多 3s，每次轮询起一个 docker 进程 | 轮询间隔做成 defcustom；后续评估 `docker events` 流 |
 | 5 | `docker ps --format '{{json .}}'` 默认截断长字段、`Labels` 为逗号串 | 解析易丢关键标签 | 强制 `--no-trunc`；labels 按 `ebasecamp.*` / `com.docker.compose.*` 已知前缀解析 |
 | 6 | `--no-interpolate` 输出的模型比常规 `config` 缺省更多字段（实测无 `command: null`、`entrypoint: null`、`ipam: {}`），且 `env_file` 条目形态随参数变化（无 `--no-interpolate` 时仅 `path`，有时含 `required: true`） | 导入解析若把「字段缺失 / 形态差异」当语义差异会误判 | 导入层按「字段可缺省、`env_file` 按路径列表归一」实现；ERT 用实测输出作 fixture |
+| 7 | 清单加载失败时用「reset + 重放已成功文件」回滚（O(n²) 次 load） | 清单文件多时首次加载变慢 | 规模超过 ~50 文件前评估在 model 层补 snapshot/restore |

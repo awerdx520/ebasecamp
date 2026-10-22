@@ -4,8 +4,8 @@
 
 - 阶段：Phase 3（Implement）· 批次 1 进行中
 - 已确认：方案 V2 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）
-- 已完成：批次 0（T0.1–T0.5）、T1.1（model 层）、T1.2（config 层）
-- 下一步：T1.3 compose 生成（先写 ERT 测试）
+- 已完成：批次 0（T0.1–T0.5）、T1.1（model 层）、T1.2（config 层）、T1.3（compose 生成）
+- 下一步：T1.4 docker 适配层（先写 ERT 测试）
 - 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist 形式
 
 ## 目标
@@ -93,7 +93,7 @@ docker compose -f <file> config --no-interpolate --no-env-resolution --no-path-r
       （依赖：无）验收：ERT 覆盖 合法定义、未知字段拒绝、scope 非法值拒绝、覆盖合并结果
 - [x] T1.2 `lisp/ebasecamp-config.el`：从 `ebasecamp-config-directory` 加载 `groups.el` 与 `projects/*.el`；目录不存在时**不自动创建**，返回空清单并置 `bootstrap-needed` 标记；语法错/重复组名收集为错误列表不中断
       （依赖：T1.1）验收：ERT 覆盖 目录缺失、语法错、重复组名、加载顺序、bootstrap 标记
-- [ ] T1.3 `lisp/ebasecamp-compose.el`：服务视图（组 + 项目覆盖）→ compose plist → YAML 文本；项目命名（`ebc-<p>` / `ebc-shared`）、标签注入、external network 附加
+- [x] T1.3 `lisp/ebasecamp-compose.el`：服务视图（组 + 项目覆盖）→ compose plist → YAML 文本；项目命名（`ebc-<p>` / `ebc-shared`）、标签注入、external network 附加
       （依赖：T1.1）验收：ERT 快照覆盖 单服务/多服务/端口覆盖/`${VAR}` 原样保留/标签注入；生成物通过 `docker compose config -q`（L2）
 - [ ] T1.4 `lisp/ebasecamp-docker.el`：`make-process` 异步封装（回调 + 超时 + kill）；`config -q` 校验（退出码 + stderr 双判据）；`ps --no-trunc` JSON 行解析（Labels 逗号串按 `ebasecamp.*`/`com.docker.compose.*` 前缀解析）；错误归一化（含 `ebasecamp-docker-permission`）；`docker compose version` 启动检测与版本警告
       （依赖：无）验收：ERT 用 fixture 覆盖 ps 解析（截断防护、多标签）、校验失败归类、权限错误归类、版本不符警告
