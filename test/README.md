@@ -1,7 +1,8 @@
 # test/ 测试说明
 
-ERT 测试套件，四个模块各一个 `*-tests.el`：`ebasecamp-model` / `ebasecamp-config` /
-`ebasecamp-compose` / `ebasecamp-docker`。
+ERT 测试套件，每个模块一个 `*-tests.el`：`ebasecamp-model` / `ebasecamp-config` /
+`ebasecamp-compose` / `ebasecamp-docker` / `ebasecamp-status` / `ebasecamp-data` /
+`ebasecamp-ui` / `ebasecamp-command`，外加包入口的 `ebasecamp-tests.el`。
 
 ## 运行
 
@@ -32,6 +33,9 @@ make check     # check-parens + compile + test（提交前必跑）
    在 `unwind-protect` 中清理，不污染 `~/.config/ebasecamp` 与 `~/.cache/ebasecamp`。
 3. 需要 docker 输出的测试用 `ebasecamp-docker--run-sync-function` 注入点伪造结果，
    不要依赖真实守护进程；确实要真调 docker 的测试必须先探测可用性并在缺失时跳过。
+   command 层用 `cl-letf` mock `ebasecamp-docker-run-async` / `ebasecamp-docker-run-sync` /
+   `ebasecamp-compose-write`；端口探测用 `ebasecamp-command--port-free-p` 注入替身，
+   **禁止真实 bind 或真实 docker**。
 4. fixture 文件若来自新的实测命令，在 `docker-ps-managed.jsonl` 同目录按
    `<domain>-<desc>.<ext>` 命名，并在上表补一行（含引用它的测试）。
 5. `make check` 全绿才算完成；`compile` 目标启用了 `byte-compile-error-on-warn`，

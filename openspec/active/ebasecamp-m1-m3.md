@@ -2,12 +2,12 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 批次 2 完成
+- 阶段：Phase 3（Implement）· 批次 3 进行中
 - 已确认：方案 V2 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）
-- 已完成：批次 0、批次 1（T1.1–T1.6）、批次 2（T2.1–T2.5）
-- 下一步：批次 3（T3.1 生命周期命令，先写 ERT 测试）
+- 已完成：批次 0、批次 1（T1.1–T1.6）、批次 2（T2.1–T2.5）、批次 3 部分（T3.1 生命周期命令、T3.3 端口冲突检测）
+- 下一步：T3.2 并发与操作态接线 + T3.4 错误链路
 - 待用户确认：真实 Emacs 中目检 `M-x ebasecamp` 界面（T2.3 验收项）
-- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist；批次 1 修复 stale .elc 陷阱；T2.3 修正 data 层为「清单 ∪ 状态」语义、check-parens 覆盖 test/*.el、加载态改用 data-grid label、toast 推迟至 T3.4
+- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist；批次 1 修复 stale .elc 陷阱；T2.3 修正 data 层为「清单 ∪ 状态」语义、check-parens 覆盖 test/*.el、加载态改用 data-grid label、toast 推迟至 T3.4；T3.1 用 compose 层既有 `group-filter` 按 scope 拆分（未改 compose 层），pending 标记改为进程计数器归零后清除
 
 ## 目标
 
@@ -118,11 +118,11 @@ docker compose -f <file> config --no-interpolate --no-env-resolution --no-path-r
 
 ### 批次 3：M2 生命周期
 
-- [ ] T3.1 `lisp/ebasecamp-command.el`：`start`/`stop`/`restart`/`down`，接收服务集合；shared 组路由到 `_shared` 生成物与 `ebc-shared`；`down` 不带 `-v`
+- [x] T3.1 `lisp/ebasecamp-command.el`：`start`/`stop`/`restart`/`down`，接收服务集合；shared 组路由到 `_shared` 生成物与 `ebc-shared`；`down` 不带 `-v`
       （依赖：T1.6）验收：ERT 用 mock 断言命令行、目标项目名、服务集合顺序
 - [ ] T3.2 并发与操作态：每个项目同时只允许一个生命周期进程（in-flight ref/锁），操作进行中 UI 操作条 `:disabled`，完成或失败后恢复；重复点击不得起第二个进程
       （依赖：T3.1、T2.3）验收：ERT 模拟双击断言仅一次 dispatch；UI 中操作期间按钮不可激活
-- [ ] T3.3 端口冲突检测：启动前对选中服务的 `ports` 做两类检查 —— ①清单/项目内重复；②宿主端口占用（`(make-network-process :server t)` bind 探测，可注入 fake binder 测试）；冲突时不启动并给出具名提示
+- [x] T3.3 端口冲突检测：启动前对选中服务的 `ports` 做两类检查 —— ①清单/项目内重复；②宿主端口占用（`(make-network-process :server t)` bind 探测，可注入 fake binder 测试）；冲突时不启动并给出具名提示
       （依赖：T3.1）验收：ERT 覆盖 冲突命中/不冲突/探测失败降级（告警但允许继续）
 - [ ] T3.4 错误链路：命令失败时 stderr 归一化进 `ebasecamp-docker-error`，UI 用 `etaf-alert` 展示可展开详情；权限错误（docker socket）单独归类并给出修复提示
       （依赖：T1.4、T3.1）验收：ERT 断言 4 类错误的分类结果；UI batch 断言 alert 文案出现

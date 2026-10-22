@@ -14,3 +14,4 @@
 | 10 | Docker 无健康检查时 `HealthStatus` 为 `"none"` 而非空串 | status 层若原样透传，UI 会显示 `none` | T2.1 在状态归一化时把 `"none"` 与空串都归一为 nil |
 | 11 | `Labels` 值内含逗号时无法完全还原（docker 不转义） | `parse-labels` 的 alist 可能不完整 | 状态层只按 `ebasecamp.*` / `com.docker.compose.*` 前缀取已知键，不依赖完整解析 |
 | 12 | `make check-parens` 原先不覆盖 test/*.el，测试文件括号错漏时会静默吞掉用例 | 测试数下降但显示全绿 | 已在 T2.3 修复：`PARENS_FILES` 含 `TEST_FILES` |
+| 13 | 按 scope 拆批执行后，per-project 生成物不含 shared 组服务，而 `depends_on` 可以跨 scope 引用共享服务名（如 per-project 的 `api` 写 `depends-on ("mysql")`，`mysql` 属 shared 组） | 该分支 `docker compose up` 会因「depends on undefined service」失败（T3.5 冒烟会暴露） | 待用户决策（T3.5 前）：①渲染时剔除跨 scope 的 `depends_on` 项并给出警告；②启动前计算依赖闭包，检测到跨 scope 依赖即提示用户先启 shared 批次 |
