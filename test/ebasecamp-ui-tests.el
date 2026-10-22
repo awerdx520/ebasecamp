@@ -261,28 +261,11 @@
   (should (equal "STARTING" (ebasecamp-ui--health-label "starting")))
   (should (equal "WEIRD" (ebasecamp-ui--health-label "weird"))))
 
-;;; 5. 当前项目（导入 / 导出入口的兼容层）
-
-(ert-deftest ebasecamp-ui-test-current-project-compat-shim ()
-  "兼容层：无会话 → nil；会话存在时回退清单第一个项目；选中组带配置时取其
-配置的 :project。导出入口（C5 前不再改动）依赖这一行为。"
-  (ebasecamp-ui-test--with-ui
-    (ebasecamp-ui-test--configs-manifest)
-    (ebasecamp-define-group cache
-      :scope shared
-      :services ((redis :image "redis:7"))
-      :configs ((dev :project other)))
-    (ebasecamp-define-project other :groups nil)
-    (ebasecamp-ui-test--with-ps nil
-      (ebasecamp-ui-open)
-      ;; 无选中 → 清单第一个项目（等价旧实现的默认项目）
-      (should (eq 'myapp (ebasecamp-ui-current-project)))
-      ;; 选中组有配置 → 取该配置的项目
-      (ebasecamp-ui--select-key (ebasecamp-ui-session) "group/cache")
-      (should (eq 'other (ebasecamp-ui-current-project)))
-      ;; 会话销毁后回到 nil
-      (ebasecamp-ui-close)
-      (should-not (ebasecamp-ui-current-project)))))
+;;; 5.（已删除）当前项目兼容层
+;;
+;; C5 起导入 / 导出 / 销毁都改为「用 `completing-read' 显式选项目」，
+;; `ebasecamp-ui-current-project' 兼容层已无调用点并删除，因此原第 5 节
+;; `current-project-compat-shim' 用例同时删除（选项目语义由第 13 节覆盖）。
 
 ;;; 6. 选中状态
 
@@ -319,10 +302,9 @@
       (should-not (ebasecamp-status-running-p))
       (should-not (get-buffer ebasecamp-ui-buffer-name))
       (should-not ebasecamp-ui--session)
-      (should-not (ebasecamp-ui-current-project))
       (should-not (ebasecamp-ui-selected-keys)))))
 
-;;; 8. 动作派发与并发控制（函数层；骨架不渲染操作条，C5 恢复）
+;;; 8. 会话与派发（函数层）
 
 (defun ebasecamp-ui-test--select (keys)
   "把 KEYS（\"project/group/service\" 列表）全部勾选到当前会话里。"
@@ -338,131 +320,6 @@
   "返回当前会话的 busy 值。"
   (etaf-value (ebasecamp-ui-session-busy (ebasecamp-ui-session))))
 
-(ert-deftest ebasecamp-ui-test-run-action-requires-selection ()
-  "无选中服务时 start 被拒：不派发命令，notice 为 info。"
-  (ebasecamp-ui-test--with-ui
-    (ebasecamp-ui-test--manifest)
-    (ebasecamp-ui-test--with-ps nil
-      (ebasecamp-ui-open)
-      (let ((called 0))
-        (cl-letf (((symbol-function 'ebasecamp-command-run)
-                   (lambda (&rest _) (cl-incf called))))
-          (should-not (ebasecamp-ui-run-action 'start))
-          (should (= 0 called))
-          (let ((notice (ebasecamp-ui-test--notice)))
-            (should (eq 'info (plist-get notice :kind)))
-            (should (equal "未选中服务" (plist-get notice :title)))
-            (should (equal "请先勾选要操作的服务"
-                           (plist-get notice :message)))))))))
-
-(ert-deftest ebasecamp-ui-test-run-action-blocks-on-port-conflict ()
-  "start 遇到 duplicate 端口冲突：不派发，notice 为 error 并汇总冲突。"
-  (ebasecamp-ui-test--with-ui
-    (ebasecamp-ui-test--manifest)
-    (ebasecamp-ui-test--with-ps nil
-      (ebasecamp-ui-open)
-      (ebasecamp-ui-test--select '("myapp/mysql/mysql"))
-      (let ((called 0))
-        (cl-letf (((symbol-function 'ebasecamp-command-run)
-                   (lambda (&rest _) (cl-incf called)))
-                  ((symbol-function 'ebasecamp-command-port-conflicts)
-                   (lambda (&rest _)
-                     (list (list :kind 'duplicate :port 3306
-                                 :services '("mysql/mysql" "mysql/mysql-ro"))))))
-          (should-not (ebasecamp-ui-run-action 'start))
-          (should (= 0 called))
-          (let ((notice (ebasecamp-ui-test--notice)))
-            (should (eq 'error (plist-get notice :kind)))
-            (should (equal "端口冲突" (plist-get notice :title)))
-            (should (ebasecamp-ui-test--contains-p
-                     (plist-get notice :message) "3306"))))))))
-
-(ert-deftest ebasecamp-ui-test-run-action-dispatches-start ()
-  "start 有选中且无冲突：派发一次，ACTION/项目/keys/on-complete 齐全。"
-  (ebasecamp-ui-test--with-ui
-    (ebasecamp-ui-test--manifest)
-    (ebasecamp-ui-test--with-ps nil
-      (ebasecamp-ui-open)
-      (ebasecamp-ui-test--select '("myapp/mysql/mysql"))
-      (let ((calls nil))
-        (cl-letf (((symbol-function 'ebasecamp-command-run)
-                   (lambda (&rest args) (push args calls)))
-                  ((symbol-function 'ebasecamp-command-port-conflicts)
-                   (lambda (&rest _) nil)))
-          (should (ebasecamp-ui-run-action 'start))
-          (should (= 1 (length calls)))
-          (let ((args (car calls)))
-            (should (eq 'start (nth 0 args)))
-            (should (eq 'myapp (nth 1 args)))
-            (should (equal '("mysql/mysql") (nth 2 args)))
-            (should (functionp (plist-get (nthcdr 3 args) :on-complete)))))))))
-
-(ert-deftest ebasecamp-ui-test-run-action-stop-skips-conflict-check ()
-  "stop 直接派发且不调用端口冲突检测。"
-  (ebasecamp-ui-test--with-ui
-    (ebasecamp-ui-test--manifest)
-    (ebasecamp-ui-test--with-ps nil
-      (ebasecamp-ui-open)
-      (ebasecamp-ui-test--select '("myapp/mysql/mysql-ro"))
-      (let ((calls nil)
-            (conflict-called 0))
-        (cl-letf (((symbol-function 'ebasecamp-command-run)
-                   (lambda (&rest args) (push args calls)))
-                  ((symbol-function 'ebasecamp-command-port-conflicts)
-                   (lambda (&rest _)
-                     (cl-incf conflict-called)
-                     nil)))
-          (should (ebasecamp-ui-run-action 'stop))
-          (should (= 0 conflict-called))
-          (should (= 1 (length calls)))
-          (should (eq 'stop (nth 0 (car calls))))
-          (should (equal '("mysql/mysql-ro") (nth 2 (car calls)))))))))
-
-(ert-deftest ebasecamp-ui-test-run-action-down-needs-confirmation ()
-  "down 先开确认框不派发；确认后以 keys=nil 派发 down。"
-  (ebasecamp-ui-test--with-ui
-    (ebasecamp-ui-test--manifest)
-    (ebasecamp-ui-test--with-ps nil
-      (ebasecamp-ui-open)
-      (ebasecamp-ui-test--select '("myapp/mysql/mysql"))
-      (let ((calls nil))
-        (cl-letf (((symbol-function 'ebasecamp-command-run)
-                   (lambda (&rest args) (push args calls))))
-          (should (ebasecamp-ui-run-action 'down))
-          (should-not calls)
-          (should (etaf-value (ebasecamp-ui-session-confirm
-                               (ebasecamp-ui-session))))
-          (should (eq 'down (ebasecamp-ui-session-confirm-action
-                             (ebasecamp-ui-session))))
-          (should (ebasecamp-ui-confirm))
-          (should (= 1 (length calls)))
-          (should (eq 'down (nth 0 (car calls))))
-          (should (null (nth 2 (car calls))))
-          (should-not (etaf-value (ebasecamp-ui-session-confirm
-                                   (ebasecamp-ui-session))))
-          (should-not (ebasecamp-ui-session-confirm-action
-                       (ebasecamp-ui-session))))))))
-
-(ert-deftest ebasecamp-ui-test-run-action-rejected-while-busy ()
-  "busy 期间再次 run-action 返回 nil，且命令只派发一次。"
-  (ebasecamp-ui-test--with-ui
-    (ebasecamp-ui-test--manifest)
-    (ebasecamp-ui-test--with-ps nil
-      (ebasecamp-ui-open)
-      (ebasecamp-ui-test--select '("myapp/mysql/mysql"))
-      (let ((calls nil))
-        (cl-letf (((symbol-function 'ebasecamp-command-run)
-                   (lambda (&rest args) (push args calls)))
-                  ((symbol-function 'ebasecamp-command-port-conflicts)
-                   (lambda (&rest _) nil)))
-          (should (ebasecamp-ui-run-action 'start))
-          (should (ebasecamp-ui-test--busy))
-          (should-not (ebasecamp-ui-run-action 'start))
-          (should (= 1 (length calls)))
-          (let ((notice (ebasecamp-ui-test--notice)))
-            (should (eq 'info (plist-get notice :kind)))
-            (should (equal "操作进行中" (plist-get notice :title)))))))))
-
 (ert-deftest ebasecamp-ui-test-on-complete-clears-busy ()
   "on-complete 回调把 busy 复位为 nil 并写 notice。"
   (ebasecamp-ui-test--with-ui
@@ -476,7 +333,8 @@
                      (setq complete (plist-get (nthcdr 3 args) :on-complete))))
                   ((symbol-function 'ebasecamp-command-port-conflicts)
                    (lambda (&rest _) nil)))
-          (should (ebasecamp-ui-run-action 'start))
+          (should (ebasecamp-ui--dispatch
+                   (ebasecamp-ui-session) 'start "myapp" '("mysql/mysql")))
           (should (ebasecamp-ui-test--busy))
           (funcall complete (list :action 'start :project 'myapp :ok t :results nil))
           (should-not (ebasecamp-ui-test--busy))
@@ -635,26 +493,19 @@ message 与 `:dismissible' 的关闭按钮）；notice 为空时退化为默认�
 
 ;;; 10. 导入 / 导出入口
 
-(ert-deftest ebasecamp-ui-test-export-without-project ()
-  "无当前项目时导出：返回 nil、notice 为 info、导出层未被调用。"
-  (ebasecamp-ui-test--with-ui
-    (let ((called 0))
-      (cl-letf (((symbol-function 'ebasecamp-export-project)
-                 (lambda (&rest _) (cl-incf called) "/tmp/never.yaml")))
-        (should-not (ebasecamp-ui-export-compose))
-        (should (= 0 called))
-        (let ((notice (ebasecamp-ui-test--notice)))
-          (should (eq 'info (plist-get notice :kind)))
-          (should (ebasecamp-ui-test--contains-p
-                   (plist-get notice :title) "项目")))))))
+;; C5 起导出改为「`completing-read' 选项目」（D5），不再依赖
+;; `ebasecamp-ui-current-project' 兼容层；用例统一打桩 `completing-read'。
 
 (ert-deftest ebasecamp-ui-test-export-success ()
-  "导出成功：调用导出层且 FORCE 为 nil，notice 为 success 且 message 含路径。"
+  "导出成功：completing-read 选中的项目传给导出层且 FORCE 为 nil，
+notice 为 success 且 message 含路径。"
   (ebasecamp-ui-test--with-ui
     (ebasecamp-ui-test--manifest)
     (let ((calls nil)
           (target "/tmp/ebc-export/docker-compose.ebasecamp.yaml"))
-      (cl-letf (((symbol-function 'ebasecamp-export-project)
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (&rest _) "myapp"))
+                ((symbol-function 'ebasecamp-export-project)
                  (lambda (project &rest keys)
                    (push (cons project keys) calls)
                    target)))
@@ -672,7 +523,9 @@ message 与 `:dismissible' 的关闭按钮）；notice 为空时退化为默认�
   "导出层 signal `ebasecamp-export-error' 时：返回 nil、notice 为 error。"
   (ebasecamp-ui-test--with-ui
     (ebasecamp-ui-test--manifest)
-    (cl-letf (((symbol-function 'ebasecamp-export-project)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _) "myapp"))
+              ((symbol-function 'ebasecamp-export-project)
                (lambda (&rest _)
                  (signal 'ebasecamp-export-error
                          (list "/tmp/x.yaml 已存在；覆盖需显式指定 :force")))))
@@ -1147,8 +1000,155 @@ dev → myapp（服务全 running）、prod → other（mysql-ro 未启动）。
           (should-not (ebasecamp-ui--section-action 'start instance))
           (should (= 1 calls)))))))
 
-(ert-deftest ebasecamp-ui-test-section-action-resets-busy-on-dispatch-error ()
-  "命令层 signal `ebasecamp-command-busy' 时 busy 复位为 nil 并写 notice。"
+(ert-deftest ebasecamp-ui-test-section-action-resets-busy-on-command-error ()
+  "命令层 signal `ebasecamp-command-error' 时 busy 复位为 nil 并写 error notice。
+命令层 busy（`ebasecamp-command-busy'）自 C5 起归为 info「操作进行中」，
+由第 13 节的 `dispatch-busy-maps-to-info' 覆盖。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let ((instance (car (ebasecamp-ui-test--instances))))
+        (ebasecamp-ui-test--select '("mysql/mysql"))
+        (cl-letf (((symbol-function 'ebasecamp-command-run)
+                   (lambda (&rest _)
+                     (signal 'ebasecamp-command-error
+                             (list "项目 myapp 没有 per-project 组的服务可 down"))))
+                  ((symbol-function 'ebasecamp-command-port-conflicts)
+                   (lambda (&rest _) nil)))
+          (should-not (ebasecamp-ui--section-action 'start instance))
+          (should-not (ebasecamp-ui-test--busy))
+          (let ((notice (ebasecamp-ui-test--notice)))
+            (should (eq 'error (plist-get notice :kind)))
+            (should (equal "命令派发失败" (plist-get notice :title)))
+            (should (ebasecamp-ui-test--contains-p
+                     (plist-get notice :message) "没有 per-project"))))))))
+
+;;; 13. 底栏、选项目导出与销毁确认（C5）
+
+;; 底栏三个入口都不参与 `busy' 判定（不是生命周期动作）；导出与销毁都用
+;; `completing-read' 显式选项目（D5），不再经过「当前项目」兼容层。销毁把
+;; 待确认动作写成 `(down . 项目名)' 交给确认框，确认后才派发（keys 为 nil）。
+
+(ert-deftest ebasecamp-ui-test-renders-footer-buttons ()
+  "主界面底栏渲染「导入 compose」「导出 compose」「销毁环境」三个入口。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let ((text (cdr (ebasecamp-ui-test--render "group/mysql"))))
+        (should (ebasecamp-ui-test--contains-p text "导入 compose"))
+        (should (ebasecamp-ui-test--contains-p text "导出 compose"))
+        (should (ebasecamp-ui-test--contains-p text "销毁环境"))))))
+
+(ert-deftest ebasecamp-ui-test-export-without-projects-notices ()
+  "清单无项目时导出：notice info「没有可用项目」，不调用导出层。"
+  (ebasecamp-ui-test--with-ui
+    (let ((called 0))
+      (cl-letf (((symbol-function 'ebasecamp-export-project)
+                 (lambda (&rest _) (cl-incf called) "/tmp/never.yaml")))
+        (should-not (ebasecamp-ui-export-compose))
+        (should (= 0 called))
+        (let ((notice (ebasecamp-ui-test--notice)))
+          (should (eq 'info (plist-get notice :kind)))
+          (should (equal "没有可用项目" (plist-get notice :title)))
+          (should-not (plist-get notice :detail)))))))
+
+(ert-deftest ebasecamp-ui-test-export-selects-project-via-completing-read ()
+  "completing-read 选到 \"myapp\" 时导出层收到 myapp 的项目对象。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (let ((prompt nil)
+          (collection nil)
+          (received nil))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (p coll &rest _)
+                   (setq prompt p collection coll)
+                   "myapp"))
+                ((symbol-function 'ebasecamp-export-project)
+                 (lambda (project &rest _)
+                   (setq received project)
+                   "/tmp/ebc-out.yaml")))
+        (should (equal "/tmp/ebc-out.yaml" (ebasecamp-ui-export-compose)))
+        (should (ebasecamp-project-p received))
+        (should (eq 'myapp (ebasecamp-project-name received)))
+        (should (ebasecamp-ui-test--contains-p prompt "导出项目"))
+        ;; 候选集合是清单里的项目名（symbol-name 形态）
+        (should (member "myapp" collection))
+        (should (member "other" collection))
+        (let ((notice (ebasecamp-ui-test--notice)))
+          (should (eq 'success (plist-get notice :kind)))
+          (should (equal "导出完成" (plist-get notice :title)))
+          (should (ebasecamp-ui-test--contains-p
+                   (plist-get notice :message) "/tmp/ebc-out.yaml")))))))
+
+(ert-deftest ebasecamp-ui-test-export-cancel-is-silent ()
+  "选项目时用户取消（`quit'）：返回 nil、无 notice、不调用导出层。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (let ((called 0))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (&rest _) (signal 'quit nil)))
+                ((symbol-function 'ebasecamp-export-project)
+                 (lambda (&rest _) (cl-incf called) "/tmp/never.yaml")))
+        (should-not (ebasecamp-ui-export-compose))
+        (should (= 0 called))
+        (should-not (ebasecamp-ui-test--notice))))))
+
+(ert-deftest ebasecamp-ui-test-destroy-requires-confirmation ()
+  "销毁：选完项目只置 confirm ref 与 confirm-action，不派发命令。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (let ((called 0))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (&rest _) "myapp"))
+                ((symbol-function 'ebasecamp-command-run)
+                 (lambda (&rest _) (cl-incf called))))
+        (should (ebasecamp-ui-destroy-environment))
+        (should (= 0 called))
+        (let ((session (ebasecamp-ui-session)))
+          (should (etaf-value (ebasecamp-ui-session-confirm session)))
+          (should (equal '(down . myapp)
+                         (ebasecamp-ui-session-confirm-action session))))))))
+
+(ert-deftest ebasecamp-ui-test-destroy-confirm-dispatches-down ()
+  "确认销毁：command-run 收到 (down myapp nil)，confirm 状态清空。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (let ((calls nil))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (&rest _) "myapp"))
+                ((symbol-function 'ebasecamp-command-run)
+                 (lambda (&rest args) (push args calls))))
+        (should (ebasecamp-ui-destroy-environment))
+        (should (ebasecamp-ui-confirm))
+        (should (= 1 (length calls)))
+        (should (eq 'down (nth 0 (car calls))))
+        (should (eq 'myapp (nth 1 (car calls))))
+        (should (null (nth 2 (car calls))))
+        (let ((session (ebasecamp-ui-session)))
+          (should-not (etaf-value (ebasecamp-ui-session-confirm session)))
+          (should-not (ebasecamp-ui-session-confirm-action session)))))))
+
+(ert-deftest ebasecamp-ui-test-destroy-dialog-text-mentions-project ()
+  "确认框文案点名项目，并说明不会删除卷、shared 组不受影响。
+batch 下 `etaf-dialog' 走 root-layer 投影，内容不落 buffer（实测挂载后文本为空
+串），因此断言文案函数本身 + 组件已注册（确认框确由该组件渲染）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (let ((session (ebasecamp-ui-session)))
+      (setf (ebasecamp-ui-session-confirm-action session) '(down . myapp))
+      (etaf-set-value (ebasecamp-ui-session-confirm session) t)
+      (let ((message (ebasecamp-ui--confirm-message 'myapp)))
+        (should (ebasecamp-ui-test--contains-p message "myapp"))
+        (should (ebasecamp-ui-test--contains-p message "不会删除卷"))
+        (should (ebasecamp-ui-test--contains-p message "shared")))
+      ;; 确认框组件已注册（`etaf-node' / View 语法据此解析）
+      (should (etaf--component-spec-p
+               (gethash 'ebasecamp-ui-confirm-dialog etaf--view-registry))))))
+
+(ert-deftest ebasecamp-ui-test-dispatch-busy-maps-to-info ()
+  "命令层 busy（`ebasecamp-command-busy'）经段内路径：notice 为 info、busy 复位。
+C4 的 `--section-dispatch' 曾把这种情况归为 error「命令派发失败」，C5 合并
+两条派发路径后统一为 info「操作进行中」。"
   (ebasecamp-ui-test--with-ui
     (ebasecamp-ui-test--section-manifest)
     (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
@@ -1163,10 +1163,26 @@ dev → myapp（服务全 running）、prod → other（mysql-ro 未启动）。
           (should-not (ebasecamp-ui--section-action 'start instance))
           (should-not (ebasecamp-ui-test--busy))
           (let ((notice (ebasecamp-ui-test--notice)))
-            (should (eq 'error (plist-get notice :kind)))
-            (should (equal "命令派发失败" (plist-get notice :title)))
-            (should (ebasecamp-ui-test--contains-p
-                     (plist-get notice :message) "已有命令在执行"))))))))
+            (should (eq 'info (plist-get notice :kind)))
+            (should (equal "操作进行中" (plist-get notice :title)))
+            (should (equal "请等待当前命令完成" (plist-get notice :message)))))))))
+
+(ert-deftest ebasecamp-ui-test-dispatch-other-error-maps-to-error ()
+  "其他错误：notice 为 error「命令派发失败」+ 消息，busy 复位。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (let ((session (ebasecamp-ui-session)))
+      (cl-letf (((symbol-function 'ebasecamp-command-run)
+                 (lambda (&rest _)
+                   (signal 'ebasecamp-command-error
+                           (list "shared 组不提供 down")))))
+        (should-not (ebasecamp-ui--dispatch session 'down "myapp" nil))
+        (should-not (ebasecamp-ui-test--busy))
+        (let ((notice (ebasecamp-ui-test--notice)))
+          (should (eq 'error (plist-get notice :kind)))
+          (should (equal "命令派发失败" (plist-get notice :title)))
+          (should (ebasecamp-ui-test--contains-p
+                   (plist-get notice :message) "shared 组不提供 down")))))))
 
 (provide 'ebasecamp-ui-tests)
 ;;; ebasecamp-ui-tests.el ends here

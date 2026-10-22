@@ -351,23 +351,6 @@ GROUP-NAME 可为 symbol 或字符串，RECORD 为服务记录 plist（见
          (copy-sequence
           (etaf-value (ebasecamp-ui-session-selected-ref session))))))
 
-(defun ebasecamp-ui-current-project ()
-  "返回当前「项目」名（symbol）；无法判定时返回 nil。
-组为中心的骨架没有「当前项目」概念，本函数仅作为**导入 / 导出入口的兼容层**
-保留（`ebasecamp-ui-import-compose' / `ebasecamp-ui-export-compose' 本轮不动，
-C5 会改为按选中组 / 配置显式选择目标）：
-1. 会话不存在时返回 nil；
-2. 否则优先取选中组首份配置的 `:project'（组内没有配置时跳过）；
-3. 仍无结果时回退到清单里的第一个项目（等价于旧实现「默认第一个项目」）。"
-  (when-let* ((session ebasecamp-ui--session))
-    (let* ((selected (etaf-value (ebasecamp-ui-session-selected-group session)))
-           (configs (and selected
-                         (ebasecamp-model-group selected)
-                         (ebasecamp-model-group-configs selected))))
-      (or (and configs (ebasecamp-model-config-project (cdr (car configs))))
-          (let ((projects (ebasecamp-model-projects)))
-            (and projects (ebasecamp-project-name (car projects))))))))
-
 ;;; 操作提示（notice）
 
 (defconst ebasecamp-ui--blocking-conflict-kinds '(duplicate busy)
@@ -689,9 +672,14 @@ GROUP-NAME 为组名（段内 key 的组部分）。列 `:key' 用关键字，�
       nil)))
 
 (defun ebasecamp-ui--dispatch (session action project keys)
-  "真正派发 ACTION（PROJECT + KEYS），返回 t（已派发）或 nil（被拒）。
-派发前置 busy，命令层抛 `ebasecamp-command-busy' 或其他错误时复位 busy 并写
-notice，绝不让界面卡在「执行中」。"
+  "把生命周期动作 ACTION（PROJECT + KEYS）派发到命令层，返回 t 或 nil。
+**唯一的派发路径**：段内生命周期按钮（`ebasecamp-ui--section-action'）与销毁
+确认（`ebasecamp-ui-confirm'）都走本函数，C5 起不再有第二条派发路径。
+派发前置 busy；命令层 signal 时按类型映射 notice 并复位 busy（绝不让界面卡在
+「执行中」）：
+- `ebasecamp-command-busy'（同项目已有命令在执行）→ info「操作进行中」；
+- 其他 error（含 `ebasecamp-command-error'）→ error「命令派发失败」+ 消息。
+返回 t 表示已派发，nil 表示被拒。"
   (etaf-set-value (ebasecamp-ui-session-busy session) t)
   (condition-case err
       (progn
@@ -709,86 +697,20 @@ notice，绝不让界面卡在「执行中」。"
                                (error-message-string err))
      nil)))
 
-(defun ebasecamp-ui--run-action (action confirmed)
-  "`ebasecamp-ui-run-action' 的实现；CONFIRMED 非 nil 表示已通过销毁确认。
-旧的项目视图接口：项目取自 `ebasecamp-ui-current-project' 兼容层（而非某个
-配置实例），C5 将迁移到「选项目」语义；当前仅为旧调用点保留。
-返回值：t 表示已受理（已派发，或销毁动作已转入确认），nil 表示被拒。"
-  (let* ((session (ebasecamp-ui-session))
-         (project (ebasecamp-ui-current-project)))
-    (cond
-     ((etaf-value (ebasecamp-ui-session-busy session))
-      (ebasecamp-ui--set-notice session 'info "操作进行中" "请等待当前命令完成")
-      nil)
-     ((null project)
-      (ebasecamp-ui--set-notice session 'info "没有可用项目"
-                                "请先在清单中定义项目")
-      nil)
-     ((eq action 'down)
-      (if confirmed
-          (ebasecamp-ui--dispatch session action project nil)
-        (setf (ebasecamp-ui-session-confirm-action session) action)
-        (etaf-set-value (ebasecamp-ui-session-confirm session) t)
-        t))
-     ((not (memq action '(start stop restart)))
-      (ebasecamp-ui--set-notice session 'error "未知动作"
-                                (format "不支持的动作 %S" action))
-      nil)
-     (t
-      (let ((keys (ebasecamp-ui--command-keys (ebasecamp-ui-selected-keys))))
-        (cond
-         ((null keys)
-          (ebasecamp-ui--set-notice session 'info "未选中服务"
-                                    "请先勾选要操作的服务")
-          nil)
-         ((not (eq action 'start))
-          (ebasecamp-ui--dispatch session action project keys))
-         (t
-          ;; 端口冲突检测：**遗留调用点**（旧的项目视图接口）。C4 起段内
-          ;; 按钮走 `ebasecamp-ui--section-action'，那里是新的唯一主路径；
-          ;; C5 合并两条路径时本分支删除。
-          (let* ((conflicts (ebasecamp-command-port-conflicts project keys))
-                 (split (ebasecamp-ui--split-conflicts conflicts))
-                 (blocking (car split))
-                 (soft (cdr split)))
-            (if blocking
-                (progn
-                  (ebasecamp-ui--set-notice
-                   session 'error "端口冲突"
-                   (ebasecamp-ui--conflict-summary blocking))
-                  nil)
-              (when soft
-                (ebasecamp-ui--set-notice
-                 session 'info "端口提示"
-                 (ebasecamp-ui--conflict-summary soft)))
-              (ebasecamp-ui--dispatch session action project keys))))))))))
-
-(defun ebasecamp-ui-run-action (action)
-  "执行生命周期 ACTION（start / stop / restart / down），返回 t 或 nil。
-旧的项目视图接口：C5 将迁移到「选项目」语义；当前仅为旧调用点（操作条
-`ebasecamp-ui--action-bar'，C5 恢复）保留，**段内按钮不走本函数**。
-返回 t 表示已受理：start / stop / restart 已派发到命令层，down 已转入确认；
-返回 nil 表示被拒，并把原因写进会话的 notice。拒绝条件：
-- 会话 busy（已有命令在执行）；
-- 无当前项目；
-- start / stop / restart 未勾选服务；
-- start 的端口冲突含 `duplicate' / `busy'（只含 `unknown' 时放行并提示）；
-- ACTION 不是四种动作之一。
-本函数经 `ebasecamp-command-run' 派发，自身不拼接任何 docker 命令。"
-  (ebasecamp-ui--run-action action nil))
-
 (defun ebasecamp-ui-confirm ()
-  "执行确认框里待确认的动作（当前只有 down），返回 t 或 nil。
-旧的项目视图接口：C5 将迁移到「选项目」语义；当前仅为旧调用点保留。
-确认按钮与测试调用本函数；无论成功与否都先清空待确认状态，避免重复派发。"
+  "执行确认框里待确认的动作，返回 t（已派发）或 nil。
+待确认动作（会话的 `confirm-action'）形如 `(down . 项目名)'，由
+`ebasecamp-ui-destroy-environment' 设置；确认后先清空确认状态（避免重复
+派发），再按「全部服务」（keys 为 nil）经 `ebasecamp-ui--dispatch' 派发。
+交互入口：确认框的「确认销毁」按钮与 `M-x'。"
   (interactive)
   (let* ((session ebasecamp-ui--session)
-         (action (and session (ebasecamp-ui-session-confirm-action session))))
+         (pending (and session (ebasecamp-ui-session-confirm-action session))))
     (when session
       (etaf-set-value (ebasecamp-ui-session-confirm session) nil)
       (setf (ebasecamp-ui-session-confirm-action session) nil))
-    (if (and session action)
-        (ebasecamp-ui--run-action action t)
+    (if (and session pending)
+        (ebasecamp-ui--dispatch session (car pending) (cdr pending) nil)
       nil)))
 
 (defun ebasecamp-ui-dismiss-confirm ()
@@ -800,65 +722,62 @@ notice，绝不让界面卡在「执行中」。"
       (setf (ebasecamp-ui-session-confirm-action session) nil)))
   nil)
 
-;;; 操作条与确认框视图
+;;; 底栏与销毁确认视图（C5）
 
-(defun ebasecamp-ui--action-button (session label action variant)
-  "返回操作条按钮：文案 LABEL、语义 VARIANT，按下派发 ACTION。
-SESSION 的 busy 为真时按钮禁用（渲染期读 ref，写 ref 即触发重渲染）。"
+;; 底栏是主视图 column 的最后一个内容行（分割线之后、notice 之前）：导入
+;; compose / 导出 compose / 销毁环境三个 ghost 按钮。三者都不是生命周期动作，
+;; 故**不参与** busy 判定（busy 期间仍可点）；销毁的危险性由二次确认
+;; （`ebasecamp-ui-confirm-dialog'）承担。
+
+(defun ebasecamp-ui--footer-button (label function)
+  "返回底栏按钮：文案 LABEL，按下调用 FUNCTION。纯视图，不参与 busy 判定。"
   (etaf-view
    (etaf-button
     :label label
-    :variant variant
-    :disabled (and (etaf-value (ebasecamp-ui-session-busy session)) t)
-    :on-press (lambda () (ebasecamp-ui-run-action action)))))
-
-(defun ebasecamp-ui--bar-button (label function variant)
-  "返回操作条按钮：文案 LABEL、语义 VARIANT，按下调用 FUNCTION。
-与 `ebasecamp-ui--action-button' 的区别：本函数直接调用回调，不经
-`ebasecamp-ui-run-action' 派发生命周期动作。"
-  (etaf-view
-   (etaf-button
-    :label label
-    :variant variant
+    :variant 'ghost
     :on-press (lambda () (funcall function)))))
 
-(defun ebasecamp-ui--action-bar (session)
-  "返回底栏操作条：生命周期按钮一行，导入 / 导出 compose 入口一行。
-导入 / 导出不参与 `busy' 判定（它们不是生命周期动作），因此恒可点。
-两行而不是一行：80 列终端下六个按钮同行会溢出，标签会被裁切。"
+(defun ebasecamp-ui--footer-view ()
+  "返回主界面底栏：导入 compose / 导出 compose / 销毁环境。"
   (etaf-view
-   (column :width 'stretch :item-gap '(lh 0)
-     (row :width 'stretch :cross-align 'center :item-gap '(ch 2)
-       (expr (ebasecamp-ui--action-button session "启动选中" 'start 'primary))
-       (expr (ebasecamp-ui--action-button session "停止选中" 'stop 'secondary))
-       (expr (ebasecamp-ui--action-button session "重启选中" 'restart 'secondary))
-       (expr (ebasecamp-ui--action-button session "销毁环境" 'down 'ghost)))
-     (row :width 'stretch :cross-align 'center :item-gap '(ch 2)
-       (expr (ebasecamp-ui--bar-button
-              "导入 compose" #'ebasecamp-ui-import-compose 'ghost))
-       (expr (ebasecamp-ui--bar-button
-              "导出 compose" #'ebasecamp-ui-export-compose 'ghost))))))
+   (row :width 'stretch :cross-align 'center :item-gap '(ch 2)
+     (expr (ebasecamp-ui--footer-button
+            "导入 compose" #'ebasecamp-ui-import-compose))
+     (expr (ebasecamp-ui--footer-button
+            "导出 compose" #'ebasecamp-ui-export-compose))
+     (expr (ebasecamp-ui--footer-button
+            "销毁环境" #'ebasecamp-ui-destroy-environment)))))
 
-(defun ebasecamp-ui--confirm-dialog (session)
-  "返回销毁环境的确认框：`:open' 绑在 SESSION 的 confirm ref 上。
-旧的项目视图接口：C5 将迁移到「选项目」语义；当前仅为旧调用点保留。
-`etaf-dialog' 的 `:open' 接受 ref（内部经 `etaf-ui--reactive-value' 读取并
-建立渲染依赖），因此写 ref 即可开关对话框。"
-  (etaf-view
-   (etaf-dialog
-    :open (ebasecamp-ui-session-confirm session)
-    :title "销毁环境"
-    :width '(ch 46)
-    :close-label nil
-    :on-close (lambda () (ebasecamp-ui-dismiss-confirm))
-    (column :width 'stretch :item-gap '(lh 1)
-      (etaf-label
-       :text "将停止并移除本项目（per-project）的全部容器，不会删除卷。")
-      (row :width 'stretch :cross-align 'center :item-gap '(ch 2)
-        (etaf-button :label "取消" :variant 'secondary
-                     :on-press (lambda () (ebasecamp-ui-dismiss-confirm)))
-        (etaf-button :label "确认销毁" :variant 'primary
-                     :on-press (lambda () (ebasecamp-ui-confirm))))))))
+(defun ebasecamp-ui--confirm-message (project)
+  "返回销毁 PROJECT 的确认文案：点名项目、不删卷、shared 组不受影响。纯函数。"
+  (format (concat "将停止并移除项目 %s 的全部 per-project 容器，"
+                  "不会删除卷。shared 组不受影响。")
+          (or project "（未选择）")))
+
+(etaf-define-component ebasecamp-ui-confirm-dialog ()
+  "销毁环境的二次确认框：会话 `confirm' ref 为真时弹出。
+`:render' 里读 `confirm' ref，因此打开 / 关闭都会让本组件重建——文案得以在
+打开的那一刻按 `confirm-action' 的 `(动作 . 项目名)' 求值（若写成普通视图
+函数，文案会在父组件上一次渲染时就固定下来）。"
+  :render
+  (let* ((session (ebasecamp-ui-session))
+         (open (etaf-value (ebasecamp-ui-session-confirm session)))
+         (pending (and open (ebasecamp-ui-session-confirm-action session))))
+    (when pending
+      (etaf-view
+       (etaf-dialog
+        :open (ebasecamp-ui-session-confirm session)
+        :title "销毁环境"
+        :width '(ch 56)
+        :close-label nil
+        :on-close (lambda () (ebasecamp-ui-dismiss-confirm))
+        (column :width 'stretch :item-gap '(lh 1)
+          (etaf-label :text (ebasecamp-ui--confirm-message (cdr pending)))
+          (row :width 'stretch :cross-align 'center :item-gap '(ch 2)
+            (etaf-button :label "取消" :variant 'secondary
+                         :on-press (lambda () (ebasecamp-ui-dismiss-confirm)))
+            (etaf-button :label "确认销毁" :variant 'primary
+                         :on-press (lambda () (ebasecamp-ui-confirm))))))))))
 
 ;;; 交互与视图（组为中心的骨架）
 
@@ -928,26 +847,6 @@ SCOPE 为 scope 字符串（如 \"per-project\"）。"
               (plist-get instance :project)
               "")))
 
-(defun ebasecamp-ui--section-dispatch (session action project keys)
-  "把段内动作 ACTION（PROJECT + KEYS）派发到命令层，返回 t（已派发）或 nil。
-派发前置 busy；命令层 signal（含 `ebasecamp-command-busy'）时复位 busy 并写
-error notice「命令派发失败」，绝不让界面卡在「执行中」。
-与旧项目视图的 `ebasecamp-ui--dispatch' 的唯一差别：命令层的
-`ebasecamp-command-busy' 也归为「命令派发失败」（旧接口把这种情况提示为
-info「操作进行中」）；C5 合并两条路径时统一语义。"
-  (etaf-set-value (ebasecamp-ui-session-busy session) t)
-  (condition-case err
-      (progn
-        (ebasecamp-command-run
-         action project keys
-         :on-complete (ebasecamp-ui--on-complete session action))
-        t)
-    ((error quit)
-     (etaf-set-value (ebasecamp-ui-session-busy session) nil)
-     (ebasecamp-ui--set-notice session 'error "命令派发失败"
-                               (error-message-string err))
-     nil)))
-
 (defun ebasecamp-ui--section-action (action instance)
   "对配置实例 INSTANCE 派发生命周期 ACTION。
 实例含 :config / :project / :records；keys 取会话选中集合（段内唯一：右栏只显示
@@ -977,7 +876,7 @@ info「操作进行中」）；C5 合并两条路径时统一语义。"
                                 "请先勾选要操作的服务")
       nil)
      ((not (eq action 'start))
-      (ebasecamp-ui--section-dispatch session action project keys))
+      (ebasecamp-ui--dispatch session action project keys))
      (t
       (let* ((conflicts (ebasecamp-command-port-conflicts project keys))
              (split (ebasecamp-ui--split-conflicts conflicts))
@@ -993,7 +892,7 @@ info「操作进行中」）；C5 合并两条路径时统一语义。"
             (ebasecamp-ui--set-notice
              session 'info "端口提示"
              (ebasecamp-ui--conflict-summary soft)))
-          (ebasecamp-ui--section-dispatch session action project keys)))))))
+          (ebasecamp-ui--dispatch session action project keys)))))))
 
 (defun ebasecamp-ui--section-button (label action variant instance disabled)
   "返回段内生命周期按钮：文案 LABEL、语义 VARIANT，按下对 INSTANCE 派发 ACTION。
@@ -1168,7 +1067,10 @@ GROUP 为 state 的组项 plist；服务名取自 `:service-names'（组定义�
             (expr (ebasecamp-ui--tree-view session)))
           (slot :name 'second
             (expr (ebasecamp-ui--detail-view session state))))
-         (etaf-divider))))))
+         (etaf-divider)
+         (expr (ebasecamp-ui--footer-view))
+         (expr (ebasecamp-ui--notice-view session))
+         (ebasecamp-ui-confirm-dialog))))))
 
 ;;; 导入 / 导出入口
 
@@ -1257,36 +1159,72 @@ Ebox 负责目标有效性与焦点恢复。"
                                  (error-message-string err))
        nil))))
 
+(defun ebasecamp-ui--read-project (prompt)
+  "用 `completing-read' 从清单里选项目，返回项目名 symbol；未选到返回 nil。
+PROMPT 为提示文案。清单无项目时写 info notice「没有可用项目」并返回 nil
+（不抛错，让调用方安静收场）；用户取消选择时 `completing-read' 会 signal
+`quit'，由调用方静默转成 nil。"
+  (let ((projects (ebasecamp-model-projects)))
+    (if (null projects)
+        (progn
+          (ebasecamp-ui--set-notice (ebasecamp-ui-session) 'info "没有可用项目"
+                                    "请先在清单中定义项目")
+          nil)
+      (let ((name (completing-read
+                   prompt
+                   (mapcar (lambda (project)
+                             (symbol-name (ebasecamp-project-name project)))
+                           projects)
+                   nil t)))
+        (and (stringp name)
+             (not (string-empty-p name))
+             (intern name))))))
+
 (defun ebasecamp-ui-export-compose ()
-  "把当前项目导出为部署用 compose 文件，成功后提示。返回导出路径或 nil。
+  "选项目并导出为部署用 compose 文件，成功后提示。返回导出路径或 nil。
+项目经 `completing-read' 选择（D5：不再依赖「当前项目」兼容层）；返回 nil 的
+三种情形一律安静：清单无项目（写 info notice「没有可用项目」）、用户取消
+选择（`quit'）、导出层返回 nil（例如冲突三选一里选了取消）。
 路径选择与覆盖冲突「换一个路径 / 覆盖 / 取消」三选一都由
 `ebasecamp-export-project' 负责（这里把 `ebasecamp-export--interactive' 绑成
 t，使事件回调上下文也能弹出该询问）。"
   (interactive)
-  (let ((session (ebasecamp-ui-session))
-        (project (ebasecamp-ui-current-project)))
-    (if (null project)
-        (progn
-          (ebasecamp-ui--set-notice session 'info "请先选择项目"
-                                    "清单里还没有项目，或尚未选定项目")
-          nil)
-      (condition-case err
+  (let ((session (ebasecamp-ui-session)))
+    (condition-case err
+        (when-let* ((name (ebasecamp-ui--read-project "导出项目： ")))
           (let ((ebasecamp-export--interactive t)
                 (path (ebasecamp-export-project
-                       (ebasecamp-model-project project) :force nil)))
+                       (ebasecamp-model-project name) :force nil)))
             (when path
               (ebasecamp-ui--set-notice session 'success "导出完成" path))
-            path)
-        (quit nil)
-        (ebasecamp-export-error
-         (ebasecamp-ui--set-notice session 'error "导出失败"
-                                   (ebasecamp-ui--error-text err)
-                                   (ebasecamp-ui--error-detail err))
-         nil)
-        (error
-         (ebasecamp-ui--set-notice session 'error "导出失败"
-                                   (error-message-string err))
-         nil)))))
+            path))
+      (quit nil)
+      (ebasecamp-export-error
+       (ebasecamp-ui--set-notice session 'error "导出失败"
+                                 (ebasecamp-ui--error-text err)
+                                 (ebasecamp-ui--error-detail err))
+       nil)
+      (error
+       (ebasecamp-ui--set-notice session 'error "导出失败"
+                                 (error-message-string err))
+       nil))))
+
+(defun ebasecamp-ui-destroy-environment ()
+  "选项目并把「销毁环境」转入二次确认，返回 t（已转入确认）或 nil。
+交互链：`completing-read' 选项目 → 待确认动作写成 `(down . 项目名)'、置
+`confirm' ref 为 t → `ebasecamp-ui-confirm-dialog' 弹出（文案点名该项目）。
+真正的派发发生在确认按钮（`ebasecamp-ui-confirm'），且 keys 为 nil（全部
+服务）：`down' 的语义是整个 compose 项目，shared 组不提供 down。
+返回 nil 的两种情形一律安静：清单无项目（info notice「没有可用项目」）、
+用户取消选择（`quit'）。"
+  (interactive)
+  (let ((session (ebasecamp-ui-session)))
+    (condition-case nil
+        (when-let* ((name (ebasecamp-ui--read-project "销毁项目： ")))
+          (setf (ebasecamp-ui-session-confirm-action session) (cons 'down name))
+          (etaf-set-value (ebasecamp-ui-session-confirm session) t)
+          t)
+      (quit nil))))
 
 ;;; 公开 API
 

@@ -2,11 +2,11 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 批次 C 进行中（C0–C4 完成）
+- 阶段：Phase 3（Implement）· 批次 C 进行中（C0–C5 完成）
 - 已确认：方案 V3 ✅（用户 2026-10-22）、计划 ✅（用户 2026-10-22 确认；plan-reviewer 三轮审查通过）
-- 已完成：批次 A（加载修复）、批次 B（模型 + 物化 + 加载集成）、批次 D（导入/导出往返，含 D4 env_file 与 D5 渲染判据两个阻断缺陷修复）、C0（组为中心的会话与视图骨架）、C1/C2（`ebasecamp-data-group-instances` 组配置实例装配）、C3（段渲染：每份配置一个 `etaf-panel` + 服务表）、C4（段内派发：段内按钮按该段自己的 project 派发到 `ebasecamp-command-run`）
-- 测试基线：299 tests 全绿（C4 后 299，新增 8 项；C3 后 291）
-- 下一步：C5 底栏（导入 / 导出 / 销毁环境，销毁走「选项目 + 二次确认」，并把旧的项目视图接口迁移到「选项目」语义、合并 `--dispatch` 与 `--section-dispatch`）→ C6 删数据适配 → C7 测试与目检
+- 已完成：批次 A（加载修复）、批次 B（模型 + 物化 + 加载集成）、批次 D（导入/导出往返，含 D4 env_file 与 D5 渲染判据两个阻断缺陷修复）、C0（组为中心的会话与视图骨架）、C1/C2（`ebasecamp-data-group-instances` 组配置实例装配）、C3（段渲染：每份配置一个 `etaf-panel` + 服务表）、C4（段内派发：段内按钮按该段自己的 project 派发到 `ebasecamp-command-run`）、C5（底栏导入/导出/销毁 + 派发路径统一 + 旧项目视图接口迁移）
+- 测试基线：300 tests 全绿（C5 后 300，新增 9 删 8 改 5；C4 后 299）
+- 下一步：C6 删 ETAF 数据适配（`ebasecamp-data` 的 `etaf-data-*`，保留纯装配函数）→ C7 测试与目检
 - 待用户：A4 重启 Emacs 后 `M-x ebasecamp` 目检
 
 
@@ -160,8 +160,9 @@
 - [x] C4 段内派发：勾选服务 → 段内按钮 → `ebasecamp-command-run action project keys`；busy 期间该段按钮 `:disabled`；失败走既有 notice（stderr 首行 + 详情）
       （依赖：C3）验收：ERT 用 mock 断言派发的 project 与 keys 正确、双击只派发一次、busy 期间拒绝
       （完成：`--section-action` 由占位改为 `(action instance)`，判定顺序严格为 busy（info「操作进行中」）→ 实例 `:project` 为空（info「该项目未定义」）→ 选中集合为空（info「未选中服务」/「请先勾选要操作的服务」）→ `start` 才做 `ebasecamp-command-port-conflicts`（`duplicate`/`busy` → error「端口冲突」+ 摘要并拒绝；`unknown` → info「端口提示」+ 摘要后继续）→ 派发；keys 取 `ebasecamp-ui-selected-keys`（段内 `"组名/服务名"`），project 取该实例自己的 `:project`（字符串），不经 `ebasecamp-ui-current-project` 兼容层，故同组多实例不串段。新增 `--section-dispatch`（复用 `--on-complete` 完成回调：复位 busy → 刷新 → `--report-result`；派发前置 busy=t，任何 error（含命令层 `ebasecamp-command-busy`）→ 复位 busy + error「命令派发失败」，未复用旧的 `--dispatch`——旧路径把命令层 busy 提示为 info「操作进行中」，C5 合并两条路径时统一）。`--section-button` 签名改为 `(label action variant instance disabled)`，`:on-press` 为 `(lambda () (ebasecamp-ui--section-action action instance))`，`:disabled` 仍由 `--busy-p` 在渲染期求值为布尔。旧接口全部保留并加 docstring 标注「C5 将迁移到「选项目」语义；当前仅为旧调用点保留」：`ebasecamp-ui-run-action` / `ebasecamp-ui-confirm` / `--run-action` / `--confirm-dialog`（旧链路 `--action-button` / `--action-bar` 未改）；`ebasecamp-command-port-conflicts` 旧调用点标注「遗留调用点」。测试新增 8 项（`section-action-dispatches-with-instance-project`、`-uses-own-project-per-instance`、`-rejects-when-busy`、`-rejects-empty-selection`、`-blocks-on-port-conflict`、`-allows-soft-conflict`、`-double-click-dispatches-once`、`-resets-busy-on-dispatch-error`），并把 C3 的 `header-buttons-disabled-when-busy` 按钮打桩改为 5 参（记录 instance）；红阶段实测 299 项中 9 项 FAILED（8 个新用例 + 该打桩项因 arity 变更），转绿后 `make check` 退出码 0、299/299 全绿（check-parens OK 22 files、compile 零 warning）。真实 docker 一次未跑，命令层与端口检测全部 `cl-letf` 打桩）
-- [ ] C5 底栏：导入 compose（沿用现有链路）、导出 compose（`completing-read` 选项目）、销毁环境（选项目 + `etaf-dialog` 二次确认）
+- [x] C5 底栏：导入 compose（沿用现有链路）、导出 compose（`completing-read` 选项目）、销毁环境（选项目 + `etaf-dialog` 二次确认）
       （依赖：C4）验收：batch 断言三个入口存在；`M-x` 调用时取消 `completing-read` 静默返回 nil
+      （完成：底栏为主视图 column 底部三按钮（`--footer-view`，ghost，`row :item-gap '(ch 2)`）：导入 compose / 导出 compose / 销毁环境；三者都不是生命周期动作，故不参与 `busy` 判定（销毁的危险性由二次确认承担）。导出与销毁都改为 `completing-read` 选项目（`--read-project`，候选为清单项目名的 `symbol-name`；清单无项目 → info「没有可用项目」+ nil；`quit` → 静默 nil）——`ebasecamp-ui-current-project` 兼容层因此无调用点并删除。导出仍绑 `ebasecamp-export--interactive` t（冲突三选一在事件回调里可用），成功 notice success「导出完成」+ 路径，失败走既有 error notice。新增 `ebasecamp-ui-destroy-environment`：选项目 → `confirm-action` = `(down . 项目名)` + `confirm` ref t → 确认框；`ebasecamp-ui-confirm` 取 `(动作 . 项目名)`、先清空确认状态，再 `(ebasecamp-ui--dispatch session 'down project nil)`（keys 为 nil = 全部服务）；确认文案「将停止并移除项目 <名> 的全部 per-project 容器，不会删除卷。shared 组不受影响。」。派发路径统一为一个 `ebasecamp-ui--dispatch`（段内 `--section-action` 与销毁确认都走它）：`ebasecamp-command-busy` → info「操作进行中」/「请等待当前命令完成」，其他 error → error「命令派发失败」+ 消息，均复位 busy；`--section-dispatch` 删除。删除清单（grep 确认无调用点）：`ebasecamp-ui--action-button`、`--action-bar`、`--bar-button`、`--run-action`、`ebasecamp-ui-run-action`、`ebasecamp-ui-current-project`、`--section-dispatch`；`--confirm-dialog` 由组件 `ebasecamp-ui-confirm-dialog` 取代（`:render` 读 `confirm` ref，否则文案会在父组件上次渲染时固化成「（未选择）」）。主视图 column 末尾追加 divider → 底栏 → notice → 确认框。测试：新增 9 项（`renders-footer-buttons`、`export-without-projects-notices`、`export-selects-project-via-completing-read`、`export-cancel-is-silent`、`destroy-requires-confirmation`、`destroy-confirm-dispatches-down`、`destroy-dialog-text-mentions-project`、`dispatch-busy-maps-to-info`、`dispatch-other-error-maps-to-error`），删除 8 项（`current-project-compat-shim`、6 个 `run-action-*`、`export-without-project`），改写 5 项（`close-stops-polling`、`on-complete-clears-busy`、`section-action-resets-busy-on-command-error`（原 `...-on-dispatch-error`，busy 语义变更）、`export-success`、`export-failure`）；红阶段 300 项中 8 项 FAILED（第 9 项 `dispatch-other-error-maps-to-error` 在旧 `--dispatch` 下天然绿，作回归护栏）。`destroy-dialog-text-mentions-project` 的 batch 断言改为「文案函数 + 组件已注册」——实测 `etaf-dialog` 走 root-layer 投影，挂载后 buffer 文本为空串。转绿后 `make check` 退出码 0、300/300 全绿（check-parens OK 22 files、compile 零 warning）。真实 docker 一次未跑，命令层全部 `cl-letf` 打桩）
 - [ ] C6 清理数据适配层（放在 UI 重写之后，避免 `make compile` 空窗）：删除 `ebasecamp-data` 中 ETAF Data 适配（`ebasecamp-data-source`、`-controller`、`-refresh`、`--load`、`--query-records`、`--slice`、`--filter`、`--field-equal`），保留纯装配函数（`--name-string`、`--service-ports`、`--item-key`、`--group-ref-scope`、`--record-lessp`、`--service-record`、`ebasecamp-data-project-records`、`--status-index`、`--resolve-project`）；同步删除 `test/ebasecamp-data-tests.el` 中 ETAF 适配相关用例，并在报告中列出「保留用例清单」（须含 `project-records` / `service-ports` / `record-lessp` / `item-key` 的用例）
       （依赖：C5）验收：`make check` 全绿；`grep -rn 'etaf-data' lisp/` 输出为空（0 行匹配）；报告删除用例数与新测试总数
 - [ ] C7 界面测试与真实目检：重写 `test/ebasecamp-ui-tests.el` 覆盖上述断言；由用户在新 Emacs 里目检一次
@@ -171,6 +172,7 @@
 
 - [ ] E1 承接原计划 T5.2：写 `docs/architecture.org`、`docs/user-guide.org`、`docs/compose-generation.org`、`docs/troubleshooting.org`，全部按 v0.2 新模型描述
       （依赖：C7）验收：四份文档存在；compose-generation 的映射表与实现一致；troubleshooting 覆盖权限/端口冲突/config -q 失败/版本不符/「命令不存在」排查
+      注意：`docs/architecture.org:147,149,185` 与 `Readme.org:180` 仍引用已删除的 `ebasecamp-ui-run-action` / `ebasecamp-ui-current-project`，E1/E2 必须同步修正
 - [ ] E2 `Readme.org`：清单示例换成组内 configs 写法，命令表补「加载不到包」排查；示例用具体命令实测：`emacs -Q --batch -L . -L lisp -L $(HOME)/thomas-emacs/.local/straight/build-31.1/etaf -L $(HOME)/thomas-emacs/.local/straight/build-31.1/etaf-ui -L $(HOME)/thomas-emacs/.local/straight/build-31.1/ebox -L $(HOME)/thomas-emacs/.local/straight/build-31.1/ecss -l /tmp/readme-manifest.el --eval '(progn (prin1 (length (ebasecamp-model-groups))) (terpri))'`
       （依赖：E1）验收：命令退出码 0 且输出的组数符合示例
 - [ ] E3 `CHANGELOG.md` 追加 0.2.0：模型新增 `:configs`、界面改为组为中心、旧写法兼容、加载修复说明
