@@ -757,5 +757,221 @@ BODY 内可用 `compose-file' 取该文件绝对路径。"
           (should (ebasecamp-ui-test--contains-p
                    (plist-get notice :detail) "go-yaml load error")))))))
 
+;;; 11. 配置段渲染（C3）
+
+;; 右栏把选中组的每份配置渲染成一个 `etaf-panel' 段（段头 + 服务表）。这些
+;; 用例不改动主界面 buffer：`ebasecamp-ui-view' 直接挂到临时 buffer 上取文本，
+;; 因此不依赖 `etaf-set-value' 在 batch 下是否会重新 patch 已有 buffer。
+;; 选中状态也先写进会话再挂载视图，避免依赖渲染时序。
+
+(defun ebasecamp-ui-test--project-container (project group service state)
+  "构造一个 per-project scope 的容器 plist（与 `ebasecamp-docker-ps' 产物一致）。"
+  (list :id (format "id-%s-%s" project service)
+        :names (format "%s-%s-1" project service)
+        :image "mysql:8.4"
+        :state state
+        :health (and (equal state "running") "healthy")
+        :ports "0.0.0.0:3306->3306/tcp"
+        :labels (list (cons "ebasecamp.managed" "true")
+                      (cons "ebasecamp.project" project)
+                      (cons "ebasecamp.group" group)
+                      (cons "ebasecamp.service" service)
+                      (cons "ebasecamp.scope" "per-project"))
+        :project project
+        :group group
+        :service service
+        :scope "per-project"))
+
+(defun ebasecamp-ui-test--section-manifest ()
+  "定义 per-project 组 mysql（2 服务 / 2 份配置）与两个项目：
+dev → myapp（服务全 running）、prod → other（mysql-ro 未启动）。"
+  (ebasecamp-define-group mysql
+    :title "MySQL"
+    :scope per-project
+    :services ((mysql :image "mysql:8.4" :ports ((3306 . 3306)))
+               (mysql-ro :image "mysql:8.4"))
+    :configs ((dev :project myapp)
+              (prod :project other)))
+  (ebasecamp-define-project myapp :title "示例项目" :groups nil)
+  (ebasecamp-define-project other :title "另一项目" :groups nil))
+
+(defun ebasecamp-ui-test--section-containers ()
+  "返回覆盖上述两组实例的容器列表：myapp 两个服务 running，other 只有 mysql。"
+  (list (ebasecamp-ui-test--project-container "myapp" "mysql" "mysql" "running")
+        (ebasecamp-ui-test--project-container "myapp" "mysql" "mysql-ro"
+                                             "running")
+        (ebasecamp-ui-test--project-container "other" "mysql" "mysql"
+                                             "running")))
+
+(defun ebasecamp-ui-test--main-text ()
+  "把主界面视图挂到临时 buffer 并返回纯文本（不动主界面 buffer）。"
+  (ebasecamp-ui-test--mount-text (ebasecamp-ui-view)))
+
+(defun ebasecamp-ui-test--render (&optional group-key)
+  "建会话、(可选) 选中 GROUP-KEY、按最近快照重建 state，返回 (STATE . TEXT)。"
+  (let ((session (ebasecamp-ui-session)))
+    (when group-key
+      (ebasecamp-ui--select-key session group-key))
+    (ebasecamp-ui-refresh (ebasecamp-status-last-records) t)
+    (cons (etaf-value (ebasecamp-ui-session-state session))
+          (ebasecamp-ui-test--main-text))))
+
+(ert-deftest ebasecamp-ui-test-build-state-includes-instances-and-counts ()
+  "每组的 :instances 来自 group-instances，计数逐级汇总且每组只装配一次。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (ebasecamp-status-snapshot)
+      (let* ((state (ebasecamp-ui--build-state))
+             (group (car (plist-get state :groups)))
+             (instances (plist-get group :instances))
+             (first (car instances))
+             (second (cadr instances)))
+        (should (equal '("dev" "prod")
+                       (mapcar (lambda (instance) (plist-get instance :config))
+                               instances)))
+        ;; dev 2/2 running，prod 1/2（mysql-ro 未启动）
+        (should (equal '(2 1)
+                       (mapcar (lambda (instance) (plist-get instance :running))
+                               instances)))
+        (should (equal '(2 2)
+                       (mapcar (lambda (instance) (plist-get instance :total))
+                               instances)))
+        (should (equal 3 (plist-get group :running)))
+        (should (equal 4 (plist-get group :total)))
+        (should (equal "myapp" (plist-get first :project)))
+        (should (equal "示例项目" (plist-get first :project-title)))
+        (should (equal "per-project" (plist-get first :scope)))
+        (should (equal 2 (length (plist-get first :records))))
+        (should (equal "other" (plist-get second :project)))
+        ;; 树节点文案：组 \"标题  (N 配置 · R/T running)\"，配置 \"dev → 项目  (R/T)\"
+        (should (equal "MySQL  (2 配置 · 3/4 running)"
+                       (ebasecamp-ui--group-caption group)))
+        (should (equal "dev → 示例项目  (2/2)"
+                       (ebasecamp-ui--config-caption
+                        (car (plist-get group :configs)))))
+        ;; 配置项也带计数：树的配置节点文案用
+        (should (equal '(2 1)
+                       (mapcar (lambda (config) (plist-get config :running))
+                               (plist-get group :configs))))
+        (should (equal '(2 2)
+                       (mapcar (lambda (config) (plist-get config :total))
+                               (plist-get group :configs))))
+        ;; 一次 build-state 内每组只调一次 group-instances
+        (let ((original (symbol-function 'ebasecamp-data-group-instances))
+              (calls 0))
+          (cl-letf (((symbol-function 'ebasecamp-data-group-instances)
+                     (lambda (group)
+                       (cl-incf calls)
+                       (funcall original group))))
+            (ebasecamp-ui--build-state)
+            (should (= 1 calls))))))))
+
+(ert-deftest ebasecamp-ui-test-render-sections-for-selected-group ()
+  "选中组后右栏渲染每份配置一个段：段头（配置 → 项目 + 计数）+ 服务表行。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let ((text (cdr (ebasecamp-ui-test--render "group/mysql"))))
+        (should (ebasecamp-ui-test--contains-p text "dev → 示例项目"))
+        (should (ebasecamp-ui-test--contains-p text "prod → 另一项目"))
+        (should (ebasecamp-ui-test--contains-p text "mysql-ro"))
+        (should (ebasecamp-ui-test--contains-p text "RUNNING"))
+        (should (ebasecamp-ui-test--contains-p text "STOPPED"))
+        (should (ebasecamp-ui-test--contains-p text "2/2"))
+        (should (ebasecamp-ui-test--contains-p text "1/2"))
+        (should (ebasecamp-ui-test--contains-p text "启动选中"))
+        (should (ebasecamp-ui-test--contains-p text "停止选中"))
+        (should (ebasecamp-ui-test--contains-p text "重启选中"))
+        (should (ebasecamp-ui-test--contains-p text "健康"))
+        (should-not (ebasecamp-ui-test--contains-p text "选择左侧的组"))
+        (should-not (ebasecamp-ui-test--contains-p text "尚未关联任何项目"))))))
+
+(ert-deftest ebasecamp-ui-test-render-empty-configs-placeholder ()
+  "组无配置：右栏含「尚未关联任何项目」并列出组定义的服务名（只读）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-define-group cache
+      :title "Cache"
+      :scope shared
+      :services ((redis :image "redis:7")
+                 (redis-ro :image "redis:7")))
+    (ebasecamp-ui-test--with-ps nil
+      (let ((text (cdr (ebasecamp-ui-test--render "group/cache"))))
+        (should (ebasecamp-ui-test--contains-p text "尚未关联任何项目"))
+        (should (ebasecamp-ui-test--contains-p text "只读"))
+        (should (ebasecamp-ui-test--contains-p text "redis-ro"))
+        (should-not (ebasecamp-ui-test--contains-p text "选择左侧的组"))))))
+
+(ert-deftest ebasecamp-ui-test-render-no-selected-group-shows-placeholder ()
+  "未选中组：右栏保持「选择左侧的组」占位，不渲染段与按钮。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let ((text (cdr (ebasecamp-ui-test--render))))
+        (should (ebasecamp-ui-test--contains-p text "选择左侧的组"))
+        (should-not (ebasecamp-ui-test--contains-p text "启动选中"))))))
+
+(ert-deftest ebasecamp-ui-test-render-checkbox-writes-selection ()
+  "服务行的 checkbox 用段内 key（\"组/服务\"）写回选中集合。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (let* ((session (ebasecamp-ui-session))
+           (record (car (plist-get (car (ebasecamp-data-group-instances 'mysql))
+                                   :records)))
+           (key (ebasecamp-ui--instance-key "mysql" record))
+           (cell (plist-get (car (ebasecamp-ui--columns session "mysql"))
+                            :cell)))
+      (should (equal "mysql/mysql" key))
+      (should (ebasecamp-ui-test--contains-p
+               (ebasecamp-ui-test--mount-text (funcall cell record)) "[ ]"))
+      (ebasecamp-ui--toggle-selected session key t)
+      (should (member key (ebasecamp-ui-selected-keys)))
+      (should (ebasecamp-ui-test--contains-p
+               (ebasecamp-ui-test--mount-text (funcall cell record)) "[x]"))
+      (ebasecamp-ui--toggle-selected session key nil)
+      (should-not (member key (ebasecamp-ui-selected-keys))))))
+
+(ert-deftest ebasecamp-ui-test-header-buttons-disabled-when-busy ()
+  "段头的三个生命周期按钮把 busy ref 的当前值传给 `:disabled'。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let* ((session (ebasecamp-ui-session))
+             (_state (progn (ebasecamp-ui-refresh
+                             (ebasecamp-status-last-records) t)
+                            nil))
+             (group (car (plist-get
+                          (etaf-value (ebasecamp-ui-session-state session))
+                          :groups)))
+             (instance (car (plist-get group :instances))))
+        (should-not (ebasecamp-ui--busy-p session))
+        (cl-labels ((capture ()
+                      (let (seen)
+                        (cl-letf (((symbol-function
+                                    'ebasecamp-ui--section-button)
+                                   (lambda (label action variant disabled)
+                                     (push (list label action disabled) seen)
+                                     (etaf-view (etaf-label :text label)))))
+                          (ebasecamp-ui-test--mount-text
+                           (ebasecamp-ui--instance-section
+                            session "mysql" instance))
+                          (reverse seen)))))
+          (let ((seen (capture)))
+            (should (equal '("启动选中" "停止选中" "重启选中")
+                           (mapcar #'car seen)))
+            (should (equal '(nil nil nil)
+                           (mapcar (lambda (entry) (nth 2 entry)) seen))))
+          (etaf-set-value (ebasecamp-ui-session-busy session) t)
+          (should (ebasecamp-ui--busy-p session))
+          (let ((seen (capture)))
+            (should (equal '(t t t)
+                           (mapcar (lambda (entry) (nth 2 entry)) seen)))))
+        ;; 不替换按钮实现时，段头文案里三个按钮都在
+        (let ((text (ebasecamp-ui-test--mount-text
+                     (ebasecamp-ui--instance-section session "mysql" instance))))
+          (should (ebasecamp-ui-test--contains-p text "启动选中"))
+          (should (ebasecamp-ui-test--contains-p text "停止选中"))
+          (should (ebasecamp-ui-test--contains-p text "重启选中")))))))
+
 (provide 'ebasecamp-ui-tests)
 ;;; ebasecamp-ui-tests.el ends here

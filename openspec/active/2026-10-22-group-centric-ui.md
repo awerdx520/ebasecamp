@@ -2,11 +2,11 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 批次 C 进行中（C0–C2 完成）
+- 阶段：Phase 3（Implement）· 批次 C 进行中（C0–C3 完成）
 - 已确认：方案 V3 ✅（用户 2026-10-22）、计划 ✅（用户 2026-10-22 确认；plan-reviewer 三轮审查通过）
-- 已完成：批次 A（加载修复）、批次 B（模型 + 物化 + 加载集成）、批次 D（导入/导出往返，含 D4 env_file 与 D5 渲染判据两个阻断缺陷修复）、C0（组为中心的会话与视图骨架）、C1/C2（`ebasecamp-data-group-instances` 组配置实例装配）
-- 测试基线：285 tests 全绿（C0 后 278，C1 新增 7 项）
-- 下一步：C3 段渲染（每份配置一个 `etaf-panel` + 服务 `etaf-table`）→ C4 段内派发 → C5 底栏 → C6 删数据适配 → C7 测试与目检
+- 已完成：批次 A（加载修复）、批次 B（模型 + 物化 + 加载集成）、批次 D（导入/导出往返，含 D4 env_file 与 D5 渲染判据两个阻断缺陷修复）、C0（组为中心的会话与视图骨架）、C1/C2（`ebasecamp-data-group-instances` 组配置实例装配）、C3（段渲染：每份配置一个 `etaf-panel` + 服务表）
+- 测试基线：291 tests 全绿（C3 后 291，新增 6 项）
+- 下一步：C4 段内派发（勾选服务 → 段内按钮 → `ebasecamp-command-run`）→ C5 底栏 → C6 删数据适配 → C7 测试与目检
 - 待用户：A4 重启 Emacs 后 `M-x ebasecamp` 目检
 
 
@@ -154,8 +154,9 @@
 - [x] C2 实现数据装配：新增 `ebasecamp-data-group-instances (group)`，返回 `((:config 名 :project 项目名 :scope S :records (...)) ...)`；shared 按 D8 匹配
       （依赖：C1）验收：C1 转绿；纯函数、无 IO
       （完成：返回项含 `:config` / `:project` / `:project-title` / `:scope` / `:records`，实例按配置定义顺序、记录按服务名升序；新增私有辅助 6 个 —— `--resolve-group`（对象/symbol/字符串 → 组对象）、`--config-ref`（优先项目 groups 槽里同组第一项，即含覆盖的物化 ref；未物化回退 `(:group G :scope S)`）、`--instance-indexes`（双索引：shared 键 `group/service` 只收 `:scope "shared"` 的记录，project 键 `project/group/service`）、`--instance-status`（按 scope 分流，D8）、`--instance-services`（项目未注册时用组默认定义副本）、`--instance-records`（单实例装配）。实测发现并修复一处缺陷：`--service-record` 不归一化 `:group`，把组名 symbol 直接传入会让记录 `:group` 为 symbol（与 `project-records` 的字符串形态不同源，`equal` 比较失败），改为先经 `--name-string` 归一。`make check` 退出码 0，285/285 全绿（check-parens OK 22 files、compile 零 warning）；batch 实测 `status-records-unchanged=t`（不修改 `ebasecamp-status--last-records`）、二次调用 `idempotent=t`、组无配置/组不存在均返回 nil）
-- [ ] C3 段渲染：每份配置一个 `etaf-panel`（header 槽手搓 row：配置名 → 项目 + scope 徽标 + running/total + 三个按钮）+ `etaf-table` 服务行（首列 checkbox）
+- [x] C3 段渲染：每份配置一个 `etaf-panel`（header 槽手搓 row：配置名 → 项目 + scope 徽标 + running/total + 三个按钮）+ `etaf-table` 服务行（首列 checkbox）
       （依赖：C2）验收：batch 断言 段头文案、服务行数、状态文案；无配置组显示「尚未关联任何项目」
+      （完成：`ebasecamp-ui.el` 新增段渲染层 —— `--running-count` / `--instance-state`（`:config`/`:project`/`:project-title`/`:scope`/`:running`/`:total`/`:records`）/ `--config-state`（改由实例派生，树节点获得计数）/ `--group-service-names` / `--group-state`（`:instances` + 逐级汇总 `:running`/`:total` + `:service-names`，每组建**只装配一次** `group-instances`，配置项由实例派生）；树文案 `--group-caption` → `"MySQL  (2 配置 · 3/4 running)"`（无服务时省略计数）、`--config-caption` → `"dev → 示例项目  (2/2)"`；新增 `--instance-key`（段内 key `"组名/服务名"`，docstring 写明「同组多实例服务同名 → 选中跨段共享」的第一期语义）、`--busy-p`、`--scope-badge`（per-project→info / shared→warning）、`--ratio-variant`（0/total=0→neutral、全 running→success、其余→warning）、`--instance-caption`、`--section-action`（**占位**，C4 实现派发）、`--section-button`（`:disabled` 由渲染期 busy 求值）、`--instance-header`、`--service-table`、`--instance-section`、`--group-header-row`、`--empty-configs-view`、`--detail-view`（未选中→占位 / 无配置→空态+组定义服务名 / 有配置→组标题行 + 每份配置一段）；`--select-cell` 与 `--columns` 改收 `group-name` 并改用 `--instance-key`（旧的 `ebasecamp-data--item-key` 不再被 UI 使用，函数保留给 data 层）；`--command-key` 兼容两段形态；服务表列宽改为「镜像 / 端口用 `(fr 2)` 抢剩余宽度」——实测 80 列 batch 下右栏约 48 列，定宽相加会把「健康」列挤出可视区。计划外调整两处：段头拆成两行（标题行 + 按钮行），否则窄面板下「停止选中 / 重启选中」被裁切；服务表列宽由 3/9/10/9/10/8 改为 3/9/(fr 2)/8/(fr 2)/5。测试：新增 6 项（`build-state-includes-instances-and-counts`、`render-sections-for-selected-group`、`render-empty-configs-placeholder`、`render-checkbox-writes-selection`、`render-no-selected-group-shows-placeholder`、`header-buttons-disabled-when-busy`）；红阶段实测 291 项中 5 项 FAILED（第 6 项在 C0 骨架下天然绿，作回归护栏），转绿后 `make check` 退出码 0、291/291 全绿（check-parens OK 22 files、compile 零 warning）。batch 实测渲染文本含 `dev → 示例项目`／`prod → 另一项目`／`2/2`／`1/2`／`启动选中 停止选中 重启选中`／`RUNNING`／`STOPPED`／`服务 镜像 状态 端口 健康`）
 - [ ] C4 段内派发：勾选服务 → 段内按钮 → `ebasecamp-command-run action project keys`；busy 期间该段按钮 `:disabled`；失败走既有 notice（stderr 首行 + 详情）
       （依赖：C3）验收：ERT 用 mock 断言派发的 project 与 keys 正确、双击只派发一次、busy 期间拒绝
 - [ ] C5 底栏：导入 compose（沿用现有链路）、导出 compose（`completing-read` 选项目）、销毁环境（选项目 + `etaf-dialog` 二次确认）
