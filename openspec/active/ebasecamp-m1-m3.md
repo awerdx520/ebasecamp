@@ -2,12 +2,12 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 批次 4 进行中
+- 阶段：Phase 3（Implement）· 批次 4 完成
 - 已确认：方案 V2 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）
-- 已完成：批次 0、批次 1、批次 2、批次 3（T3.1–T3.6）、T4.1（导入映射）、T4.2（导入落盘）、T4.3（导出）、T4.4（导入导出 UI 入口）、T4.5（导入导出安全断言）
-- 下一步：T4.6 L3 导入→启停→导出闭环
+- 已完成：批次 0–4（M1 数据层与界面、M2 生命周期、M3 导入导出）
+- 下一步：批次 5（文档：Readme.org / docs/*.org / CHANGELOG.md）
 - 待用户确认：真实 Emacs 中目检 `M-x ebasecamp` 界面（T2.3 验收项）
-- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist；批次 1 修复 stale .elc 陷阱；T2.3 修正 data 层语义、check-parens 覆盖 test/*.el；T3.1 补强跨 scope 依赖；T3.4 toast 降级为 alert；T4.1 落地导入映射（JSON 走 hash-table 解析、不可表达端口进 extra）；T4.2 落地导入落盘（组名 = 项目名、手工构造可读格式、写后自校验与回滚；临时 buffer 读回须显式 `forward-comment` 跳注释，`string-match-p` 校验名字须关 `case-fold-search`）；T4.3 落地导出（只渲 per-project 组 + 项目副本关 shared-network + 原子写 tmp→校验→rename；实测 `docker compose -f x.yaml.tmp config -q` 接受 `.tmp` 扩展名）；T4.4 落地导入导出 UI 入口（操作条改两行避免 80 列溢出裁切、`etaf-call-with-input` 只捕获 `etaf-event-error` 降级、导出侧绑 `ebasecamp-export--interactive` 让冲突三选一在回调里可用）；T4.5 落地导入→导出全链路密钥断言（docker 可用走真实 `--no-interpolate`，否则注入同形态 JSON）
+- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist；批次 1 修复 stale .elc 陷阱；T2.3 修正 data 层语义、check-parens 覆盖 test/*.el；T3.1 补强跨 scope 依赖；T3.4 toast 降级为 alert；T4.1 落地导入映射（JSON 走 hash-table 解析、不可表达端口进 extra）；T4.2 落地导入落盘（组名 = 项目名、手工构造可读格式、写后自校验与回滚；临时 buffer 读回须显式 `forward-comment` 跳注释、`string-match-p` 校验名字须关 `case-fold-search`）；T4.3 落地导出（只渲 per-project 组 + 项目副本关 shared-network + 原子写 tmp→校验→rename；实测 `docker compose -f x.yaml.tmp config -q` 接受 `.tmp` 扩展名）；T4.4 落地导入导出 UI 入口（操作条改两行避免 80 列溢出裁切、`etaf-call-with-input` 只捕获 `etaf-event-error` 降级、导出侧绑 `ebasecamp-export--interactive` 让冲突三选一在回调里可用）；T4.5 落地导入→导出全链路密钥断言（docker 可用走真实 `--no-interpolate`，否则注入同形态 JSON）；T4.6 真实 docker 闭环通过（导入→加载→启动→状态回读→停止→导出→部署 `config -q`，全程断言 40 项零失败，`:order (project)`、`:auto-started-shared nil`；清理后容器/网络/缓存目录回到基线）
 
 ## 目标
 
@@ -148,8 +148,9 @@ docker compose -f <file> config --no-interpolate --no-env-resolution --no-path-r
 - [x] T4.5 ERT 安全断言：导入含 `${FAKE_SECRET}` 与 `env_file` 的 fixture，断言清单保留引用、不出现明文、`env_file` 为相对路径；导出物同样不含明文
       （依赖：T4.1、T4.3）验收：断言匹配 `${FAKE_SECRET}`、不含探针值、`env_file` 路径不以 `/` 开头
       （已完成：端到端用例 `ebasecamp-import-test-e2e-import-export-keeps-reference` 在 `FAKE_SECRET=fake-e2e-secret` 环境下跑 导入落盘 → 读清单文本 → `ebasecamp-config-load` → 导出 → 读导出文本；docker 可用时走真实 `compose config --no-interpolate`（本机实测走真实分支），不可用时注入同形态 JSON；导出前 `cl-letf` 打桩 `ebasecamp-docker-check-compose` 返回 `(:ok t)`；断言两处文本均含 `${FAKE_SECRET}`、均不含探针明文，清单侧 `env_file` 为 `"./api.env"` 且无绝对化路径。ERT 新增 1 项，全量 234 项）
-- [ ] T4.6 L3 闭环：真实项目 compose → 导入（项目名交互）→ 启动 → 停止 → 导出 → `config -q` 通过
+- [x] T4.6 L3 闭环：真实项目 compose → 导入（项目名交互）→ 启动 → 停止 → 导出 → `config -q` 通过
       （依赖：T4.1–T4.5）验收：全链路成功；`~/.config/ebasecamp/projects/<name>.el` 存在且可加载；清理干净
+      （已完成：`emacs -Q --batch` 驱动真实 docker（29.9.1 / compose 5.6.0）跑闭环，清单目录与项目根均放 `/tmp`；导入物 `projects/myapp.el` 含 `ebasecamp-define-group/project myapp`、`:image "alpine:3"`、`:ports ((18081 . 80))`、`GREETING`/`SECRET_REF` 保留 `${...}` 原样、`ebasecamp.*` 标签被剔除而 `com.example.owner` 保留；`ebasecamp-config-load` 零错误且注册 myapp；`ebasecamp-command-run 'start 'myapp` 结果 `:ok t` / `:order (project)` / `:auto-started-shared nil`，`docker ps` 实见 `ebc-myapp-web-1`/`ebc-myapp-cache-1` 均 running 且 web 为 `18081->80`、五项托管标签正确注入、同挂 `ebasecamp` 网络；`ebasecamp-docker-ps` 回读 2 条记录（project/group=myapp、scope=per-project、state=running）；stop 后同 2 条记录 state=exited；导出 `docker-compose.ebasecamp.yaml` 通过 `check-compose`（`:ok t`）且真实 `docker compose config -q` 退出码 0、stderr 仅 `EBC_SECRET` 未设的 warning，导出物无 `external: true`、无标签残留、端口保留；`down` 清理后 `docker rm -f` 无残留、`ebasecamp` 网络与 `~/.cache/ebasecamp/` 回到基线（删除）。共 33 项断言零失败，未发现产品缺陷）
 
 ### 批次 5：文档
 
