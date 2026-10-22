@@ -19,7 +19,7 @@
 ;;   │  └─ box → etaf-data-grid（服务表：服务 / 镜像 / 状态 / 端口 / 健康）
 ;;   ├─ etaf-divider
 ;;   ├─ row（操作条）: 启动选中 / 停止选中 / 重启选中 / 销毁环境
-;;   ├─ etaf-label（notice；无提示时显示操作提示）
+;;   ├─ etaf-alert（notice；无提示时退化为一行 etaf-label 操作提示）
 ;;   └─ etaf-dialog（销毁环境确认；`:open' 绑在会话的 confirm ref 上）
 ;;
 ;; 清单为空时整棵树替换为 `etaf-empty'；当前项目无组时表格显示
@@ -27,11 +27,19 @@
 ;;
 ;; 状态与生命周期：
 ;;
-;; - 会话对象（`ebasecamp-ui-session'）持有 Data controller 与四个 `etaf-ref'：
+;; - 会话对象（`ebasecamp-ui-session'）持有 Data controller 与若干 `etaf-ref'：
 ;;   当前项目（`project-ref'）、选中 key 列表（`selected-ref'）、生命周期命令
 ;;   执行中标记（`busy'）、操作提示（`notice'，值为 nil 或
-;;   `(:kind error|info :title STR :message STR)')、销毁确认框开关（`confirm'）。
+;;   `(:kind error|warning|success|info :title STR :message STR :detail STR-or-nil)'）、
+;;   销毁确认框开关（`confirm'），以及提示自动清除定时器（`notice-timer'）。
 ;;   会话在 `ebasecamp-ui-open' 中创建，`ebasecamp-ui-close' 中销毁；
+;; - 提示的呈现：notice 非 nil 时渲染 `etaf-alert'（`:variant' 由 `:kind' 映射、
+;;   `:dismissible' 的关闭按钮清空 notice），`:detail' 以换行拼接进 message；
+;;   成功 / 信息类提示在 `ebasecamp-ui-notice-timeout' 秒后自动清除，定时器
+;;   存进会话，`ebasecamp-ui-close' 与写新 notice 时都会先取消它（防泄漏）。
+;;   这里不用 `etaf-toast'：其实测要求 `:anchor' 必填（必须是带 `:id' 的
+;;   Host），且 batch 下只画出标题、正文不可见，无法覆盖需要展示 stderr 的
+;;   场景；
 ;; - `etaf-on-mounted' → `ebasecamp-status-start'，回调里**只**调
 ;;   `etaf-data-load'（不调 `ebasecamp-data-refresh'，否则一次刷新会跑两次
 ;;   `docker ps'）；
@@ -75,13 +83,21 @@
   :type 'sexp
   :group 'ebasecamp)
 
+(defcustom ebasecamp-ui-notice-timeout 3
+  "成功 / 信息类提示自动清除的秒数。
+错误类提示不自动清除（需要用户阅读 stderr），只能手动关闭。"
+  :type 'number
+  :group 'ebasecamp)
+
 ;;; 会话
 
 (cl-defstruct (ebasecamp-ui-session (:constructor ebasecamp-ui--session-create))
   "一次界面会话的可变状态。
 CONTROLLER 为 Data controller；PROJECT-REF / SELECTED-REF / BUSY / NOTICE /
-CONFIRM 均为 `etaf-ref'；CONFIRM-ACTION 为等待确认的动作 symbol（无则 nil）。"
-  controller project-ref selected-ref busy notice confirm confirm-action)
+CONFIRM 均为 `etaf-ref'；CONFIRM-ACTION 为等待确认的动作 symbol（无则 nil）；
+NOTICE-TIMER 为临时的提示自动清除定时器（无则 nil，必须随会话一起取消）。"
+  controller project-ref selected-ref busy notice confirm confirm-action
+  notice-timer)
 
 (defvar ebasecamp-ui--session nil
   "当前界面会话（`ebasecamp-ui-session' 对象）；未打开时为 nil。")
@@ -215,31 +231,84 @@ nil → \"-\"；healthy → OK；unhealthy → BAD；starting → STARTING；其
   "会阻塞启动的端口冲突类型。
 `unknown'（探测不可用）不阻塞，只作为提示写进 notice。")
 
-(defun ebasecamp-ui--set-notice (session kind title message)
-  "把 SESSION 的 notice 写成 KIND（error/info）+ TITLE + MESSAGE，返回 nil。"
+(defconst ebasecamp-ui--transient-notice-kinds '(success info)
+  "会自动清除的 notice 类型；错误类需要用户阅读细节，只能手动关闭。")
+
+(defun ebasecamp-ui--cancel-notice-timer (session)
+  "取消 SESSION 的提示自动清除定时器（无定时器时不动），返回 nil。"
   (when session
-    (etaf-set-value (ebasecamp-ui-session-notice session)
-                    (list :kind kind :title title :message message)))
+    (when-let* ((timer (ebasecamp-ui-session-notice-timer session)))
+      (cancel-timer timer)
+      (setf (ebasecamp-ui-session-notice-timer session) nil)))
+  nil)
+
+(defun ebasecamp-ui--clear-notice (session)
+  "清空 SESSION 的 notice 及其自动清除定时器，返回 nil。
+Dismissible alert 的 `:on-dismiss' 与定时器回调都走本函数。"
+  (when session
+    (ebasecamp-ui--cancel-notice-timer session)
+    (etaf-set-value (ebasecamp-ui-session-notice session) nil))
+  nil)
+
+(defun ebasecamp-ui--schedule-notice-clear (session notice)
+  "为瞬时类 NOTICE 安排自动清除定时器，返回定时器；不需要时返回 nil。
+定时器存进 SESSION，`ebasecamp-ui-close' 与写新 notice 前都会取消它。
+回调只在 SESSION 仍是当前会话时清除，避免关闭后操作已销毁的会话。"
+  (when (and session
+             (memq (plist-get notice :kind) ebasecamp-ui--transient-notice-kinds))
+    (let ((timer (run-with-timer
+                  ebasecamp-ui-notice-timeout nil
+                  (lambda ()
+                    (when (eq session ebasecamp-ui--session)
+                      (ebasecamp-ui--clear-notice session))))))
+      (setf (ebasecamp-ui-session-notice-timer session) timer)
+      timer)))
+
+(defun ebasecamp-ui--set-notice (session kind title message &optional detail)
+  "把 SESSION 的 notice 写成 KIND + TITLE + MESSAGE + DETAIL，返回 nil。
+KIND 为 error / warning / success / info；成功与信息类通知会在
+`ebasecamp-ui-notice-timeout' 秒后自动清除（定时器存进会话）。"
+  (when session
+    (ebasecamp-ui--cancel-notice-timer session)
+    (let ((notice (list :kind kind :title title :message message :detail detail)))
+      (etaf-set-value (ebasecamp-ui-session-notice session) notice)
+      (ebasecamp-ui--schedule-notice-clear session notice)))
   nil)
 
 (defun ebasecamp-ui--notice (session)
   "返回 SESSION 的 notice 值（nil 或 plist），读 ref 以建立渲染依赖。"
   (and session (etaf-value (ebasecamp-ui-session-notice session))))
 
-(defun ebasecamp-ui--notice-text (session)
-  "返回操作条下方的提示文案：有 notice 用「标题：正文」，否则用默认提示。"
-  (let ((notice (ebasecamp-ui--notice session)))
-    (if (and notice (plist-get notice :title))
-        (format "%s：%s" (plist-get notice :title)
-                (or (plist-get notice :message) ""))
-      ebasecamp-ui--hint)))
+(defun ebasecamp-ui--notice-body (notice)
+  "返回 NOTICE 的正文：MESSAGE，DETAIL 非空时以换行追加。纯函数。"
+  (let ((message (or (plist-get notice :message) ""))
+        (detail (plist-get notice :detail)))
+    (if (and (stringp detail) (not (string-empty-p detail)))
+        (format "%s\n%s" message detail)
+      message)))
 
-(defun ebasecamp-ui--notice-variant (session)
-  "把 notice 的语义映射为 `etaf-label' 的 variant。纯展示逻辑。"
-  (pcase (plist-get (ebasecamp-ui--notice session) :kind)
+(defun ebasecamp-ui--kind-variant (kind)
+  "把 notice 的 KIND 映射为 `etaf-alert' 的 `:variant'（error → danger）。纯函数。"
+  (pcase kind
     ('error 'danger)
-    ('info 'muted)
-    (_ 'muted)))
+    ('warning 'warning)
+    ('success 'success)
+    (_ 'info)))
+
+(defun ebasecamp-ui--notice-view (session)
+  "返回操作条下方的提示视图。
+无 notice 时给默认的操作提示 label；有 notice 时渲染 `etaf-alert'
+（`:dismissible' 的关闭按钮清空 notice，`:detail' 以换行拼进 message）。"
+  (let ((notice (ebasecamp-ui--notice session)))
+    (if (null notice)
+        (etaf-view (etaf-label :text ebasecamp-ui--hint :variant 'muted))
+      (etaf-view
+       (etaf-alert
+        :title (or (plist-get notice :title) "")
+        :message (ebasecamp-ui--notice-body notice)
+        :variant (ebasecamp-ui--kind-variant (plist-get notice :kind))
+        :dismissible t
+        :on-dismiss (lambda () (ebasecamp-ui--clear-notice session)))))))
 
 ;;; 动作名与端口冲突汇总
 
@@ -387,20 +456,60 @@ running 数来自 `ebasecamp-status-aggregate'，total 数来自清单（清单�
 
 ;;; 动作派发与并发控制
 
+(defun ebasecamp-ui--failed-branch (results)
+  "从批次结果 RESULTS 里返回第一个失败分支，无则返回 nil。
+失败判定：`:failed' 为真，或 `:exit' 为数字且非 0。纯函数。"
+  (cl-find-if (lambda (entry)
+                (let ((exit (plist-get entry :exit)))
+                  (or (plist-get entry :failed)
+                      (and (numberp exit) (/= exit 0)))))
+              results))
+
+(defun ebasecamp-ui--first-line (text)
+  "返回 TEXT 的第一个非空行（去掉首尾空白）；无内容时返回 nil。纯函数。"
+  (when (stringp text)
+    (cl-find-if (lambda (line) (not (string-empty-p line)))
+                (mapcar #'string-trim (split-string text "\n")))))
+
+(defun ebasecamp-ui--report-result (session label result)
+  "把批次结果 RESULT 写成 SESSION 的 notice，LABEL 为动作中文名。返回 nil。
+成功 → 绿色完成提示（`:auto-started-shared' 为真时额外说明）；
+失败 → 从 `:results' 取失败分支的 stderr：含 permission denied 时给 docker
+组提示，否则把 stderr 首行作为 message、原文作为 detail；无 stderr（例如
+批次被跳过）时说明「未完成」。"
+  (if (plist-get result :ok)
+      (ebasecamp-ui--set-notice
+       session 'success (format "%s完成" label)
+       (if (plist-get result :auto-started-shared)
+           "所有批次已执行完成；已自动启动 shared 服务"
+         "所有批次已执行完成"))
+    (let* ((failed (ebasecamp-ui--failed-branch (plist-get result :results)))
+           (stderr (or (and failed (plist-get failed :stderr)) ""))
+           (first (ebasecamp-ui--first-line stderr)))
+      (cond
+       ((string-match-p "permission denied" (downcase stderr))
+        (ebasecamp-ui--set-notice
+         session 'error "无权访问 Docker"
+         "请将当前用户加入 docker 组并重新登录，或检查 /var/run/docker.sock 权限"
+         stderr))
+       (first
+        (ebasecamp-ui--set-notice session 'error (format "%s失败" label)
+                                  first stderr))
+       (t
+        (ebasecamp-ui--set-notice
+         session 'error (format "%s未完成" label)
+         "部分批次被跳过（没有可展示的错误输出），请查看命令行输出")))))
+  nil)
+
 (defun ebasecamp-ui--on-complete (session action)
   "构造 `ebasecamp-command-run' 的完成回调。
-回调里清 SESSION 的 busy、刷新数据、并写 ACTION 的完成 / 失败 notice。"
+回调里清 SESSION 的 busy、刷新数据，并按 RESULT 的 `:ok' / `:results' /
+`:auto-started-shared' 写成功或失败的 notice（失败时带 stderr 原文 detail）。"
   (let ((label (ebasecamp-ui--action-label action)))
     (lambda (result)
       (etaf-set-value (ebasecamp-ui-session-busy session) nil)
       (ebasecamp-ui-refresh)
-      (if (plist-get result :ok)
-          (ebasecamp-ui--set-notice
-           session 'info (format "%s完成" label)
-           "所有批次已执行完成")
-        (ebasecamp-ui--set-notice
-         session 'error (format "%s失败" label)
-         "批次未全部成功，请查看命令行输出"))
+      (ebasecamp-ui--report-result session label result)
       nil)))
 
 (defun ebasecamp-ui--dispatch (session action project keys)
@@ -551,8 +660,11 @@ SESSION 的 busy 为真时按钮禁用（渲染期读 ref，写 ref 即触发重
 ;;; 交互
 
 (defun ebasecamp-ui--select-project (session key)
-  "把当前项目切到 KEY（项目名 symbol），并重载表格数据。"
+  "把当前项目切到 KEY（项目名 symbol），清空选中项，并重载表格数据。
+选中 key 带项目前缀，跨项目残留会让命令层拿到不属于当前项目的 key（报
+「未引用组」），因此切换项目必须清空选中。"
   (etaf-set-value (ebasecamp-ui-session-project-ref session) key)
+  (etaf-set-value (ebasecamp-ui-session-selected-ref session) nil)
   (let ((controller (ebasecamp-ui-session-controller session)))
     (etaf-data-set-query controller (symbol-name key))
     (etaf-data-load controller)))
@@ -621,9 +733,7 @@ SESSION 的 busy 为真时按钮禁用（渲染期读 ref，写 ref 即触发重
               :empty-label "该项目还没有服务")))
          (etaf-divider)
          (expr (ebasecamp-ui--action-bar session))
-         (etaf-label
-          :variant (ebasecamp-ui--notice-variant session)
-          :text (ebasecamp-ui--notice-text session))
+         (expr (ebasecamp-ui--notice-view session))
          (expr (ebasecamp-ui--confirm-dialog session)))))))
 
 ;;; 公开 API
@@ -651,8 +761,8 @@ SESSION 的 busy 为真时按钮禁用（渲染期读 ref，写 ref 即触发重
       (ebasecamp-data-refresh (ebasecamp-ui-session-controller session)))))
 
 (defun ebasecamp-ui-close ()
-  "关闭主界面：卸载运行时（触发 unmounted 收尾）、停轮询、销毁会话与 buffer。
-返回 nil。"
+  "关闭主界面：卸载运行时（触发 unmounted 收尾）、停轮询、取消提示定时器、
+销毁会话与 buffer。返回 nil。"
   (interactive)
   (when-let* ((buffer (get-buffer ebasecamp-ui-buffer-name)))
     (when-let* ((runtime (etaf-runtime-for-buffer buffer)))
@@ -660,6 +770,7 @@ SESSION 的 busy 为真时按钮禁用（渲染期读 ref，写 ref 即触发重
     (kill-buffer buffer))
   (ebasecamp-status-stop)
   (when-let* ((session ebasecamp-ui--session))
+    (ebasecamp-ui--cancel-notice-timer session)
     (etaf-data-stop (ebasecamp-ui-session-controller session))
     (setq ebasecamp-ui--session nil))
   nil)

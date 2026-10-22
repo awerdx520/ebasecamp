@@ -4,10 +4,10 @@
 
 - 阶段：Phase 3（Implement）· 批次 3 进行中
 - 已确认：方案 V2 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）
-- 已完成：批次 0、批次 1（T1.1–T1.6）、批次 2（T2.1–T2.5）、批次 3（T3.1 生命周期命令、T3.2 操作条与并发控制、T3.3 端口冲突检测）、T3.1 补强（跨 scope 依赖处理）
-- 下一步：T3.4 错误链路
+- 已完成：批次 0、批次 1（T1.1–T1.6）、批次 2（T2.1–T2.5）、批次 3（T3.1 生命周期命令、T3.2 操作条与并发控制、T3.3 端口冲突检测、T3.4 错误链路与反馈）、T3.1 补强（跨 scope 依赖处理）
+- 下一步：T3.5 L3 起停冒烟 + T3.6 shared 互通
 - 待用户确认：真实 Emacs 中目检 `M-x ebasecamp` 界面（T2.3 验收项）
-- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist；批次 1 修复 stale .elc 陷阱；T2.3 修正 data 层为「清单 ∪ 状态」语义、check-parens 覆盖 test/*.el、加载态改用 data-grid label、toast 推迟至 T3.4；T3.1 用 compose 层既有 `group-filter` 按 scope 拆分（未改 compose 层），pending 标记改为进程计数器归零后清除；T3.1 补强（修 tech-debt #13）：compose 层在 filter 渲染时剔除跨集合 `depends_on`，command 层 `start` 时先补齐 shared 批次（串行、失败即中止）；T3.2 实证 `etaf-button :disabled` 只接受布尔（传 ref signal `etaf-renderer-error`），改为渲染期 `etaf-value` 读 ref（渲染依赖使写 ref 即重渲染，无需 render-tick）；`etaf-dialog :open` 直接接受 ref；界面选中 key 为 `project/group/service`，派发前剥掉项目前缀
+- 修订记录：第一轮修 B1/B2 + M1–M5 + m1–m7；第二轮修导入落盘语义并实证三个 compose flag；T1.1 细化 volumes 为 plist；批次 1 修复 stale .elc 陷阱；T2.3 修正 data 层为「清单 ∪ 状态」语义、check-parens 覆盖 test/*.el、加载态改用 data-grid label、toast 推迟至 T3.4；T3.1 用 compose 层既有 `group-filter` 按 scope 拆分（未改 compose 层），pending 标记改为进程计数器归零后清除；T3.1 补强（修 tech-debt #13）：compose 层在 filter 渲染时剔除跨集合 `depends_on`，command 层 `start` 时先补齐 shared 批次（串行、失败即中止）；T3.2 实证 `etaf-button :disabled` 只接受布尔（传 ref signal `etaf-renderer-error`），改为渲染期 `etaf-value` 读 ref（渲染依赖使写 ref 即重渲染，无需 render-tick）；`etaf-dialog :open` 直接接受 ref；界面选中 key 为 `project/group/service`，派发前剥掉项目前缀；T3.4 实证 `etaf-toast` 的 `:anchor` 必填（须带 `:id` 的 Host）且 batch 下只画标题、正文不可见 → 改用 `etaf-alert` + 3 秒定时清除（`ebasecamp-ui-notice-timeout`，定时器存进会话，close / 写新 notice 时取消）；notice 结构扩为 `:kind/:title/:message/:detail`，成功与信息类自动清除、错误类保留待手动关闭；切项目清空选中（修 T3.2 遗留）
 
 ## 目标
 
@@ -124,7 +124,7 @@ docker compose -f <file> config --no-interpolate --no-env-resolution --no-path-r
       （依赖：T3.1、T2.3）验收：ERT 模拟双击断言仅一次 dispatch；UI 中操作期间按钮不可激活
 - [x] T3.3 端口冲突检测：启动前对选中服务的 `ports` 做两类检查 —— ①清单/项目内重复；②宿主端口占用（`(make-network-process :server t)` bind 探测，可注入 fake binder 测试）；冲突时不启动并给出具名提示
       （依赖：T3.1）验收：ERT 覆盖 冲突命中/不冲突/探测失败降级（告警但允许继续）
-- [ ] T3.4 错误链路：命令失败时 stderr 归一化进 `ebasecamp-docker-error`，UI 用 `etaf-alert` 展示可展开详情；权限错误（docker socket）单独归类并给出修复提示
+- [x] T3.4 错误链路：命令失败时 stderr 归一化进 `ebasecamp-docker-error`，UI 用 `etaf-alert` 展示可展开详情；权限错误（docker socket）单独归类并给出修复提示
       （依赖：T1.4、T3.1）验收：ERT 断言 4 类错误的分类结果；UI batch 断言 alert 文案出现
 - [ ] T3.5 L3 起停冒烟：真实起停 alpine 组（启动→状态回读→停止→`down`），结束后无残留容器/网络
       （依赖：T3.1–T3.4）验收：`docker ps -a --filter label=ebasecamp.managed=true` 在清理后为空

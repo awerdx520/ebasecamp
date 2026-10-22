@@ -394,9 +394,165 @@
           (funcall complete (list :action 'start :project 'myapp :ok t :results nil))
           (should-not (ebasecamp-ui-test--busy))
           (let ((notice (ebasecamp-ui-test--notice)))
-            (should (eq 'info (plist-get notice :kind)))
+            ;; T3.4 起成功提示的 kind 是 success（原先为 info）
+            (should (eq 'success (plist-get notice :kind)))
             (should (ebasecamp-ui-test--contains-p
                      (plist-get notice :message) "完成"))))))))
+
+;;; 9. 错误链路与操作反馈（T3.4）
+
+(defun ebasecamp-ui-test--complete (session action result)
+  "用 SESSION + ACTION 构造的 on-complete 回调处理 RESULT。"
+  (funcall (ebasecamp-ui--on-complete session action) result))
+
+(defun ebasecamp-ui-test--ok-result (&rest extra)
+  "构造一个 `:ok' 为 t 的完成结果 plist，EXTRA 覆盖默认字段。"
+  (append extra
+          (list :action 'start :project 'myapp :ok t
+                :results (list (list :scope 'project :exit 0 :stderr ""))
+                :auto-started-shared nil)))
+
+(defun ebasecamp-ui-test--failed-result (stderr)
+  "构造一个失败结果 plist（单批次，STDERR 为 stderr 原文）。"
+  (list :action 'start :project 'myapp :ok nil
+        :results (list (list :scope 'project :exit 1 :stderr stderr :failed t))
+        :auto-started-shared nil))
+
+(ert-deftest ebasecamp-ui-test-on-complete-success-notice ()
+  "成功完成 → notice kind 为 success，title 含动作名与「完成」。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (let ((session (ebasecamp-ui-session)))
+      (ebasecamp-ui-test--complete session 'start
+                                   (ebasecamp-ui-test--ok-result))
+      (let ((notice (etaf-value (ebasecamp-ui-session-notice session))))
+        (should (eq 'success (plist-get notice :kind)))
+        (should (equal "启动完成" (plist-get notice :title)))
+        (should (ebasecamp-ui-test--contains-p
+                 (plist-get notice :title) "完成"))))))
+
+(ert-deftest ebasecamp-ui-test-on-complete-success-auto-shared ()
+  "成功且 `:auto-started-shared' 为真 → message 提示已自动启动 shared 服务。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (let ((session (ebasecamp-ui-session)))
+      (ebasecamp-ui-test--complete
+       session 'stop
+       (ebasecamp-ui-test--ok-result :auto-started-shared t))
+      (let ((notice (etaf-value (ebasecamp-ui-session-notice session))))
+        (should (eq 'success (plist-get notice :kind)))
+        (should (ebasecamp-ui-test--contains-p
+                 (plist-get notice :message) "自动启动"))
+        (should (ebasecamp-ui-test--contains-p
+                 (plist-get notice :message) "shared"))))))
+
+(ert-deftest ebasecamp-ui-test-on-complete-failure-notice ()
+  "失败 → kind error，message 取 stderr 首行，detail 为 stderr 原文。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (let ((session (ebasecamp-ui-session)))
+      (ebasecamp-ui-test--complete
+       session 'restart
+       (ebasecamp-ui-test--failed-result "\nboom\nmore detail\n"))
+      (let ((notice (etaf-value (ebasecamp-ui-session-notice session))))
+        (should (eq 'error (plist-get notice :kind)))
+        (should (equal "重启失败" (plist-get notice :title)))
+        (should (ebasecamp-ui-test--contains-p
+                 (plist-get notice :message) "boom"))
+        (should-not (ebasecamp-ui-test--contains-p
+                     (plist-get notice :message) "more detail"))
+        (should (ebasecamp-ui-test--contains-p
+                 (plist-get notice :detail) "boom"))
+        (should (ebasecamp-ui-test--contains-p
+                 (plist-get notice :detail) "more detail"))))))
+
+(ert-deftest ebasecamp-ui-test-on-complete-permission-denied ()
+  "stderr 含 permission denied（大小写不敏感）→ 专门的权限提示。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (let ((session (ebasecamp-ui-session)))
+      (ebasecamp-ui-test--complete
+       session 'start
+       (ebasecamp-ui-test--failed-result
+        "permission denied while trying to connect to the Docker daemon socket"))
+      (let ((notice (etaf-value (ebasecamp-ui-session-notice session))))
+        (should (eq 'error (plist-get notice :kind)))
+        (should (string-match-p "无权\\|权限" (plist-get notice :title)))
+        (should (ebasecamp-ui-test--contains-p
+                 (plist-get notice :message) "docker 组"))
+        (should (ebasecamp-ui-test--contains-p
+                 (plist-get notice :detail) "permission denied"))))))
+
+(ert-deftest ebasecamp-ui-test-on-complete-failure-without-stderr ()
+  "失败但无 stderr（例如批次被跳过）→ kind 为 error 且 message 非空。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (let ((session (ebasecamp-ui-session)))
+      (ebasecamp-ui-test--complete
+       session 'down
+       (list :action 'down :project 'myapp :ok nil
+             :results (list (list :scope 'project :exit nil :stderr ""
+                                  :skipped t))
+             :auto-started-shared nil))
+      (let ((notice (etaf-value (ebasecamp-ui-session-notice session))))
+        (should (eq 'error (plist-get notice :kind)))
+        (should (equal "销毁未完成" (plist-get notice :title)))
+        (should (and (stringp (plist-get notice :message))
+                     (not (string-empty-p (plist-get notice :message)))))
+        (should (ebasecamp-ui-test--contains-p
+                 (plist-get notice :message) "跳过"))))))
+
+(ert-deftest ebasecamp-ui-test-notice-rendered-as-alert ()
+  "notice 非 nil 时界面渲染 etaf-alert，buffer-string 含 title 与 message。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (let ((session (ebasecamp-ui-session)))
+      (ebasecamp-ui--set-notice session 'error "端口冲突" "3306 已被占用")
+      (ebasecamp-ui-test--with-ps nil
+        (ebasecamp-ui-open)
+        (let ((text (ebasecamp-ui-test--buffer-text)))
+          (should (ebasecamp-ui-test--contains-p text "端口冲突"))
+          (should (ebasecamp-ui-test--contains-p text "3306 已被占用"))
+          ;; `:dismissible' 的关闭按钮是 alert 独有（旧实现只有一行 label）
+          (should (ebasecamp-ui-test--contains-p text "×"))
+          (should-not (ebasecamp-ui-test--contains-p
+                       text ebasecamp-ui--hint)))))))
+
+(ert-deftest ebasecamp-ui-test-notice-dismiss-clears ()
+  "关闭按钮的回调（`ebasecamp-ui--clear-notice'）把 notice 置回 nil。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (let ((session (ebasecamp-ui-session)))
+      (ebasecamp-ui--set-notice session 'error "端口冲突" "3306 已被占用")
+      (should (etaf-value (ebasecamp-ui-session-notice session)))
+      (ebasecamp-ui--clear-notice session)
+      (should-not (etaf-value (ebasecamp-ui-session-notice session))))))
+
+(ert-deftest ebasecamp-ui-test-select-project-clears-selection ()
+  "切换项目会清空选中列表，避免跨项目残留 key。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (ebasecamp-define-project other :groups ((mysql)))
+    (ebasecamp-ui-test--with-ps nil
+      (ebasecamp-ui-open)
+      (ebasecamp-ui-test--select '("myapp/mysql/mysql"))
+      (should (= 1 (length (ebasecamp-ui-selected-keys))))
+      (ebasecamp-ui--select-project (ebasecamp-ui-session) 'other)
+      (should-not (ebasecamp-ui-selected-keys))
+      (should (eq 'other (ebasecamp-ui-current-project))))))
+
+(ert-deftest ebasecamp-ui-test-notice-timer-cancelled-on-close ()
+  "成功 notice 会挂定时器；close 后定时器被取消，timer-list 回到基线。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (let* ((session (ebasecamp-ui-session))
+           (baseline (length timer-list)))
+      (ebasecamp-ui-test--complete session 'start
+                                   (ebasecamp-ui-test--ok-result))
+      (should (> (length timer-list) baseline))
+      (should (timerp (ebasecamp-ui-session-notice-timer session)))
+      (ebasecamp-ui-close)
+      (should (= baseline (length timer-list))))))
 
 (provide 'ebasecamp-ui-tests)
 ;;; ebasecamp-ui-tests.el ends here
