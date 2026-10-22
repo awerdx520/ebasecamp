@@ -18,12 +18,19 @@
 ;; `docker compose -f compose.yaml config --no-interpolate --no-env-resolution
 ;; --no-path-resolution --format json' 的实测输出（99 行），对应的输入为同目录
 ;; 的 compose-config-noint.yaml。
+;;
+;; T4.2 落盘（`ebasecamp-import-apply'）的测试用临时清单目录 + 伪造的
+;; `ebasecamp-docker--run-sync-function'（返回同一 fixture JSON），因此不依赖
+;; docker：断言生成文件存在与格式、可被清单层加载、服务字段还原、已存在拒绝
+;; 与 force 覆盖、非法名拒绝、`:root` 默认值与显式值、`${VAR}` 原样保留、
+;; 自校验失败回滚。
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'ert)
 (require 'ebasecamp-model)
+(require 'ebasecamp-config)
 (require 'ebasecamp-import)
 
 ;;; 测试脚手架
@@ -333,6 +340,183 @@ extra 的 \"ports\" 桶保留原始对象。"
       (should (string-match-p (regexp-quote "${PROBE_SECRET}") result))
       (should-not (string-match-p "fake-import-secret" result))
       (should-not (string-match-p "fake-import-other" result)))))
+
+;;; 12. 落盘语义（T4.2）
+
+(defun ebasecamp-import-test--read (file)
+  "读取文件 FILE，返回完整内容字符串。"
+  (with-temp-buffer
+    (insert-file-contents file)
+    (buffer-string)))
+
+(defmacro ebasecamp-import-test--with-manifest (compose-name &rest body)
+  "在临时清单目录与临时 compose 目录下执行 BODY。
+绑定 `config-dir'（临时清单目录，无尾斜杠）、`compose-dir'（临时 compose
+目录，无尾斜杠）、`compose-file'（COMPOSE-NAME 对应的绝对路径），并把
+`ebasecamp-config-directory' 指向 `config-dir'。
+compose 读取由 `ebasecamp-docker--run-sync-function' 伪造为实测 fixture，
+因此不依赖 docker。"
+  (declare (indent 1) (debug t))
+  `(let* ((config-dir (make-temp-file "ebc-import-config-" t))
+          (compose-dir (make-temp-file "ebc-import-compose-" t))
+          (compose-file (expand-file-name ,compose-name compose-dir))
+          (ebasecamp-config-directory config-dir)
+          (ebasecamp-docker--run-sync-function
+           (lambda (_args _timeout)
+             (list :exit 0
+                   :stdout (ebasecamp-import-test--config-json)
+                   :stderr ""))))
+     (unwind-protect
+         (progn
+           (with-temp-file compose-file (insert "services: {}\n"))
+           ,@body)
+       (ignore-errors (delete-directory config-dir t))
+       (ignore-errors (delete-directory compose-dir t)))))
+
+(defun ebasecamp-import-test--target (name config-dir)
+  "返回 NAME 在 CONFIG-DIR 下的清单文件绝对路径。"
+  (expand-file-name (concat "projects/" name ".el")
+                    (file-name-as-directory config-dir)))
+
+(ert-deftest ebasecamp-import-test-apply-writes-file ()
+  "apply 返回 projects/<name>.el 绝对路径，文件含组/项目定义与文件头。"
+  (ebasecamp-import-test--with-manifest "compose.yaml"
+    (let* ((path (ebasecamp-import-apply compose-file "probe-app"))
+           (content (ebasecamp-import-test--read path)))
+      (should (file-exists-p path))
+      (should (equal (ebasecamp-import-test--target "probe-app" config-dir) path))
+      (should (string-match-p "lexical-binding: t" content))
+      (should (string-match-p "^(ebasecamp-define-group probe-app$" content))
+      (should (string-match-p "^(ebasecamp-define-project probe-app$" content))
+      ;; 中文注释头保留
+      (should (string-match-p "由 ebasecamp 从 compose 导入生成" content))
+      ;; 末尾单个换行
+      (should (string-suffix-p ")\n" content))
+      (should-not (string-suffix-p "\n\n" content)))))
+
+(ert-deftest ebasecamp-import-test-apply-loadable ()
+  "生成的文件能被 `ebasecamp-config-load' 加载：无错误、1 组 1 项目。"
+  (ebasecamp-import-test--with-manifest "compose.yaml"
+    (ebasecamp-import-apply compose-file "probe-app")
+    (let ((status (ebasecamp-config-load config-dir)))
+      (should (null (plist-get status :errors)))
+      (should-not (plist-get status :bootstrap-needed))
+      (should (= 1 (length (plist-get status :groups))))
+      (should (= 1 (length (plist-get status :projects))))
+      (should (eq 'probe-app (ebasecamp-project-name
+                              (car (plist-get status :projects)))))
+      (should (eq 'probe-app (ebasecamp-group-name
+                              (car (plist-get status :groups)))))
+      (should (eq 'per-project (ebasecamp-group-scope
+                                (car (plist-get status :groups))))))))
+
+(ert-deftest ebasecamp-import-test-apply-services-resolve ()
+  "落盘后经 `ebasecamp-model-resolve-services' 取回的服务字段正确。"
+  (ebasecamp-import-test--with-manifest "compose.yaml"
+    (ebasecamp-import-apply compose-file "probe-app")
+    (ebasecamp-config-load config-dir)
+    (let* ((project (ebasecamp-model-project 'probe-app))
+           (services (ebasecamp-model-resolve-services
+                      project (car (ebasecamp-project-groups project))))
+           (api (cl-find 'api services :key #'ebasecamp-service-name))
+           (cache (cl-find 'cache services :key #'ebasecamp-service-name)))
+      (should (= 2 (length services)))
+      (should (equal "myapp/api:dev" (ebasecamp-service-image api)))
+      (should (equal '((8080 . 80)) (ebasecamp-service-ports api)))
+      (should (equal "${PROBE_SECRET}"
+                     (cdr (assoc "SECRET_REF"
+                                 (ebasecamp-service-environment api)))))
+      (should (equal "${PROBE_OTHER:-fallback}"
+                     (cdr (assoc "SECRET_DEFAULT"
+                                 (ebasecamp-service-environment api)))))
+      (should (eq t (plist-get (car (ebasecamp-service-volumes api))
+                               :read-only)))
+      (should (equal '("cache") (ebasecamp-service-depends-on api)))
+      (should (equal '("backend") (ebasecamp-service-networks cache)))
+      (should (equal "redis:7.4" (ebasecamp-service-image cache))))))
+
+(ert-deftest ebasecamp-import-test-apply-existing-without-force ()
+  "目标已存在且未指定 force 时 signal，且原文件内容一字未动。"
+  (ebasecamp-import-test--with-manifest "compose.yaml"
+    (let ((path (ebasecamp-import-apply compose-file "probe-app")))
+      (with-temp-file path (insert ";;; sentinel\n"))
+      (should-error (ebasecamp-import-apply compose-file "probe-app")
+                    :type 'ebasecamp-import-error)
+      (should (equal ";;; sentinel\n" (ebasecamp-import-test--read path))))))
+
+(ert-deftest ebasecamp-import-test-apply-force-overwrites ()
+  "force 非 nil 时覆盖已存在的目标文件。"
+  (ebasecamp-import-test--with-manifest "compose.yaml"
+    (let ((path (ebasecamp-import-apply compose-file "probe-app")))
+      (with-temp-file path (insert ";;; sentinel\n"))
+      (should (equal path (ebasecamp-import-apply compose-file "probe-app"
+                                                  :force t)))
+      (should-not (string-match-p "sentinel" (ebasecamp-import-test--read path)))
+      (should (string-match-p "ebasecamp-define-group"
+                              (ebasecamp-import-test--read path))))))
+
+(ert-deftest ebasecamp-import-test-apply-rejects-invalid-names ()
+  "非法名（含空格、大写、空串）signal `ebasecamp-import-error'，不落盘。"
+  (ebasecamp-import-test--with-manifest "compose.yaml"
+    (dolist (name '("Bad Name" "Upper" "UPPER" "" "with.dot" "with/slash"))
+      (should-error (ebasecamp-import-apply compose-file name)
+                    :type 'ebasecamp-import-error))
+    (should-not (file-directory-p (expand-file-name "projects" config-dir)))))
+
+(ert-deftest ebasecamp-import-test-apply-root-defaults-to-compose-directory ()
+  ":root 省略时取 compose 文件父目录，且不带尾斜杠。"
+  (ebasecamp-import-test--with-manifest "compose.yaml"
+    (ebasecamp-import-apply compose-file "probe-app")
+    (ebasecamp-config-load config-dir)
+    (let ((root (ebasecamp-project-root (ebasecamp-model-project 'probe-app))))
+      (should (equal (directory-file-name compose-dir) root))
+      (should-not (string-suffix-p "/" root)))))
+
+(ert-deftest ebasecamp-import-test-apply-root-explicit ()
+  ":root 显式传入时优先使用该值。"
+  (ebasecamp-import-test--with-manifest "compose.yaml"
+    (ebasecamp-import-apply compose-file "probe-app" :root "/srv/probe-app")
+    (ebasecamp-config-load config-dir)
+    (should (equal "/srv/probe-app"
+                   (ebasecamp-project-root
+                    (ebasecamp-model-project 'probe-app))))
+    (should (string-match-p (regexp-quote ":root \"/srv/probe-app\"")
+                            (ebasecamp-import-test--read
+                             (ebasecamp-import-test--target "probe-app"
+                                                            config-dir))))))
+
+(ert-deftest ebasecamp-import-test-apply-keeps-variable-reference ()
+  "生成文件中 `${VAR}' 原样出现，不带 `\\$' 转义。"
+  (ebasecamp-import-test--with-manifest "compose.yaml"
+    (let ((content (ebasecamp-import-test--read
+                    (ebasecamp-import-apply compose-file "probe-app"))))
+      (should (string-match-p (regexp-quote "${PROBE_SECRET}") content))
+      (should (string-match-p (regexp-quote "${PROBE_OTHER:-fallback}") content))
+      (should-not (string-match-p (regexp-quote "\\${PROBE_SECRET}") content)))))
+
+(ert-deftest ebasecamp-import-test-apply-rollback-on-invalid-service ()
+  "自校验失败时回滚：新文件被删除；原本有文件时恢复原内容。"
+  (ebasecamp-import-test--with-manifest "compose.yaml"
+    (let ((path (ebasecamp-import-test--target "probe-app" config-dir))
+          (broken (lambda (_file)
+                    (ebasecamp-project-create
+                     :name 'probe-app
+                     :title "probe-app"
+                     :groups (list (list :group 'app
+                                         :scope 'per-project
+                                         :service-overrides
+                                         (list (cons 'api (list :image nil)))))))))
+      ;; 情形 1：目标不存在 → 自校验失败后不得留下文件
+      (cl-letf (((symbol-function 'ebasecamp-import-parse) broken))
+        (should-error (ebasecamp-import-apply compose-file "probe-app")
+                      :type 'ebasecamp-import-error))
+      (should-not (file-exists-p path))
+      ;; 情形 2：目标已存在 + force → 自校验失败后恢复原内容
+      (with-temp-file path (insert ";;; sentinel\n"))
+      (cl-letf (((symbol-function 'ebasecamp-import-parse) broken))
+        (should-error (ebasecamp-import-apply compose-file "probe-app" :force t)
+                      :type 'ebasecamp-import-error))
+      (should (equal ";;; sentinel\n" (ebasecamp-import-test--read path))))))
 
 (provide 'ebasecamp-import-tests)
 ;;; ebasecamp-import-tests.el ends here
