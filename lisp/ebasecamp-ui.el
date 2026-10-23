@@ -1292,25 +1292,53 @@ t，使事件回调上下文也能弹出该询问）。"
     (ebasecamp-ui--report-counts
      (etaf-value (ebasecamp-ui-session-state ebasecamp-ui--session)))))
 
+(defun ebasecamp-ui--display-buffer (buffer)
+  "把 BUFFER 显示在选中 window 中并选中该 window。
+BUFFER 已在某窗口显示时复用之（`select-window'）；否则用 `display-buffer-same-window'
+把选中 window 的 buffer 直接换成 BUFFER —— 即用户已确认的显示策略：当前
+window 切过去，不拆分、不删除其它 window。
+
+不要把它写成 `(pop-to-buffer BUFFER \\='((display-buffer-reuse-window
+display-buffer-same-window)))'：batch 实测 `display-buffer-reuse-window' 在
+「无可复用窗口」时**会 split** 出第二个窗口（`*scratch*` 留在原窗口，frame
+被拆成两半），与「不动其它 window」的策略相反。"
+  (let ((window (get-buffer-window buffer)))
+    (if window
+        (progn (select-window window) window)
+      (pop-to-buffer buffer '(display-buffer-same-window)))))
+
 (defun ebasecamp-ui-open ()
-  "打开（或复用）ebasecamp 主界面 buffer，返回该 buffer。
+  "打开（或复用）ebasecamp 主界面 buffer，并把它显示在选中 window，返回该 buffer。
 清单未加载时先按 `ebasecamp-config-directory' 加载一次；buffer 已有运行时
 则直接复用，不重复挂载。
 
-被**直接**交互调用（\\[ebasecamp-ui-open]）时用 `message' 报告「N 组 · M
-配置」，并 `pop-to-buffer'；由 `ebasecamp' 命令间接调用时两者都不做 ——
-回执由该命令在打开后自行报告（`called-interactively-p' 不跨帧传播，故回执
-必须落在用户实际调用的那个命令上）。"
+**显示无条件发生**（见 `ebasecamp-ui--display-buffer'）：当前 window 直接切到
+界面 buffer，不拆分、不删除其它 window。顺序是「先显示、后挂载」：`etaf-mount'
+期间 `ebox' 要按窗口宽度测量视口，buffer 尚未显示时只能拿到默认视口宽度，而
+`ebox-refit' 只在窗口尺寸变化时被动触发 —— 先显示让首帧即按真实宽度排版。
+挂载失败时把选中 window 恢复为显示前的 buffer，再原样 re-signal（不吞错）。
+
+被**直接**交互调用（\\[ebasecamp-ui-open]）时额外用 `message' 报告「N 组 · M
+配置」；由 `ebasecamp' 命令间接调用时不报告，回执由该命令在打开后自行报告
+（`called-interactively-p' 不跨帧传播，回执必须落在用户实际调用的那个命令上，
+否则 `M-x ebasecamp' 会漏发或重发）。
+注意：显示不能放在 `called-interactively-p' 门控里 —— 那正是「`M-x ebasecamp'
+建好 buffer 却永不显示」的成因。"
   (interactive)
   (ebasecamp-ui--ensure-manifest)
   (ebasecamp-ui-session)
-  (let ((buffer (get-buffer-create ebasecamp-ui-buffer-name)))
-    (with-current-buffer buffer
-      (unless (etaf-runtime-for-buffer buffer)
-        (etaf-mount buffer (ebasecamp-ui-view))))
+  (let ((buffer (get-buffer-create ebasecamp-ui-buffer-name))
+        (previous (window-buffer (selected-window))))
+    (ebasecamp-ui--display-buffer buffer)
+    (condition-case err
+        (with-current-buffer buffer
+          (unless (etaf-runtime-for-buffer buffer)
+            (etaf-mount buffer (ebasecamp-ui-view))))
+      ((error quit)
+       (set-window-buffer (selected-window) previous)
+       (signal (car err) (cdr err))))
     (when (called-interactively-p 'any)
-      (ebasecamp-ui-report-counts)
-      (pop-to-buffer buffer))
+      (ebasecamp-ui-report-counts))
     buffer))
 
 (defun ebasecamp-ui-refresh (&optional records supplied-p)

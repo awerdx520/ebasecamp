@@ -35,6 +35,7 @@
 - **旧清单里同一项目重复引用同一组被静默取首个**：改为加载期报 `ebasecamp-config-duplicate-group-ref`（见「兼容性」）。
 - **v0.1 清单在组视图里完全不可见（C8）**：`ebasecamp-data-group-instances` 原先只在组侧有 `:configs` 时返回实例，v0.1 清单（关联只写在项目侧 `:groups`）因此渲染出「N 组 · 0 配置」的空壳，且打开界面时没有任何 `message`，容易被误判为命令失灵。现在组无 `:configs` 时按项目名升序回退装配「旧写法实例」（`:legacy` t、`:config` nil，记录仍与 `ebasecamp-data-project-records` 同源）：组节点显示 `MySQL  (旧 · 1 项目)`、右栏段头显示 `（旧写法）→ 项目` 并在组标题下给出迁移提示，既无配置也无关联时显示 `(未关联)`；`ebasecamp` 命令与 `M-x ebasecamp-ui-open` 打开界面时用 `message` 回报「N 组 · M 配置（K 个旧写法关联）」，据此可区分「清单是旧写法」与「命令没生效」。
 - **`M-x ebasecamp` 报「命令不存在」**（批次 A）：根因是运行中的 Emacs 里没有加载该包 —— straight recipe 指向远程上游且 build 目录晚于 daemon 启动生成。recipe 改指本地仓库（`:local-repo` + `:files ("*.el" "lisp/*.el")`）并重建 build 后恢复可用。
+- **`M-x ebasecamp` 只出回执、主界面从不显示**：消息区正常打印「ebasecamp：N 组 · M 配置」，`*ebasecamp*` buffer 也确实创建并 `etaf-mount` 成功（`*Messages*` 无报错、buffer 为 `fundamental-mode` 的未修改状态），但从不显示到任何窗口。根因是 `ebasecamp-ui-open` 把 `pop-to-buffer` 放在 `(called-interactively-p 'any)` 门控内，而 `M-x ebasecamp` 经 `ebasecamp` 命令**普通函数调用**进入，`called-interactively-p` 不跨帧传播、恒为 nil → 永不 pop。现在显示无条件执行（新增 `ebasecamp-ui--display-buffer`：已显示则 `select-window` 复用，否则 `display-buffer-same-window` 替换当前 window，不拆分、不删除其它 window），顺序改为「先显示、后 `etaf-mount`」—— `ebox` 首次即测量到真实窗口宽度（`ebox-refit` 只在尺寸变化时被动触发），`etaf-mount` 失败时恢复原 window buffer 并原样 re-signal；`called-interactively-p` 只保留给回执，故 `M-x ebasecamp` 与 `M-x ebasecamp-ui-open` 两条入口各仍只发一条。附带实测：`(display-buffer-reuse-window display-buffer-same-window)` 组合在无可复用窗口时会 split 出第二个窗口（原 buffer 留在拆出的窗口里），与「不动其它 window」相反，故不采用。
 
 ### 移除
 

@@ -28,6 +28,7 @@
 (require 'ebasecamp-import)
 (require 'ebasecamp-export)
 (require 'ebasecamp-ui)
+(require 'ebasecamp)
 
 ;;; 测试脚手架
 
@@ -1360,6 +1361,41 @@ open 走全新会话（不残留上一次的选中集合、提示与确认状态
           (should (ebasecamp-ui-test--contains-p text "2 组"))
           (should (ebasecamp-ui-test--contains-p text "0 配置"))
           (should (ebasecamp-ui-test--contains-p text "2 个旧写法关联")))))))
+
+(ert-deftest ebasecamp-ui-test-command-shows-buffer-in-window ()
+  "走 `M-x ebasecamp' 的真实路径（普通函数调用）时，主界面 buffer 必须显示在选中 window。
+回归：`ebasecamp-ui-open' 曾把 `pop-to-buffer' 放进 `(when (called-interactively-p
+'any) …)'，而 `ebasecamp' 是**普通函数调用**，`called-interactively-p' 不跨帧
+传播、恒为 nil → buffer 被创建并挂载却永不显示（用户只看到一条 minibuffer 回执）。
+因此这里刻意不用 `call-interactively'，直接调 `(ebasecamp)'。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--legacy-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((before (length (window-list)))
+            (buffer (ebasecamp)))
+        (should (eq buffer (get-buffer ebasecamp-ui-buffer-name)))
+        (should (get-buffer ebasecamp-ui-buffer-name))
+        ;; batch 下同样有 terminal frame 与 window（实测 `get-buffer-window'
+        ;; 返回 `#<window 1 on *ebasecamp*>），故可直接断言「显示在某窗口」；
+        ;; 再断言选中 window 的 buffer 就是它，防止「显示在别处」蒙过。
+        (should (get-buffer-window ebasecamp-ui-buffer-name))
+        (should (eq (window-buffer (selected-window))
+                    (get-buffer ebasecamp-ui-buffer-name)))
+        ;; 「不动其它 window」：窗口数必须不变（`display-buffer-reuse-window'
+        ;; 组合会在无可复用窗口时 split 出第二个窗口，实测过）。
+        (should (= before (length (window-list))))))))
+
+(ert-deftest ebasecamp-ui-test-open-does-not-duplicate-message ()
+  "交互调用 `ebasecamp-ui-open' 时恰好 1 条 \"ebasecamp：\" 回执。
+显示改为无条件发生（不再受 `called-interactively-p' 门控）后，回执仍只允许
+一条：`M-x ebasecamp-ui-open' 由 open 自己发，`M-x ebasecamp' 由命令发。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--legacy-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((messages (ebasecamp-ui-test--capture-ebasecamp-messages
+                       (lambda () (call-interactively #'ebasecamp-ui-open)))))
+        (should (= 1 (length messages)))
+        (should (ebasecamp-ui-test--contains-p (car messages) "ebasecamp："))))))
 
 (ert-deftest ebasecamp-ui-test-render-no-config-no-legacy-label ()
   "组既无配置也无旧写法关联 → 组节点文案为「(未关联)」。"
