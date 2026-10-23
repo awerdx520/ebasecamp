@@ -2,7 +2,7 @@
 #+author: Thomas
 #+options: toc:t
 
-ebasecamp 是 Emacs 里的 Docker 环境分组管理插件（版本 0.2.0）。
+ebasecamp 是 Emacs 里的 Docker 环境分组管理插件（版本 0.4.0）。
 
 * ebasecamp 是什么
 
@@ -215,14 +215,17 @@ v0.1 的写法仍然可用，视作「匿名配置」（配置名等于组名）
 
 * 命令表
 
-以下为全部 =M-x= 可见的交互命令（共 13 个，=fboundp= 实测）：
+以下为全部 =M-x= 可见的交互命令（共 16 个，=commandp= 实测）：用 =emacs -Q --batch= 加载 =ebasecamp.el= 后统计非私有的 =ebasecamp*= 命令（=ebasecamp--*= / =ebasecamp-ui--*= 等内部命令不计）。
 
 | 命令 | 说明 |
 |------+------|
 | =ebasecamp= | 打开管理界面（=ebasecamp-ui-open= 的入口命令）。 |
 | =ebasecamp-ui-open= | 打开或复用主界面 buffer；清单未加载时先加载一次。 |
 | =ebasecamp-ui-close= | 关闭主界面，停轮询并销毁会话。 |
+| =ebasecamp-ui-mode= | 界面主模式（=special-mode= 派生，设 =buffer-read-only t=）；=M-x= 直接调用只切换当前 buffer 的 mode，正常入口是 =ebasecamp=。 |
 | =ebasecamp-ui-refresh= | 采一次容器状态快照并重建渲染数据。 |
+| =ebasecamp-ui-report-counts= | 用 =message= 报告当前会话的组数 / 配置数（有旧写法关联时附其数量）—— 即界面打开时的那条回执；无会话时静默返回 =nil=。 |
+| =ebasecamp-ui-edit-manifest= | 打开 =groups.el= 并定位到当前选中组的定义 —— 界面唯一的写入口（界面里按 =e=）。 |
 | =ebasecamp-reload= | 重新加载清单并刷新界面，报告组 / 项目 / 错误数量。 |
 | =ebasecamp-create-sample-config= | 生成示例清单；=C-u= 前缀强制覆盖。 |
 | =ebasecamp-import-file= | 选一个 compose 文件导入为清单（迷你缓冲区确认项目名）。 |
@@ -232,6 +235,89 @@ v0.1 的写法仍然可用，视作「匿名配置」（配置名等于组名）
 | =ebasecamp-ui-destroy-environment= | 界面版销毁入口：选项目 → 二次确认 → =docker compose down=（不带 =-v=）。 |
 | =ebasecamp-ui-confirm= | 执行确认框里待确认的动作。 |
 | =ebasecamp-ui-dismiss-confirm= | 关闭确认框并丢弃待确认动作。 |
+
+* 界面键位
+
+界面 buffer =*ebasecamp*= 是只读的：它只是清单的投影，在界面里敲的字不会落到任何文件。要改配置就按 =e= ，它会打开 =groups.el= 并把 point 定位到当前组的定义 —— 这是界面唯一的写入口；改完保存，回界面按 =g= 重载。界面内按 =?= 弹出全部键位；其余字母在界面内无反应，例如 =i= 不会进入 evil 的 insert state。
+
+** 界面布局
+
+界面是「顶栏 / 中间两栏 / 底栏」三段式，总高恒等于窗口高：
+
+- *底栏常驻窗口底部*：=导入 compose= / =导出 compose= / =销毁环境= 三个入口与提示区固定在底部，不再排在树之后 —— 不需要先把整窗滚到底才能看到它们。
+- *左树与右栏各自内部滚动*：配置多时只有当前区域的列在滚，顶栏与底栏不动，整窗不再滚动。滚轮按「最内层可滚区域优先」分派，所以左栏只滚左栏、右栏只滚右栏。
+- *左栏宽度可拖动*：分隔线可用鼠标拖动（也支持键盘拖动），宽度钳制在 *0.15–0.55* 之间；默认 0.26（约占窗口宽度 26%），把宽度让给右栏的服务表格。
+- *宽度跨会话记住*：拖动结果写在 =~/.cache/ebasecamp/ui-state.el=（运行时状态缓存，*不是清单*，不参与 =ebasecamp-config-load=，可随时删除，下次打开回默认）。
+
+** 根级键位
+
+整个界面内生效：
+
+| 键 | 动作 |
+|----+------|
+| =q= | 关闭界面：卸载运行时、停轮询、销毁会话 |
+| =g= | 重载清单并刷新；改完 =groups.el= 后按它 |
+| =n= / =p= | 下一个 / 上一个组 |
+| =1= / =2= / =3= | 跳到左栏 / 右栏 / 底栏：把焦点移到该区域的第一个停靠点 |
+| =e= | 编辑当前组清单：打开 =groups.el= 并定位到该组定义 |
+| =t= | 切换当前行的服务勾选，行内任意位置都生效 |
+| =I= | 导入 compose |
+| =o= | 导出 compose |
+| =D= | 销毁环境：二次确认，只作用于 per-project 项目 |
+| =?= | 键位帮助 |
+| =TAB= / =S-TAB= | 移动焦点：树节点 → 段内按钮 → 服务行 → 勾选框 |
+| =RET= | 激活当前控件：勾选框上勾选、按钮上按下、组节点展开 / 收起 |
+| 方向键 | 树与表格内的方向移动 |
+| =C-x= / =M-x= / =C-g= / =ESC= | 保留给 Emacs，界面不拦截 |
+
+=1= / =2= / =3= 是 printing key：绑定后 evil 的数字前缀在界面内失效（与 =q= / =g= 同理）。
+
+** 段级键位
+
+point 落在某个配置段内时额外生效。段指右栏里的一份配置：
+
+| 键 | 动作 |
+|----+------|
+| =s= | 启动该段选中的服务 |
+| =x= | 停止该段选中的服务 |
+| =r= | 重启该段选中的服务 |
+| =a= | 全选该段全部服务 |
+| =A= | 全不选该段服务 |
+
+段级键与段头的三个按钮走同一条派发路径，作用于该段自己的项目；point 在左栏或顶栏时按这几个键无反应。
+
+** 关于 =SPC=
+
+=SPC= 与 =RET= 等价，都是「激活当前控件」：在勾选框上勾选、在按钮上按下。它 *不是* 本插件的勾选键，也不能在界面 buffer 里当 general 或 evil 的 leader 前缀用。行级切换勾选请用 =t= 键，它不会误触按钮。
+
+** 编辑清单的流程
+
+1. 按 =e= 打开 =groups.el= ，point 停在当前组的 =(ebasecamp-define-group= 那行；
+2. 改完保存；
+3. 回界面按 =g= 重载清单并刷新。
+
+** 主题
+
+界面颜色不写死，跟着 Emacs 主题走：
+
+- *跟随主题*：基础色（前景 / 背景 / 面板 / 边框）从当前 face 取（=default=、=mode-line-inactive= 等），状态色（success / warning / danger / info / 按钮 / 徽标 / 勾选框）按当前明暗（=background-mode=）从内置的明暗两套 palette 取。
+- *切换即时生效*：=M-x load-theme= 之后界面立即变色，不需要重开界面或重载清单 —— 主题变化只刷新节点属性，不重建整棵树。暗色主题下的徽标与提示块不会再是浅色块。
+- *自定义覆盖*：=ebasecamp-ui-theme=（默认 =nil=，表示完全跟随）可以按 token 覆盖，未覆盖的键仍按「face → 内置 palette」生成：
+
+  #+begin_src elisp
+  (setq ebasecamp-ui-theme '(:ui-accent "#B45309"
+                             :ui-accent-soft-bg "#FDF2E3"))
+  #+end_src
+
+  一共 35 个 =:ui-*= token（9 个基础色 + 26 个状态色）；界面没用到的 etaf-ui token（shell / window / search / picker 等）继续走 etaf-ui 的默认 palette。
+
+** 在项目中打开
+
+- *自动定位*：在某个项目目录里（=default-directory= 落在该项目 =:root= 之下）执行 =M-x ebasecamp= ，打开时会自动选中 *该项目第一份配置所属的组*。
+- *「第一份」的定义*：按 =groups.el= 的组定义顺序、组内 =:configs= 顺序，首个 =:project= 命中该项目的配置。
+- *最长 root 胜出*：=:root= 嵌套时（=/a= 与 =/a/deep=）取更长的那个；路径比较前用 =file-truename= 归一，因此 =~=、=..=、软链不影响判断；比较 *大小写敏感*，只匹配整段目录（=/tmp/a2= 不会被 =/tmp/a= 命中）。
+- *无匹配则不选中*：当前目录不在任何项目 =:root= 之下，或该项目还没有配置时，*不选中任何组*，右栏保持「选择左侧的组」。
+- *只在打开时算一次*：=g= 与 =M-x ebasecamp-ui-refresh= 不会覆盖你手选的组；关闭界面再打开才重新定位。
 
 * 安全约束
 
@@ -296,5 +382,5 @@ make check EMACS=/path/to/emacs STRAIGHT_BUILD=/path/to/build-XX.X
 - [[file:docs/compose-generation.org][compose 生成与导入导出规则]]：清单到 compose 的映射、导入映射表、导出物差异。
 - [[file:docs/troubleshooting.org][排障手册]]：命令不存在 / 界面空白 / 加载报错 / =config -q= 失败 / 导入导出异常 / 端口冲突 / 状态不刷新。
 - =docs/adr/0001-architecture.org=：架构决策（ADR）。
-- =openspec/active/=：进行中的计划；=openspec/decisions.md=：决策日志；=openspec/tech-debt.md=：技术债。
+- =openspec/completed/=：已归档计划（v0.2 / v0.3 / v0.4 与 M1–M3 四份，当前无进行中计划）；=openspec/decisions.md=：决策日志；=openspec/tech-debt.md=：技术债。
 - =AGENTS.md=：仓库地图与不变量清单。

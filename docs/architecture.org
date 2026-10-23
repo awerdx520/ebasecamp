@@ -163,7 +163,7 @@ ebasecamp 是 Emacs 里的 Docker 环境分组管理插件。v0.2 起，模型�
 
 * 不变量清单
 
-以下每条都可机械检查（命令或断言），违反即视为缺陷而非风格问题。前 8 条沿用 v0.1（与 [[file:../AGENTS.md][AGENTS.md]] 对齐），第 9–11 条为 v0.2 新增。
+以下每条都可机械检查（命令或断言），违反即视为缺陷而非风格问题。前 8 条沿用 v0.1（与 [[file:../AGENTS.md][AGENTS.md]] 对齐），第 9–11 条为 v0.2 新增，第 12 条为 v0.3 新增（ADR-0003），第 13 条为 v0.4 新增（ADR-0004）。
 
 | # | 不变量 | 违反后果 |
 |---+--------+----------|
@@ -178,6 +178,8 @@ ebasecamp 是 Emacs 里的 Docker 环境分组管理插件。v0.2 起，模型�
 | 9 | 物化产物的键名必须是 =:service-overrides=，*不得* 写 =:services= | 覆盖被下游静默丢弃（渲染 / 命令 / 导入都按 =:service-overrides= 读） |
 | 10 | 同一项目 + 同一组只允许 *1 个引用*（旧 =:groups= 与配置侧合计） | 容器标签无配置维度、服务名会撞；后一份覆盖静默丢失。加载期即报 =ebasecamp-config-duplicate-group-ref= |
 | 11 | =shared= 组至多 1 份配置，且该配置的 =:project= 必填 | 多宿主会互相覆盖 =_shared/compose.yaml= 与 =ebc-shared= 容器集合；缺 =:project= 无法推出渲染上下文 |
+| 12 | UI buffer 必须只读（=ebasecamp-ui-mode= 派生 =special-mode= + =buffer-read-only t=），最外层 Host 用 =:key-scope 'local= 吞未绑定 printing key；写只经 =e= 打开的 =groups.el= | 界面能打字 → 改动无处落地且误导；写能力脱离清单文件 |
+| 13 | UI 样式不得硬编码色值 —— 只允许出现在 palette / token 定义区与 =defcustom= 默认值，render 区一律走 =etaf-theme-token= | 硬编码色值在暗色主题下发白（v0.3 前的实际问题），且无法随 =load-theme= 切换 |
 
 第 5 条的三个 flag 缺一不可，缺 =--no-interpolate= 时退出码仍为 0（静默失败），因此只能靠代码审查 + 密钥断言测试守住。
 
@@ -195,6 +197,144 @@ ebasecamp 是 Emacs 里的 Docker 环境分组管理插件。v0.2 起，模型�
 
 轮询的启停与 UI 生命周期绑定：=etaf-on-mounted= → =ebasecamp-status-start=；=etaf-on-unmounted= / =ebasecamp-ui-close= → =ebasecamp-status-stop= + 取消提示定时器。
 
+* UI buffer 身份与键位分层
+
+=*ebasecamp*= 不是可以随便打字的 buffer，而是清单的投影。这一节记录实现里必须守住的几条机制，顺序从 buffer 身份到键位分层。
+
+** buffer 身份：从 =special-mode= 派生并且只读
+
+主模式 =ebasecamp-ui-mode= 用 =define-derived-mode= 从 =special-mode= 派生，body 里设 =buffer-read-only= 为 t。启用时点在同一次 =ebasecamp-ui-open= 里早于 =etaf-mount= ，顺序不能反。
+
+原因是 =special-mode= 会执行 =kill-all-local-variables= 而清掉 ebox 的 buffer-local 挂载状态，即 =ebox--buffer-mount= 变量。若「先 mount 再设 mode」，随后 =ebox-node-at= 与 =ebox-focus-scope= 会报 =No mounted Ebox tree= 错误，焦点与键层全部失效；而渲染断言比对的是 buffer 文本，仍然全绿，属隐蔽失败。U1 实测即为此：计划原写「mount 之后设 mode」，实测必须改成之前。
+
+只读不阻断渲染：etaf 写 buffer 时自己用 =inhibit-read-only= 关掉只读，因此 mount 后整树 patch 照常更新，而 =buffer-read-only= 全程保持 t，首帧渲染未被阻断。
+
+** 键位三层与优先级
+
+从高到低：
+
+| 层 | 内容 | 效果 |
+|----+------+------|
+| etaf Host =:keys= | 根 Host 9 条由 =ebasecamp-ui--root-keys= 提供，段 Host 5 条由 =ebasecamp-ui--section-keys= 提供；此外有框架默认的 =?= 帮助 / =TAB= 与 =S-TAB= 焦点移动 / =RET= 激活 / 方向键 | 装在 =emulation-mode-map-alists= 最前面，因此能遮住 evil |
+| evil emulation map | =i= 进 insert state 等 | 未装 evil 时不存在；装了也被上一层的 local 边界吞掉 |
+| =ebox-buffer-mode= 的 =suppress-keymap= | 未绑定键的兜底抑制 | 优先级最低，挡不住 evil |
+
+结论：界面内 evil 的 =i= 之所以不进 insert，靠的是 *etaf 键层把它吞掉* 这个机制，而不是 =special-mode= 或 =suppress-keymap= 。
+
+** 吞键条件
+
+etaf 只在 *边界 Host* 内吞掉未绑定的 printing key。边界指 =:key-scope= 为 =local= 或 =:focus-scope= 为 =modal= 的 Host，当事件是 printing key 且键链末端落在该边界时返回 =#'ignore= 值。两个必要细节：
+
+- 边界必须在 *最外层* Host，也就是 =ebasecamp-ui-app= 的 render 里那个全 stretch 的 =box= ：它统一包住 empty 与非 empty 两个分支，并把 =:key-scope 'local= 与 =:keys= 都写在上面，因此覆盖全 buffer；子树上的边界只在其子树内生效，段级键就装在每份配置的段 Host 上。
+- 无焦点时键链以 =ebox-focus-scope= 兜底，取的是 mount root，所以冷启动也安全 —— 打开界面后没按过 =TAB= 与方向键就按 =i= ，同样被吞掉。
+
+框架保留键由 etaf 拥有，包括 =escape= / =M-g= / =C-g= / =?= / Tab 系列 / 四个方向键，应用侧绑定会被 =etaf--keys-validate= 拒绝。另有 =C-x= / =M-x= / =C-g= / =ESC= 不受 local 边界影响，仍按 Emacs 原生语义走。
+
+** mode-map 绑定只作装饰
+
+=ebasecamp-ui-mode-map= 里重绑了 =q= 与 =g= 两个键。其中 =q= 覆盖 =special-mode= 默认的 =quit-window= 并指向 =ebasecamp-ui-close= ，而 =g= 指向 =ebasecamp-ui--reload-and-refresh= 。但 major-mode map 上的 printing key 会被 etaf 的 runtime 键层遮住 —— =lookup-key= 能命中，而 =key-binding= 却返回 =ignore= 值（U1 实测）。因此这两条只是「etaf 键层不可用」时的兜底，界面内按键必须声明在 Host 的 =:keys= 里；新增键不要指望 mode-map 生效。
+
+** =SPC= 不可重绑，行级勾选改用 =t=
+
+=SPC= 的事件向量是 =[32]= ，属于 ebox 的 =ebox--activation-keys= 列表（与 =RET= / =mouse-1= 同组），以 *节点级 char-property keymap* 安装，按键查找顺序先于 =emulation-mode-map-alists= 。三个后果：
+
+- 根 Host =:keys= 里的 ="SPC"= 条目 *永远不执行* 。同一张表里的普通字母立刻生效，说明键层本身正常，只是收不到这个事件。
+- =etaf-activate= 作用于 *焦点宿主* ，包括按钮。所以 =SPC= 不能当勾选键：point 在「启动选中」上按 =SPC= 会直接把容器起起来。
+- =etaf-button= 不接受 =:keymap= 覆盖，会报 =Unknown prop or Host attribute :keymap= 错误，没有 per-node 绕过的途径。
+
+因此 =SPC= 保持 ebox 的「激活当前控件」语义，勾选框上勾选、按钮上按下，与 =RET= 等价；行级切换另绑 =t= ，它是 printing key，由本应用的键层处理，在按钮上不会误触。
+
+** =t= 的实现前提：行必须可交互
+
+服务表的 =:row-ref= 只有在同时传 =:on-row-press= 时才被采用，判定逻辑在 =etaf-ui--table-row-node= 的 =interactive-p= 分支里；否则行 Host 退回实例内生成 ref，于是 =t= 就取不到行身份。副作用有两个：行变为可聚焦，TAB 停靠点因此增加；点击行、或焦点在行上按 =RET= 时也会切换该行勾选。三者写的是同一个 =ebasecamp-ui--toggle-selected= ，不存在第二套选中表示。
+
+** 段级键位与段内按钮同源
+
+=ebasecamp-ui--section-keys= 的闭包 *捕获该段自己的 instance* 再调 =ebasecamp-ui--section-action= ，与段头三个按钮完全同一条派发路径。段级全选与全不选分别用 =a= 、 =A= ，两者调的都是 =ebasecamp-ui--select-instance= 。刻意不引入「当前段」全局状态，因此同组多实例不会串段。
+
+** 焦点优先于 point
+
+根 Host 的 =:key-scope 'local= 使 =etaf--keys-chain= 在任何焦点存在时 *从焦点起算* ，而不是从 point 起算。于是 Tab 定位过控件之后，段级键跟随焦点所在段，可能与光标所在段不同。这是「与段内按钮一致」的代价：按钮同样按焦点宿主激活。
+
+** 编辑入口边界
+
+UI buffer 只读，唯一写入口是 =ebasecamp-ui-edit-manifest= ，绑在根级键 =e= 上。它的流程是取会话的 =selected-group= ，用 =find-file= 打开 =<dir>/groups.el= ，再定位到 =(ebasecamp-define-group <组名>= 那一行。三条降级路径：无选中组、文件不存在时走 =user-error= ；文件里找不到组定义时退到 =point-min= 并 =message= 提示，不 signal。函数只打开文件，不读取也不打印任何密钥值；保存后的重载由 =g= 走 =ebasecamp-reload= 完成。这意味着「写」只发生在 =emacs-lisp-mode= 的清单 buffer 里，界面永远只是投影。
+
+* 布局与主题
+
+v0.4 把主界面从「一个内容自然增长的 =column=」改成「总高恒等于窗口高的 flex 三段式」，并让配色跟随 Emacs 主题、让三个区域各自可滚、可跳转。这一节记录实现里必须守住的机制与实测边界；逐批次实测数据见 =openspec/completed/2026-10-23-ui-layout-theme-nav.md=。
+
+** flex 三段式（没有 sticky bottom 可用）
+
+底栏要固定，先得否掉「靠定位属性钉住」这条路：etaf 的 =:sticky= *只支持 top*（实现是写 header-line，每 Runtime 一个、限单行），=:position= 只有 =static= / =relative= / =absolute= 三种，没有 fixed。因此唯一可行解是让 *根节点总高等于视口高*、整窗不产生滚动，底栏自然落在最后一行。
+
+渲染结构（=ebasecamp-ui-app=）：
+
+| 层 | 节点 | 关键属性 |
+|----+------+----------|
+| 根 | =flex= | =:flex-direction 'column= + =:width 'stretch= + =:height 'stretch= |
+| 顶栏 | =row= | =:width 'stretch= + =:flex-shrink 0= |
+| 中间区 | =box= | =:width 'stretch= + =:flex-grow 1= + =:min-height '(lh 0)= |
+| 底栏 | =flex= | =:flex-direction 'column= + =:flex-shrink 0=（=:ref 'ebasecamp-ui-footer=） |
+
+四条硬约束：
+
+1. *根必须是 =flex=，不能是 =column=*。只有 tag 为 =flex= 的节点进 =ebox--layout-flex=；=column= / =row= *不走 flex 分配算法*，写在它们子节点上的 =:flex-grow= / =:flex-shrink= / =:min-height= *全被忽略*。实测对照：根写 =column= 时根内容高 32 > 视口 20、底栏下沿掉出视口、buffer 里连「底栏」文本都没有，且 =etaf-scroll-by= 恒返回 0（中间区拿不到限高 → 滚动恒定无效）。
+2. *顶栏与底栏都要显式 =:flex-shrink 0=*。漏写时会被压缩到 0 行，文本直接从 buffer 消失（不是「看起来挤」）。
+3. *中间区 =:flex-grow 1 :min-height '(lh 0)= 承担全部收缩*。这是「整窗不滚」的关键：漏写 =:min-height '(lh 0)= 时中间区拒绝收缩，整窗继续滚动。
+4. *flex 只接受 =:row-gap= / =:column-gap=*，纵向间距不能写 =:item-gap=（实测 =Ebox flex rejected properties=）；=:column-gap= 只接受 =(px ch vw %)=，不吃 =(lh N)=。详见 [[file:../openspec/tech-debt.md][技术债]] #28。
+
+** 区域内部滚动的前提
+
+左右两个 pane 各包一层 =column :height 'stretch :overflow 'scroll=，高度 *由父 flex 约束*，不写死 =(lh N)=。两个坑：
+
+- *slot 里的 pane 必须显式 =:height 'stretch=*：=etaf-splitter= 的 =&key= 白名单里没有 =:flex-grow= / =:min-height=，它自己不能撑高；pane 不写 =:height 'stretch= 时高度退化为内容高（=vh == ch=），=etaf-scroll-by= 恒返回 0，滚动区静默失效。
+- *内容列自带 =:height 'stretch= 时要垫一层 =box=*：滚动容器的 =ch= 计的是子节点 border-box，子节点被拉成「滚动视口高」后 =vh == ch=，仍然滚不动。右栏内容列正是自带 =:height 'stretch= 的情形，因此中间垫了一层高度取内容的 =box=，内容恢复自然高度后才会溢出、才会滚。
+
+滚轮按「最内层滚动器优先」分派（=ebox--scroll-chain=），所以左树与右栏互不干扰，顶栏与底栏在滚动时几何完全不变（实测滚动到 end 后底栏 =ebox-node-geometry= 与滚动前一致）。
+
+** 主题两层与主题钩子
+
+配色分两层，色值字面量 *只允许* 出现在 =ebasecamp-ui--palette-light= / =-palette-dark= 与 =defcustom= 默认值里，render 区一律走 =etaf-theme-token=（由测试的 render 区字面量扫描机械守护）。
+
+1. *基础色（9 个）从 face 取*：=:ui-fg= / =:ui-bg= 取 =default= 的前景 / 背景；=:ui-panel-fg= / =:ui-panel-bg= 取 =mode-line-inactive= 的前景 / 背景；=:ui-muted-fg= 取 =shadow= 前景；=:ui-border= / =:ui-panel-border= / =:ui-divider-bg= / =:ui-table-border= 走 =fringe= 前景 → =mode-line-inactive= 背景 → palette 的两级回退。
+2. *状态色（26 个）走内置 palette*：success / warning / danger / info / accent / disabled / button / checkbox / table-selected 的 fg / bg / border，按 =(frame-parameter nil 'background-mode)= 选 light 或 dark。合计 *35 个 token*。
+
+=face-attribute= 有三种「无值」形态，逐一都要兜：①*伪色字符串* —— 无主题时 =default= 的前景 / 背景是 ="unspecified-fg"= / ="unspecified-bg"=（字符串，=symbolp= 为 nil）；②*符号 =unspecified=* —— =shadow= / =fringe= / =mode-line-inactive= 在无主题时全是它；③*未定义 face 直接抛错* —— =(error "Invalid face")=，用 =condition-case= 兜住。回退方向是「palette 同名键」，*不是* 回退到 =default= 的同属性（否则自指）。
+
+=etaf-theme-provide= *只能在 =:setup= 阶段调用*：render 期调用会被 =etaf--assert-not-rendering= 拒绝并 signal =etaf-render-side-effect-error (provide-context)=。传 =etaf-ref= *本身*即可（不要 =(etaf-value …)=），取值变化后同一节点身份的 =:bgcolor= 就地刷新，不重挂载整棵树。
+
+主题切换靠 =enable-theme-functions= / =disable-theme-functions= 两个 abnormal hook（Emacs 29+）：=ebasecamp-ui-open= 在 =etaf-mount= *之前* =add-hook= 并重算一次，=ebasecamp-ui-close= 的 *第一行* =remove-hook= —— 挂载与卸载严格对称，任何后续失败都不会残留钩子。回调无脑重算整份 plist（face 与 =background-mode= 都是全量状态，按主题增量推断必然漏）。
+
+** ui-state.el 是运行时状态缓存
+
+左栏宽度持久化到 =<ebasecamp-cache-directory>/ui-state.el=，内容只有 =(:split-ratio FLOAT)=。
+
+- *不是清单*：不参与 =ebasecamp-config-load=、不经界面 =e=（编辑清单）入口、可随时删除（下次打开回默认）。因此它 *不破坏* ADR-0003 的「清单唯一写入口 = =e=」不变量。
+- *写入*：目录不存在时 =make-directory= 递归创建；先写同目录 =make-temp-file= 的唯一临时文件，再 =rename-file= 原子覆盖 —— 避免写一半留下损坏文件。写盘失败只 =message= 不 signal（本函数在 =close= 与拖动回调里调用）。
+- *读取*：只接受 =(:split-ratio NUMBER)= 单一形态，其余（空文件 / =(foo)= / 裸字符串 / ratio 为字符串）一律按非法回退 defcustom 默认；读到数字后 *钳制到 [0.15, 0.55]* —— 越界值不钳制会在渲染期被 =etaf-check-prop= 判死、界面打不开。
+- *不执行文件内容*：Emacs 31.1 起 =#.= 读语法默认禁用，且 =read-eval= 变量 *已不存在*（=boundp= 为 nil，照旧写 =(let ((read-eval nil)) …)= 会因「变量未使用」被 =byte-compile-error-on-warn= 判死）。替代做法是读前显式拒绝含 =#.= 的文本：合法状态文件永不含该序列，语义在 31.1 与旧版（=read-eval= 默认 t）上都成立。
+
+** 区域跳转
+
+etaf *没有* 「跳到某个 group」的 API，可用的是 =etaf-focus-within=。三条实测结论决定实现形态：
+
+1. *nil COUNT 就是「子树第一个停靠点」*，不需要传 count（零值只查询焦点是否在内）。
+2. *缺失 Host 会 =user-error=*（经 =etaf--event-host-node= 报 =No committed ETAF Host=），所以调用前必须判 =(etaf-runtime-host-node runtime ref)= 非 nil；runtime 也必须取自 *当前 buffer*（=(etaf-runtime-for-buffer (current-buffer))=），在别的 buffer 里误触自然 no-op。三类静默 no-op：未知区域、无已挂载运行时、该区域未渲染（空清单没有底栏）。
+3. *真实停靠点不是区域 Host 本身*，而是区域子树里第一个可聚焦控件，因此契约只能是「焦点进入该区域子树」。
+
+=1= / =2= / =3= 绑的是 *三个零参命令*（=--focus-tree= / =-detail= / =-footer=）而不是带 =interactive= 的 =--focus-region=：=etaf--keys-run= 对 commandp 条目走 =call-interactively=，直接绑带 interactive 参数的函数会在按键时先弹 =completing-read= 问区域。
+
+** 项目定位
+
+=ebasecamp-ui--project-for-directory= 按「最长 =:root= 前缀」找当前目录所属项目，三条要点：
+
+- *双归一*：DIR 与每个项目 =:root= 都先 =expand-file-name= 再 =file-truename=，然后统一成 =file-name-as-directory= 形态 —— =~=、=..=、软链因此等价，且只匹配 *整段目录*（=/tmp/a2= 不会被 root =/tmp/a= 命中）。
+- *大小写敏感*：=string-prefix-p= 不传第三参数也不绑 =case-fold-search=（=/tmp/A= 与 =/tmp/a= 是两个目录）。多个命中时取 root *最长* 者（=/a/b/c= 同时命中 =/a/b= 与 =/a= 时取 =/a/b=）；=:root= 为空串或目录不存在时跳过。
+- *「第一份配置」的顺序契约*：按 =ebasecamp-model-groups= 的组顺序、组内 =:configs= 顺序，取首个 =:project= 命中的配置所在组 —— 只由清单的组定义顺序决定，不看项目 =groups= 槽（物化产物里也有该组，但物化顺序不是契约）。
+- *无匹配不选中*：命中不到项目、或该项目没有配置时，保持既有「无选中组」态（右栏显示「选择左侧的组」），*不是* 回退到第一个组 —— 自动选中会删掉未选中态。
+- *只算一次*：定位只在 =ebasecamp-ui-open= 建会话时算，=ebasecamp-ui-refresh= / =g= 都不覆盖用户手选的组；关闭后重开才重算。
+
 * 已删除 / 不再使用的机制
 
 后来者不要按 v0.1 的记忆找这些符号：
@@ -210,7 +350,7 @@ ebasecamp 是 Emacs 里的 Docker 环境分组管理插件。v0.2 起，模型�
 
 * 模块公开 API
 
-口径：=defun= / =cl-defun= / =defmacro= 定义、名字中不含 =--= 的非私有符号（HEAD 实测合计 69 个）。
+口径：=defun= / =cl-defun= / =defmacro= 定义、名字中不含 =--= 的非私有符号（HEAD 实测合计 72 个）。
 
 | 文件 | 公开 API 数 | 主要符号 |
 |------+-------------+----------|
@@ -224,7 +364,7 @@ ebasecamp 是 Emacs 里的 Docker 环境分组管理插件。v0.2 起，模型�
 | =ebasecamp-data.el= | 2 | =ebasecamp-data-project-records= / =ebasecamp-data-group-instances= |
 | =ebasecamp-import.el= | 7 | =ebasecamp-import-parse= / =-parse-json= / =-suggest-name= / =-service-plists= / =-service-plist= / =-apply= / =-file= |
 | =ebasecamp-export.el= | 3 | =ebasecamp-export-default-file= / =-project= / =-compose= |
-| =ebasecamp-ui.el= | 11 | =ebasecamp-ui-open= / =-close= / =-view= / =-refresh= / =-session= / =-selected-keys= / =-confirm= / =-dismiss-confirm= / =-import-compose= / =-export-compose= / =-destroy-environment= |
+| =ebasecamp-ui.el= | 14 | =ebasecamp-ui-open= / =-close= / =-view= / =-refresh= / =-session= / =-selected-keys= / =-confirm= / =-dismiss-confirm= / =-import-compose= / =-export-compose= / =-destroy-environment= / =-report-counts= / =-edit-manifest= / =-mode= （buffer 身份与键位） |
 
 * 验证入口
 
@@ -241,9 +381,11 @@ ebasecamp 是 Emacs 里的 Docker 环境分组管理插件。v0.2 起，模型�
 
 - [[file:adr/0001-architecture.org][ADR-0001 架构与同步模型]]
 - [[file:adr/0002-group-configs.org][ADR-0002 组内配置与加载期物化]]
+- [[file:adr/0003-ui-readonly-keymap.org][ADR-0003 UI buffer 只读化与 etaf Host 键位]]
+- [[file:adr/0004-ui-layout-theme.org][ADR-0004 布局、主题与导航]]
 - [[file:compose-generation.org][compose 生成与导入导出规则]]
 - [[file:user-guide.org][用户指南]]
 - [[file:troubleshooting.org][故障排查]]
 - [[file:../AGENTS.md][AGENTS.md 仓库地图与不变量]]
-- [[file:../openspec/active/2026-10-22-group-centric-ui.md][v0.2 组为中心计划（设计决策 D1–D9）]]
+- [[file:../openspec/completed/2026-10-22-group-centric-ui.md][v0.2 组为中心计划（设计决策 D1–D9）]]
 - [[file:../openspec/tech-debt.md][技术债清单]]

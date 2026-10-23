@@ -2,6 +2,60 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/) 与 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式。
 
+## [0.4.0] - 2026-10-23
+
+界面骨架重构：根布局改为 flex 三段式（底栏常驻、左右两栏各自内部滚动）、配色改为跟随 Emacs 主题、左栏宽度可拖动并跨会话记住、新增 `1` / `2` / `3` 区域跳转、在项目目录内打开时自动定位到该项目的配置。
+
+### 新增
+
+- **底栏常驻 + 区域独立滚动**：`导入 compose` / `导出 compose` / `销毁环境` 与提示区固定在窗口底部；左树与右栏各包一层 `:overflow 'scroll'` 的限高容器，配置多时只滚当前区域，顶栏与底栏几何不变（滚动到底后底栏几何与滚动前完全一致），整窗不再滚动。
+- **区域跳转 `1` / `2` / `3`**：分别跳到左栏 / 右栏 / 底栏的首个停靠点（根级键从 9 条扩到 12 条）。实现走 `etaf-focus-within` + 三个零参命令（`ebasecamp-ui--focus-tree` / `-detail` / `-footer`），`etaf-focus-within` 的 nil COUNT 即「子树第一个停靠点」。
+- **主题跟随**：基础色（前景 / 背景 / 面板 / 边框，9 个）从 Emacs face 取，状态色（26 个）走内置明暗两套 palette，按 `background-mode` 选择，合计 35 个 `:ui-*` token；`M-x load-theme` 后即时生效（属性级刷新，不重挂载）。新增 `defcustom ebasecamp-ui-theme`（默认 `nil` = 完全跟随；plist = 按 token 覆盖，未覆盖的键仍按「face → 内置 palette」生成）。
+- **左栏宽度可拖动并跨会话记住**：`etaf-splitter` 的 `:on-change` 接管鼠标 / 键盘拖动，比例钳制在 `[0.15, 0.55]`，持久化到 `<ebasecamp-cache-directory>/ui-state.el`（只存 `(:split-ratio FLOAT)`，`make-temp-file` + `rename-file` 原子覆盖；读取拒绝含 `#.` 的文本、只接受单一形态、越界钳制）。该文件是运行时状态缓存，不是清单。
+- **在项目目录内打开自动定位**：`ebasecamp-ui--project-for-directory` 按最长 `:root` 前缀匹配当前 `default-directory`（`file-truename` 双归一、只匹配整段目录、大小写敏感），选中该项目「第一份配置」（组顺序 × `:configs` 顺序首个 `:project` 命中者）所属组；无匹配时保持「未选中组」态。
+
+### 变更
+
+- **界面根布局改为 flex 三段式**：根 `flex :flex-direction 'column :height 'stretch`，顶栏与底栏各 `:flex-shrink 0`，中间区 `box :flex-grow 1 :min-height '(lh 0)` 承担全部收缩。`column` / `row` 不走 flex 算法（子节点的 `:flex-*` 被忽略），因此根必须是 `flex`；`flex` 只接受 `:row-gap` / `:column-gap`。
+- **左栏默认宽度 0.38 → 0.26**：`ebasecamp-ui--split-ratio` 改为 `defcustom`（默认 0.26），新增 `--split-ratio-min` / `-max`（0.15 / 0.55）同时作为 splitter 的 `:min-ratio` / `:max-ratio`；会话里真正生效的值由 `split-ratio` 槽位的 `etaf-ref` 承载（只重渲染 splitter，不重建整棵树）。
+- **render 区色值全部改用 theme token**：`lisp/ebasecamp-ui.el` 的 render 函数区不再含任何色值字面量（含根 Host 原先硬编码的 `#F8F5EE` / `#252A2E`），色值只允许出现在 `--palette-light` / `--palette-dark` 与 `defcustom` 默认值里，由测试的函数名清单扫描机械守护。
+- **主题钩子与界面生命周期绑定**：`ebasecamp-ui-open` 在 `etaf-mount` 之前挂 `enable-theme-functions` / `disable-theme-functions` 并重算一次配色，`ebasecamp-ui-close` 第一行移除（严格对称）；`etaf-theme-provide` 只能在 `:setup` 调用（render 期会被 `etaf--assert-not-rendering` 拒绝）。
+- **文档与决策**：新增 ADR-0004（布局、主题与导航，含 6 条否决备选）、`openspec/decisions.md` 五行决策、`AGENTS.md` 不变量第 13 条与当前状态；`Readme.org` / `docs/user-guide.org` / `docs/architecture.org` 分别新增「界面布局」「主题」「在项目中打开」「布局与导航」「布局与主题」节。
+
+### 修复
+
+- **底栏需滚到底才能看到**：底栏原先排在内容之后且没有固定约束，容器一多就掉出视口。现在中间区 flex 撑满剩余高度、底栏 `:flex-shrink 0`，根高恒等于视口高。
+- **暗色主题下 badge / alert 是浅色块**：根因是界面从未 `etaf-theme-provide` 过 token，etaf-ui 的语义 palette 只有一套浅色值，整体回退。现在 provide 35 个 token，状态色按明暗切换（`theme-plist-dark-differs` 守护）。
+- **左栏过宽**：默认 0.38 挤占右栏服务表格，改为 0.26 并可拖动。
+
+## [0.3.0] - 2026-10-23
+
+界面只读化与完整键位：`*ebasecamp*` 有了 buffer 身份（`ebasecamp-ui-mode` + `buffer-read-only`），键位集中到 etaf Host 的 `:keys`，写入口收敛到 `e`。
+
+### 新增
+
+- **根级键位（9 条）**：`q` 关闭界面（卸载运行时 / 停轮询 / 销毁会话）、`g` 重载清单并刷新、`n` / `p` 下一个 / 上一个组、`e` 编辑当前组清单、`t` 切换当前行勾选、`I` 导入 compose、`o` 导出 compose、`D` 销毁环境。键表单一来源 `ebasecamp-ui--root-keys`，渲染与测试共用。
+- **段级键位（5 条）**：`s` / `x` / `r` 启动 / 停止 / 重启该段选中服务，`a` / `A` 全选 / 全不选该段服务（`ebasecamp-ui--section-keys`，捕获该段自己的 instance，同组多实例不串段）。
+- **`t` 行级勾选**：point 在服务行内任意单元格都能切换该行勾选；在按钮上是 no-op（不会误触段级动作）。行 ref 与 checkbox ref 由 `组名/服务名` 派生，重渲染后身份不变。
+- **`e` 编辑当前组清单**（`ebasecamp-ui-edit-manifest`）：打开 `<dir>/groups.el` 并把 point 定位到 `(ebasecamp-define-group <组名>` —— 界面唯一的写入口。无选中组 / 文件不存在时 `user-error`；组定义找不到时回 `point-min` 并 `message`（不 signal）。
+- **`?` 快捷键帮助**：每条键位都带中文 LABEL，`etaf-help` 按 point 所在键链列出根级 9 条 + 段内 5 条；无 LABEL 的条目会被框架静默跳过，故 LABEL 覆盖率由测试守护。
+
+### 变更
+
+- **`*ebasecamp*` 改为 `ebasecamp-ui-mode` 且只读**：`special-mode` 派生 + `buffer-read-only t`，mode 在 `etaf-mount` **之前**启用（反过来做会让 `special-mode` 的 `kill-all-local-variables` 清掉 ebox 的挂载状态，报 `No mounted Ebox tree`）。`q` / `g` 在 mode map 里保留兜底绑定（printing key 实际由 etaf 键层接管）。
+- **`q` 关闭界面、`g` 重载清单并刷新**：`q` 是 `ebasecamp-ui-close`（不是 `quit-window`），`g` = `ebasecamp-reload`（内部已刷新，不再二次 `docker ps`）。
+- **服务行可聚焦**：`etaf-table` 传 `:on-row-press` 后行 Host 带 `:tab-index 0`，点击行或焦点在行上按 `RET` 切换该行勾选；代价是 `TAB` 停靠点增加。
+- **`SPC` = `RET`（ebox 激活语义，不再是勾选键）**：`[32]` 属 `ebox--activation-keys`（节点级 char-property keymap 先于 etaf 键层），无法用 `:keys` 重绑；`SPC` 保持「激活当前控件」（checkbox 上勾选、按钮上按下），行级勾选改绑 `t`。
+- **未绑定 printing key 一律被吞**：最外层 Host 加 `:key-scope 'local`，`i` 不再落到 evil 的 insert state；`C-x` / `M-x` / `C-g` / `ESC` 不受影响。
+- **文档与决策**：新增 ADR-0003（UI buffer 只读化与 etaf Host 键位，含 6 条否决备选）、`openspec/decisions.md` 两行决策、`AGENTS.md` 不变量第 12 条与「已知特性」表、`docs/troubleshooting.org` 第 11–13 条；`Readme.org` / `docs/user-guide.org` / `docs/architecture.org` 分别新增「界面键位」「界面操作与键位」「UI buffer 身份与键位分层」节。
+
+### 修复
+
+- **界面能进入 insert state / 能打字**：UI buffer 原先没有 major mode、没有只读、根 Host 没有 `:key-scope 'local`，`i` 一路落到 evil。现在只读 + local 边界，打字无处可去。
+- **键盘无法切换选中组**：`etaf-tree` 分支节点的 `:on-press` 只做展开 / 收起、`on-select` 只对叶子调用，组节点按 `RET` 只能折叠；新增 `n` / `p` 按 `:groups` 顺序循环切换（含回绕）。
+- **无段级动作键**：配置段的启动 / 停止 / 重启原先只有鼠标可点，新增 `s` / `x` / `r` 与全选 `a` / 全不选 `A`。
+- **无编辑清单入口**：此前只能自己找路径打开 `groups.el`，新增 `e` 定位到当前组定义。
+
 ## [0.2.0] - 2026-10-23
 
 组为中心的界面与「组内配置」模型：关联方向由「项目 → 组」反转为「组 → 配置 → 项目」，旧写法继续可用。

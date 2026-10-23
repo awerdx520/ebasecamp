@@ -1,0 +1,51 @@
+#+title: ADR-0003 UI buffer 只读化与 etaf Host 键位
+#+date: 2026-10-23
+#+status: 已接受（Accepted）
+
+* 背景
+
+v0.2 的主界面 =*ebasecamp*= 是「没有身份的裸 buffer」：=ebasecamp-ui-open= 只做 =get-buffer-create= + =etaf-mount=，既不设 major mode 也不设 =buffer-read-only=。etaf 的 mount 同样不做这两件事。由此产生三类具体问题。
+
+1. *UI buffer 能进 insert state，能打字*。按键查找有三层叠加（优先级由高到低）：etaf Host =:keys=（应用声明的键 + 框架默认，v0.2 应用侧一条都没声明）、evil 的 emulation map（=i= → insert state）、=ebox-buffer-mode= 的 =suppress-keymap=。etaf 键层确实装在 =emulation-mode-map-alists= 最前面、本可遮住 evil，但 etaf *只在 local / modal 边界内* 吞掉未绑定的 printing key；当前视图根没有 =:key-scope 'local=，于是 =i= 一路落到 evil，界面里可以随便敲字。敲进去的字不落任何文件，纯属误导。
+2. *键位缺失，键盘无法完成基本操作*。=q= / =g= / =n= / =p= / =I= / =o= / =D= 一个都没绑；=etaf-tree= 分支节点的 =:on-press= 只做展开 / 收起，=on-select= 只对叶子调用，因此组节点按 =RET= 只能折叠、无法「选中这个组」；配置段内的启动 / 停止 / 重启只有鼠标可点。
+3. *写能力错位*。insert state 让 UI buffer 本身成了「可以打字的地方」，而真正该写的地方（清单文件 =groups.el= / =projects/*.el=）却没有界面入口 —— 用户只能自己找路径、自己打开、自己定位到那个组的定义。
+
+* 决策
+
+1. *给 buffer 身份，并只读*：新增 =ebasecamp-ui-mode=（用 =define-derived-mode= 派生 =special-mode=），body 里设 =buffer-read-only t=；=special-mode= 自带的 =q= / =g= 在 =ebasecamp-ui-mode-map= 里重绑为 =ebasecamp-ui-close= / =ebasecamp-ui--reload-and-refresh= 作兜底。*mode 必须在 =etaf-mount= 之前启用* —— 反过来做时 =special-mode= 的 =kill-all-local-variables= 会清掉 ebox 的 buffer-local 挂载状态（=ebox--buffer-mount=），随后 =ebox-focus-scope= / =ebox-node-at= 报 =user-error: No mounted Ebox tree in *ebasecamp*=，焦点与键层全部失效，而渲染断言仍然全绿（这个错法很难被发现）。
+2. *键位单一来源 = etaf Host =:keys=*：全部键位集中在 =ebasecamp-ui--root-keys=（根级 9 条：=q g n p e t I o D=）与 =ebasecamp-ui--section-keys=（段级 5 条：=s x r a A=）两张表，渲染与测试共用同一份数据；*每条都必须带 LABEL*，因为 =etaf-help-data= 会 *静默跳过* 没有 LABEL 的条目 —— LABEL 是 =?= 帮助面的唯一来源，漏写等于键位不可发现。
+3. *吞键 = 最外层 Host 的 =:key-scope 'local=*：根 Host（统一包住 empty 与非 empty 两个渲染分支）声明 =:key-scope 'local=，未绑定的 printing key（含 =i=）在边界内被吞掉、无反应；=C-x= / =M-x= / =C-g= / =ESC= 是前缀键，不受影响。
+4. *=SPC= 交还 ebox 的激活语义，行级勾选另绑 =t=*：实测 =[32]= 在 =ebox--activation-keys= 里，以节点级 char-property keymap 安装，按键查找中先于 =emulation-mode-map-alists=（etaf 键层所在处），因此 root Host =:keys= 里的 ="SPC"= 条目 *永远不执行*（同表 ="z"= 立即可执行 → 键层本身正常），且 =etaf-button= 不接受 =:keymap= 覆盖，没有 per-node 绕过途径。于是 =SPC= 保持「激活当前控件」（与 =RET= 同义：checkbox 上勾选、按钮上按下），行级切换改绑 =t= —— =t= 由我们的键层接管，且能覆盖「行内任意单元格」，在按钮上是 no-op 而不会误按。
+5. *段级键与段内按钮同源*：=s= / =x= / =r= 的闭包直接调 =ebasecamp-ui--section-action= 并捕获 *该段自己的* instance，=a= / =A= 直接写 =selected-ref= 的该段 key 集合；不引入「当前段」全局状态，避免同组多实例串段。
+6. *唯一写入口 = =e= → =groups.el= 定位*：=ebasecamp-ui-edit-manifest= 取会话的 =selected-group=，打开 =<dir>/groups.el= 并用 =search-forward "(ebasecamp-define-group <组名>"= 定位到该组定义。写只发生在普通 =emacs-lisp-mode= 的清单 buffer 里；UI buffer 保持只读。三条降级路径：无选中组 / 文件不存在 → =user-error=；组定义找不到 → 回 =point-min= + =message=（不 signal，手写清单里组可能不在 =groups.el=）。
+
+* 后果
+
+** 正面
+
+- *界面真的只读*：=i= 不再进 insert，打字无处可去，写能力回到清单文件。
+- *键盘可完成全流程*：切组（=n= / =p=）、勾选（=t= 或点行 / =RET=）、生命周期（=s= / =x= / =r=）、全选 / 全不选（=a= / =A=）、导入导出销毁（=I= / =o= / =D=）、重载（=g=）、退出（=q=）。
+- *可发现*：=?= 按 point 所在键链列出根级 9 条 + 进入段内再列 5 条段级，每条都有中文 LABEL。
+- *写入口单一*：全插件只有 =e= 一处把用户带到可写 buffer，安全约束（清单只存 =${VAR}= 引用与相对路径）不被界面绕过。
+
+** 代价与已知边界
+
+- *服务行变得可聚焦*，=TAB= 停靠点增加：=etaf-table= 只在传了 =:on-row-press= 时才采用调用方提供的 =:row-ref=（=etaf-ui--table-row-node= 的 =if interactive-p= 分支），因此行点击 / =RET= 切换勾选的代价是行 Host 带 =:tab-index 0=。这是有意取舍：换来「行内任意位置按 =t= 或 =RET= 都能勾」。
+- *焦点优先于 point*：etaf 键链从焦点起算，焦点在 A 段而 point 在 B 段时会命中 A 段的段级键 —— 与段内按钮的行为一致，但需要知道。
+- *同组多配置共享选中 key*：=ebasecamp-ui--instance-key= 只有 =组名/服务名=、无配置维度，因此段级 =s= / =a= / =A= 会把另一段同名服务一起算进去（与容器标签无配置维度同源，见技术债 #25 与新增条目）。
+- *=SPC= 不能再作 leader 前缀*：界面 buffer 内 =SPC= 恒等于 =RET=，general / evil 的 =SPC= 前缀在这里不生效。注意这不是我们绑的键 —— 是 ebox 内建的激活语义；原先「把 =SPC= 绑成勾选」的设计已按此实测废弃（见下方备选 F）。
+- *段外按键被吞且无提示*：point 在左树 / 顶栏时按 =s= / =x= / =r= 无反应 —— 与「未绑定 printing key 一律无反应」的约定一致，但用户可能误以为坏了（已写入 =docs/troubleshooting.org=）。
+- *evil 的 insert 行为无法在 batch 下验证*：=emacs -Q --batch= 没有 evil，=i= 不进 insert 只能在用户目检（L3）覆盖。本 ADR 的 =:key-scope 'local= 结论有 batch 探针支撑（=(etaf--keys-binding [?\i])= 返回 =#'ignore=），evil 一侧由条件化集成（=with-eval-after-load 'evil= + =evil-set-initial-state=）兜住，未装 evil 时无副作用。
+
+* 备选方案与否决理由
+
+- *A. 只 =setq buffer-read-only= ，不加 major mode*：否决。=buffer-read-only= 只挡 Lisp 侧写入与 self-insert，不提供 mode 身份：=q= / =g= 无兜底绑定、=evil-set-initial-state= 无处可挂、用户无法用 =describe-mode= 知道这个 buffer 是什么。而且没有 major mode 时 =kill-all-local-variables= 的时序问题依然存在（只是变成「谁先谁后都对」的假象），把一个身份问题降级成若干局部补丁。
+- *B. 用 =evil-define-key= 解决 insert 问题（硬依赖 evil）*：否决。等于为一个「不该能打字」的 buffer 引入重度第三方依赖，且只解决 evil 用户的 insert，不解决键位缺失与吞键；非 evil 用户白付依赖成本。改为 =with-eval-after-load 'evil= 条件化设置初始状态。
+- *C. 把键位绑在 major-mode map（=ebasecamp-ui-mode-map=）而非 etaf Host =:keys=*：否决（实测）。printing key 被 etaf runtime 键层遮住：=lookup-key ebasecamp-ui-mode-map (kbd "q")= 命中 =ebasecamp-ui-close=，但运行期 =(key-binding (kbd "q"))= 返回 =ignore=，按键根本不生效。mode map 只能作兜底装饰（=q= / =g= 保留兜底即可），不能作为键位的事实源。
+- *D. 界面内做清单编辑器*：否决（本期）。新增 / 删除配置、字段表单、写盘回滚、并发编辑冲突，工作量与风险都远超「只读投影 + 一处写入口」；且 =groups.el= 本身是 Elisp，界面表单必然只能表达子集，反而制造「界面能改一半」的困惑。留技术债 #26 与 M4。
+- *E. advice =ebox-activate= 拦截 =SPC=*：否决。依赖 ebox 内部行为，且会造成「=SPC= 在按钮上无反应而同义的 =RET= 有反应」的不一致；同时把「=SPC= 该干什么」这个语义决定藏进一个 advice 里，后续 ebox 升级即隐性失效。
+- *F. 用 =etaf-activate= 兼作勾选键*：否决（实测）。=etaf-activate= 按的是 *焦点宿主* 而不是 point 处节点（有焦点时 point 移到别处仍按焦点），且会真的按下按钮 —— 在配置段的「启动选中」按钮上按一次就等于起容器。勾选走 ref + dispatch 的显式路径（=--ref-at-point= → =ebox-node-at= → =etaf-dispatch-event=），非服务行位置静默 no-op。
+
+* 状态
+
+*已接受*（2026-10-23，0.3.0）。引用：ADR-0001（分层与同步模型，UI 层不得直接拼 docker 命令）、ADR-0002（组内配置与加载期物化，本 ADR 的界面是它的投影）。相关技术债：#20（docker 输出捕获偶发失败，与本 ADR 无关但同批次实证）、#25（容器标签无配置维度 → 同组多配置共享选中 key 的根因）、#26（不做界面内清单编辑器）。实现细节与逐批次实测记录见 =openspec/completed/2026-10-23-ui-readonly-keymap.md=；键位分层与只读机制的完整说明见 =docs/architecture.org= 的「UI buffer 身份与键位分层」节。

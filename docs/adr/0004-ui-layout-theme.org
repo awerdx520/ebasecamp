@@ -1,0 +1,70 @@
+#+title: ADR-0004 布局、主题与导航（flex 三段式 / 主题两层 / 区域跳转 / 项目定位）
+#+date: 2026-10-23
+#+status: 已接受（Accepted）
+
+* 背景
+
+v0.3 的界面在功能上完整（只读 + 键位 + 唯一写入口），但骨架仍是 v0.2 的「内容自然增长的一个 =column=」，五个现象直接来自这个骨架：
+
+1. *底栏要滚到底才看得到*。根视图是普通 =column=、高度随内容增长，底栏排在树之后；没有任何约束让「中间区撑满剩余高度、底栏固定」。容器一多，「导入 compose / 导出 compose / 销毁环境」就掉到视口之外。
+2. *配置多时整窗滚动，左树跟着滚走*。左树与右栏都没有 =:overflow 'scroll'= 的限高容器；etaf 的滚轮链是「最内层滚动器优先」，没有限高容器时唯一滚动器就是窗口本身。
+3. *暗色主题下界面发白*。背景 ="#F8F5EE"=、前景 ="#252A2E"= 等色值直接写在 Host 属性里；同时界面从未 =etaf-theme-provide= 过任何 token，于是 etaf-ui 的 badge / alert / button 整体回退到它那套 *只有浅色* 的语义 palette。
+4. *左栏占了 0.38 却只有一行内容*。=ebasecamp-ui--split-ratio= 是常量 0.38（为容纳旧写法的「· N 项目」文案调的），宽度不能拖也不能记住。
+5. *无区域跳转、无项目上下文*。三个区域没有 =:ref=，键盘只能在 =TAB= 停靠点里一路走；打开界面时只按 =--default-expanded= 展开，不读 =default-directory= —— 从项目目录里进来也看不到该项目的配置。
+
+前四条的根因都是同一个：*没有可用的固定布局机制*。etaf 没有 fixed / sticky bottom（=:sticky= 只支持 top，=:position= 只有 static/relative/absolute），所以只能把根节点做成「总高 = 视口高」的 flex 容器。
+
+* 决策
+
+1. *flex 三段式*：根 =flex :flex-direction 'column :height 'stretch=（顶栏 =row :flex-shrink 0= / 中间区 =box :flex-grow 1 :min-height '(lh 0)= / 底栏 =flex :flex-shrink 0=）。除中间区外都不参与收缩，因此 *整窗永不滚动*，底栏恒在最后一行。关键前提：=column= / =row= *不走 flex 算法*，写在它们子节点上的 =:flex-*= 全被忽略 —— 根必须是真的 =flex=。
+2. *区域各自滚动*：=etaf-splitter= 的两个 slot 各包一层 =column :height 'stretch :overflow 'scroll=，高度由父 flex 约束而不写死 =(lh N)=。内容列自带 =:height 'stretch= 时中间垫一层 =box=，否则 =vh == ch= 而滚不动。
+3. *主题两层 + 主题钩子*：*基础色*（9 个：前景 / 背景 / 面板 / 边框）从 Emacs face 取，*状态色*（26 个：success / warning / danger / info / accent / disabled / button / checkbox / table-selected）走内置明暗两套 palette，按 =(frame-parameter nil 'background-mode)= 选择，合计 *35 个 token*。整套 token 由 =ebasecamp-ui--theme=（=etaf-ref=）承载，=etaf-theme-provide= 在根 Host 的 =:setup= 里提供；=enable-theme-functions= / =disable-theme-functions= 钩子重算 ref，=load-theme= 后 *属性级刷新*（节点身份不变，不整树重挂载）。render 区因此不含任何色值字面量，由测试机械守护。
+4. *宽度持久化*：默认 0.26（=defcustom ebasecamp-ui--split-ratio=），可拖（鼠标 / 键盘），钳制在 [0.15, 0.55]，写入 =<ebasecamp-cache-directory>/ui-state.el=。
+5. *区域跳转*：三个区域各加 =:ref=（=ebasecamp-ui-tree= / =-detail= / =-footer=），=1= / =2= / =3= 分别经 =etaf-focus-within= 把焦点送进对应区域子树的首个停靠点。因为 =etaf--keys-run= 用 =call-interactively=，键上绑的是三个零参命令，不是带 interactive 参数的 =--focus-region=。
+6. *项目定位*：=ebasecamp-ui--project-for-directory= 用「双 =file-truename= 归一 + =file-name-as-directory= 形态 + =string-prefix-p=（大小写敏感）+ 最长 =:root= 胜出」匹配当前目录；命中则把选中组设为该项目 *第一份配置*（组顺序 × =:configs= 顺序的首个 =:project= 命中者）所在组；*无匹配则不选中任何组*（保持「选择左侧的组」）。只在 =ebasecamp-ui-open= 建会话时算一次。
+
+* 后果
+
+** 正面
+
+- *底栏常驻*：三个入口与提示区始终可见，不再需要「先滚到底」。
+- *区域独立滚动*：配置多时只滚当前区域，顶栏 / 底栏几何完全不变（实测滚动到 end 后底栏几何与滚动前一致），左树不再被右栏内容带走。
+- *主题跟随*：=M-x load-theme= 即时生效，暗色主题下 badge / alert / 按钮不再是浅色块；用户还能用 =ebasecamp-ui-theme= 按 token 覆盖。
+- *宽度合身且可记*：默认 0.26 把宽度让给服务表格，拖过之后跨会话记住。
+- *键盘可达*：=1= / =2= / =3= 一步进区域，不必数 =TAB=。
+- *上下文化*：从项目目录里打开界面就直接落在该项目的配置上。
+- *色值有唯一出口*：色值只出现在 palette / token 定义区与 =defcustom= 默认值，render 区由测试扫描守护，杜绝再次散落。
+
+** 代价与已知边界
+
+- *正向约束变成硬约束*：=flex= 只接受 =:row-gap= / =:column-gap=（=:item-gap= 被拒、=:column-gap= 不吃 =lh=）；滚动列里子树不得自带 =:height 'stretch=。写错会「界面打不开」或「看起来有滚动容器但滚不动」，二者都无提示。已记入 [[file:../../openspec/tech-debt.md][技术债]] #28。
+- *主题只覆盖界面用到的 35 个 token*：=etaf-ui= 的 shell / window / search / picker / playing-card / data-grid 继续走它自己的浅色 palette —— 这些组件在界面上不出现，未为「全量」而覆盖。若将来引入这些组件，需补 token。
+- *face 的「无值」形态要逐一兜*：无主题时 =default= 前景 / 背景是伪色字符串 ="unspecified-fg"= / ="unspecified-bg"=，=shadow= / =fringe= / =mode-line-inactive= 是符号 =unspecified=，未定义 face 直接抛 =Invalid face=。三种都不是 nil，判空不能只判 =nil=。
+- *=1= / =2= / =3= 是 printing key*：绑定后 evil 的数字前缀在界面内失效（与 =q= / =g= 同理）。
+- *停靠点位置由 ebox 决定*：区域跳转的落点是「区域内第一个可聚焦控件」而非区域 Host 本身，契约只能是「焦点进入该区域子树」。
+- *宽度状态文件是新增落盘物*：多了一个 =ui-state.el=（仅 =(:split-ratio FLOAT)=），下文单独说明其边界。
+- *batch 下的布局断言必须固定视口*：=emacs -Q --batch= 里 =(set-frame-height nil 40)= 不改 =frame-height=，不 =(let ((ebox-viewport-height N)) …)= 包住 =ebasecamp-ui-open= 会假绿。
+
+** ui-state.el 的定位（与 ADR-0003 不变量不冲突）
+
+=ui-state.el= 是 *运行时状态缓存*，不是清单：
+
+- 位于 =ebasecamp-cache-directory=（=~/.cache/ebasecamp/=），不在清单目录 =~/.config/ebasecamp/=；
+- 只存 =(:split-ratio FLOAT)= 一项，不参与 =ebasecamp-config-load=，不是清单的事实源，也不影响任何渲染语义的正确性；
+- *不经界面 =e=（编辑清单）入口*，界面对它没有编辑面；
+- 可随 =~/.cache= 清理、可随时手工删除，下次打开回默认 0.26。
+
+因此它 *不破坏* ADR-0003 的「清单唯一写入口 = =e=」不变量 —— 那条不变量约束的是 *用户编辑清单内容* 的路径，而这里写的是「窗口宽度」这类一次性的视图偏好，且只由程序在拖动 / 关闭时写入。
+
+* 备选方案与否决理由
+
+- *A. 用 =:sticky top= 把底栏钉住*：否决。etaf 的 =:sticky= 只支持 top，实现方式是写 header-line（每 Runtime 仅 1 个、限单行），既不能用于 bottom，也表达不了「三个按钮 + 提示区」这种多行结构。改用 =:position 'absolute= 同样不行：=:position= 只有 static / relative / absolute，absolute 相对的是内容盒而非视口，内容高度不足时底栏不会贴底、内容超高时它会跟着滚走。唯一可行的是让根高恒等于视口高。
+- *B. 只用硬编码的明暗两套 plist，不读 face*：否决。看起来更简单、也更「可控」，但用户换主题后界面仍是固定的两套颜色，与编辑器其余部分割裂；而且 =:ui-bg= 这类基础色 *必须* 与 =default= 的底一致，否则文字对比度在部分主题下直接崩（例如浅底主题配深底界面）。读 face 的代价是三种「无值」形态要兜，但兜住的正是「用户没装主题」这个最常见情形。
+- *C. 引入主题库依赖（如 =color-theme= / =autothemer= / 自建 theme 文件）*：否决。本项目的不变量是「零外部依赖（除 etaf / etaf-ui）」，为取几个颜色引入主题框架会破坏该约束；而且我们需要的是「读当前 face + 一套状态色」，=face-attribute= + 内置 palette 已经足够，不需要主题框架的抽象。改用「自带一套 =deftheme=" 同样被否：那会让界面颜色独立于用户主题，回到方案 B 的问题。
+- *D. 用 =TAB= 循环代替 =1= / =2= / =3=*：否决。=TAB= 是线性遍历，配置段里停靠点几十个，跨区域跳转等于把区域导航退化成多次按键；而且 =TAB= 的语义是「区域内移动」，与「跨区域跳转」是两种操作，复用会让两者都变模糊。
+- *E. 把「跳区域」做成带 interactive 参数的一个命令（=--focus-region=）*：否决（实测）。=etaf--keys-run= 对 commandp 条目走 =call-interactively=，按键时会先弹 =completing-read= 问区域。改为三个零参包装命令。
+- *F. 无匹配项目时回退到第一个组*：否决（实测）。自动选中第一个组会删掉「未选中组」态，让 4 项既有的占位断言（右栏「选择左侧的组」）集体变红；且「你不在任何项目里」这件事本身就是有用信息，不应被静默掩盖。
+
+* 状态
+
+*已接受*（2026-10-23，0.4.0）。引用：ADR-0003（UI buffer 只读化与 etaf Host 键位 —— 本 ADR 的 =ui-state.el= 不破坏其「清单唯一写入口 = =e=」不变量；键位表从 9 条扩到 12 条，新增 =1= / =2= / =3=）、ADR-0001（分层与同步模型，UI 层不得直接拼 docker 命令，本次改动只落在 =lisp/ebasecamp-ui.el=）。相关技术债：[[file:../../openspec/tech-debt.md][#28]]（=flex= 不接受 =:item-gap=、滚动容器里子节点自带 =:height 'stretch= 时滚不动）。实现细节与逐批次实测记录见 =openspec/completed/2026-10-23-ui-layout-theme-nav.md=；布局与主题机制的完整说明见 =docs/architecture.org= 的「布局与主题」节。

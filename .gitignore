@@ -8,3 +8,9 @@
 .cask/
 .eask/
 test/fixtures/.tmp/
+.envrc
+# 测试/探针临时目录（make-temp-file 残留）
+/ebasecamp-ui-test-*/
+/ebc-probe-*/
+/test-nativecomp-cache-*/
+/ebasecamp-config-test-*/
