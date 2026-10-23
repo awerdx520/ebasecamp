@@ -2,7 +2,7 @@
 #+author: Thomas
 #+options: toc:t
 
-ebasecamp 是 Emacs 里的 Docker 环境分组管理插件（版本 0.4.0）。
+ebasecamp 是 Emacs 里的 Docker 环境分组管理插件（版本 0.5.1）。
 
 * ebasecamp 是什么
 
@@ -22,6 +22,8 @@ ebasecamp 把 Docker 环境按「组 → 配置 → 项目」组织：
 - *状态轮询*：容器状态由 =docker ps --no-trunc= 采集并按标签归一，默认 3 秒轮询一次（见 =ebasecamp-status-refresh-interval=）。
 - *导入已有 compose*：用 =docker compose config --no-interpolate= 系列 flag 读取项目 compose，映射为清单文件落盘（组内 =:configs= 写法）。
 - *导出部署用 compose*：把项目的 per-project 组（含项目级覆盖）渲染为可直接部署的 compose 文件。
+- *界面内编辑 container 配置*：按 =S= 打开服务编辑表单，改 =image= / =ports= / =environment= / =volumes= / =command= / =restart= 六个字段，只把你改动的字段写回清单，其余字段原样保留。
+- *配置 / 项目 / 组的增删改*：=E= 改配置的关联项目、=M= 把配置移动到其他组的其他项目、=X= 打开清单操作菜单做配置 / 项目 / 组的 CRUD；删除带引用保护与影响提示。
 - *密钥只存引用*：清单里只保存 =${VAR}= 引用与相对路径，插件不读取、不打印、不落盘任何密钥值。
 
 * 安装
@@ -104,6 +106,14 @@ ebasecamp 把 Docker 环境按「组 → 配置 → 项目」组织：
 ├── groups.el        服务组定义（可选）
 └── projects/*.el    项目定义，按文件名字典序加载
 #+end_src
+
+** 组定义放哪里：groups.el 或 projects/*.el
+
+加载层按「=groups.el= （存在时）→ =projects/*.el= 字典序」读取全部清单文件，两类 form（=ebasecamp-define-group= / =ebasecamp-define-project= ）写在哪个文件里都能被读到 —— 所以 *组定义可以放在 =groups.el= ，也可以放在 =projects/*.el=* ，没有 =groups.el= 是完全正常的清单（导入功能就是把「组 + 项目」一起写进 =projects/<name>.el= 的）。
+
+界面里的写操作（=S= / =E= / =M= / =X=）也不要求 =groups.el= 存在：它们 *按组名跨文件定位* 组定义的实际所在文件（=groups.el= 优先，其次 =projects/*.el= 字典序），改哪份配置就写回组真正所在的那个文件，不会凭空创建 =groups.el= 。
+
+唯一硬约束是 *同一个组名只能在一个文件里定义*。同名组出现在多处时，加载层报错「组 X 已定义」，并且 *后加载的那个文件整体回滚* —— 与它同文件的项目定义一起消失，*该项目不会出现在界面中*（其余文件照常加载）。因此写操作一旦发现同一组名在多个文件中定义，会直接 *拒绝* 并列出这些文件，要求先清理重复定义，不会静默挑第一个。
 
 ** groups.el 示例
 
@@ -196,6 +206,27 @@ ebasecamp 把 Docker 环境按「组 → 配置 → 项目」组织：
 - =environment= 与 =labels= 是字符串 alist，值用 =${VAR}= 引用，插件原样保留不插值。
 - =:extra= 存放清单未识别的 compose 字段，导出时原样回写；清单层不校验其键名。
 
+** compose 顶层 =configs= / =secrets=
+
+compose 允许服务引用顶层声明的 config / secret（服务级 =configs: [{source: web_cfg}] = 指向上面的顶层 =configs: {web_cfg: {file: ./web.conf}}= ）。导入时这两个顶层段会保留到 *项目定义* 的 =:file-configs= / =:file-secrets= 槽，per-project 生成物渲染时再输出回去：
+
+#+begin_src elisp
+(ebasecamp-define-project example
+  :title "示例项目"
+  :root "~/Workspace/example"
+  :file-configs (("web_cfg" ("file" . "./web.conf")))
+  :file-secrets (("db_pass" ("file" . "./db_pass.txt"))))
+#+end_src
+
+值的形态是 *compose 原样结构*（字符串键的 alist），插件只校验「键必须是字符串」而不做更深语义校验；清单里照旧只存相对路径与 =${VAR}= 引用。
+
+四条边界：
+
+- *老清单需要重新导入一次*：v0.5.1 之前导入的清单 *没有* =:file-configs= / =:file-secrets= —— 服务级 =configs:= 引用还在（走 =:extra= 原样透传），顶层段却已丢失，此时启动会报 =service "xxx" refers to undefined config=。修法是对 *原 compose 重新导入一次*（=M-x ebasecamp-import-file= 或界面底栏 =导入 compose= ），顶层段就补齐了；插件不会自动改写你的清单。
+- *只支持 =file:= / =external= / =name= 形态*：顶层 config / secret 的值为「字符串键的 alist」+ 单行标量。用 =content:= 写 *多行字符串* 目前 *不可表达* —— 渲染器只有单行标量写法，这类内容导入后会丢，且 =config -q= 仍可能 exit 0（静默错误，见 [[file:openspec/tech-debt.md][技术债]]）。
+- *shared 生成物不含顶层段*：=ebc-shared= 只渲染 shared 组服务，不带顶层 =configs: / secrets:= ；shared 组服务若引用顶层 config / secret，需要自行处理。
+- *界面不编辑顶层段*：第一版只保证「导入 → 渲染往返不丢」，界面里没有编辑 =:file-configs= / =:file-secrets= 的入口，需要时手写清单（=e=）。
+
 ** 覆盖合并语义
 
 覆盖写在配置的 =:services= 里，按服务名逐字段处理：=environment=、=labels=、=:extra= 按键合并（项目值覆盖同键、其余键保留），=image=、=command=、=entrypoint=、=ports=、=volumes=、=healthcheck=、=depends-on=、=networks=、=working-dir=、=user=、=restart= 整体替换。覆盖组内不存在的服务名会报错。
@@ -225,7 +256,7 @@ v0.1 的写法仍然可用，视作「匿名配置」（配置名等于组名）
 | =ebasecamp-ui-mode= | 界面主模式（=special-mode= 派生，设 =buffer-read-only t=）；=M-x= 直接调用只切换当前 buffer 的 mode，正常入口是 =ebasecamp=。 |
 | =ebasecamp-ui-refresh= | 采一次容器状态快照并重建渲染数据。 |
 | =ebasecamp-ui-report-counts= | 用 =message= 报告当前会话的组数 / 配置数（有旧写法关联时附其数量）—— 即界面打开时的那条回执；无会话时静默返回 =nil=。 |
-| =ebasecamp-ui-edit-manifest= | 打开 =groups.el= 并定位到当前选中组的定义 —— 界面唯一的写入口（界面里按 =e=）。 |
+| =ebasecamp-ui-edit-manifest= | 打开当前组定义所在的清单文件（=groups.el= 或 =projects/*.el= ，按组名跨文件定位）并定位到该组的定义 —— 手写清单的入口（界面里按 =e=）；定位不到时降级为打开文件头并提示，不阻断。表单式写操作走 =S= / =E= / =M= / =X= 。 |
 | =ebasecamp-reload= | 重新加载清单并刷新界面，报告组 / 项目 / 错误数量。 |
 | =ebasecamp-create-sample-config= | 生成示例清单；=C-u= 前缀强制覆盖。 |
 | =ebasecamp-import-file= | 选一个 compose 文件导入为清单（迷你缓冲区确认项目名）。 |
@@ -238,7 +269,7 @@ v0.1 的写法仍然可用，视作「匿名配置」（配置名等于组名）
 
 * 界面键位
 
-界面 buffer =*ebasecamp*= 是只读的：它只是清单的投影，在界面里敲的字不会落到任何文件。要改配置就按 =e= ，它会打开 =groups.el= 并把 point 定位到当前组的定义 —— 这是界面唯一的写入口；改完保存，回界面按 =g= 重载。界面内按 =?= 弹出全部键位；其余字母在界面内无反应，例如 =i= 不会进入 evil 的 insert state。
+界面 buffer =*ebasecamp*= 是只读的：它只是清单的投影，在界面里敲的字不会落到任何文件。改配置有两条路：按 =S= / =E= / =M= / =X= 走界面表单（改动由插件写回清单），或按 =e= 打开该组定义所在的清单文件（=groups.el= 或 =projects/*.el= ）手写 Elisp。两条路共用同一个写盘事务内核（备份 → 原子写 → 校验 → 失败回滚），所以表单与手工编辑的安全性一致。写完全局生效，界面自动重载；界面内按 =?= 弹出全部键位；其余字母在界面内无反应，例如 =i= 不会进入 evil 的 insert state。
 
 ** 界面布局
 
@@ -259,7 +290,11 @@ v0.1 的写法仍然可用，视作「匿名配置」（配置名等于组名）
 | =g= | 重载清单并刷新；改完 =groups.el= 后按它 |
 | =n= / =p= | 下一个 / 上一个组 |
 | =1= / =2= / =3= | 跳到左栏 / 右栏 / 底栏：把焦点移到该区域的第一个停靠点 |
-| =e= | 编辑当前组清单：打开 =groups.el= 并定位到该组定义 |
+| =e= | 编辑当前组清单：打开该组定义所在的清单文件（=groups.el= 或 =projects/*.el= ）并定位到该组定义 |
+| =S= | 编辑 point 所在服务：打开服务编辑表单（6 个字段） |
+| =E= | 编辑配置：改当前配置关联的项目 |
+| =M= | 移动配置：把当前配置移到其他组的其他项目 |
+| =X= | 清单操作菜单：配置 / 项目 / 组的新建、修改、删除 |
 | =t= | 切换当前行的服务勾选，行内任意位置都生效 |
 | =I= | 导入 compose |
 | =o= | 导出 compose |
@@ -286,15 +321,70 @@ point 落在某个配置段内时额外生效。段指右栏里的一份配置�
 
 段级键与段头的三个按钮走同一条派发路径，作用于该段自己的项目；point 在左栏或顶栏时按这几个键无反应。
 
+** 启动前的 compose 预校验
+
+=s= （与段头 =启动选中= 、=r= / =重启选中= ）在派发 =docker compose up= 之前先对生成物做一次 *compose 预校验*（=config -q= ，退出码 + stderr 双判据）：
+
+- 本次要启动 shared 与 per-project 两类生成物时 *逐个校验*，全部通过才进入启动，不会出现「已启动一部分」的中间态；
+- 只要有生成物不合法就 *一个容器都不启动*，连 external network =ebasecamp= 都不创建（零副作用），并在提示区显示 stderr 首行这类可读错误，例如 =service "api" refers to undefined config web_cfg: invalid compose project= —— 不再是笼统的 =invalid compose project= ；
+- =x= （停止）与 =D= （销毁）*不做*预校验：它们作用于已经存在的容器，生成物暂时不合法时更应该允许先把服务停掉。
+
 ** 关于 =SPC=
 
 =SPC= 与 =RET= 等价，都是「激活当前控件」：在勾选框上勾选、在按钮上按下。它 *不是* 本插件的勾选键，也不能在界面 buffer 里当 general 或 evil 的 leader 前缀用。行级切换勾选请用 =t= 键，它不会误触按钮。
 
 ** 编辑清单的流程
 
-1. 按 =e= 打开 =groups.el= ，point 停在当前组的 =(ebasecamp-define-group= 那行；
+想直接改 Elisp（表单覆盖不到的字段、块间注释、组服务定义本身）：
+
+1. 按 =e= 打开该组定义所在的清单文件（=groups.el= 或 =projects/*.el= ），point 停在当前组的 =(ebasecamp-define-group= 那行；
 2. 改完保存；
 3. 回界面按 =g= 重载清单并刷新。
+
+只想改端口 / 环境变量 / 卷 / 命令 / 重启策略 / 镜像的话，用 =S= 表单更快，也省得自己对齐缩进。
+
+** 编辑 container 配置
+
+把 point 放到右栏某个服务行上，按 =S= 打开服务编辑表单。表单预填该服务的当前值，改完点 =保存= 写回清单；点 =取消= 丢弃。
+
+可编辑的 6 个字段与书写规则：
+
+| 字段 | 表单控件 | 书写规则 |
+|------+----------+----------|
+| =image= | 单行文本框（必填） | 镜像名，如 =mysql:8.4= ；留空会报错 |
+| =ports= | 多行文本框 | *每行一项*：=HOST:CONTAINER=（如 =3307:3306=）或只写容器端口 =CONTAINER=（如 =80=）；两段都必须是十进制整数 |
+| =environment= | 多行文本框 | *每行一项* =KEY=VALUE= ，按 *首个* = = 切分值（值里可以再有 = = ）；同一字段内键不可重复；=${VAR}= 原样保留、不插值 |
+| =volumes= | 多行文本框 | *每行一项* =SRC:DST[:ro]= ；源以 =.= 或 =/= 开头视为 bind 挂载，否则视为命名卷；只写 =DST= 表示匿名卷；第三段只能是 =ro= ，写成 =rw= 会报错（要可写就不写第三段） |
+| =command= | 多行文本框 | exec 形式，*每行一个参数*；参数自身含空格时必须用多行（单行输入会按空白切分，等于无法表达带空格的单个参数） |
+| =restart= | 下拉选择 | =no= / =always= / =on-failure= / =unless-stopped= 四选一，或选「自定义…」手输 =on-failure:5= 这类自由值；原值不在这四个里时下拉自动落到「自定义」并显示原值 |
+
+保存语义：
+
+- *只提交改动字段*：打开时快照一份原值，保存时逐字段比对，只有真正改过的字段才写进清单；没碰的字段连重写都不做（清单里那几个键逐字节不变）。
+- *清空字段 = 删除该键*，不是写空串。例如把 =ports= 的多行框清空，写回后该服务就没有 =:ports= 了。
+- *表单之外的字段原样保留*：=healthcheck= / =labels= / =networks= / =depends-on= / =entrypoint= / =working-dir= / =user= / =extra= 不在表单里，写回时从清单 *原文* 取值带回（不经模型归一化），因此 =command= / =entrypoint= 原先是字符串（shell 形式）就仍是字符串。
+- *校验在写盘之前*：非法端口、缺 = = 的环境变量行、缺冒号的卷、空的 =image= 都会在表单内以 *行号* 报错，表单 *不关闭*；此时磁盘上没有任何改动，修好再保存即可。
+
+** 配置与项目、组操作
+
+除服务字段外，配置、项目、组本身也能在界面里增删改：
+
+| 键 | 动作 | 说明 |
+|----+------+------|
+| =E= | 改配置的关联项目 | 选一份配置（组内只有一份时不问），再用 =completing-read= 选目标项目，写回 =:configs= 里该配置的 =:project= |
+| =M= | 移动配置到其他组的其他项目 | 两级选择：目标组 → 目标项目；写盘在 *一次事务* 内完成「源组移除 + 目标组追加」，中间不会有半成品状态；配置自带的 =:services= 覆盖随配置一起搬走 |
+| =X= | 清单操作菜单 | 一个 =completing-read= 里 8 项：新建配置 / 删除配置 / 新建项目 / 改项目 / 删除项目 / 新建组 / 改组 / 删除组 |
+
+=X= 菜单里删除类操作都有两道防线：
+
+- *引用保护*：删 *项目* 前扫所有组的 =:configs= ，只要有配置指向该项目就拒绝，并列出「组/配置」清单（如 =alpha/dev=）；删 *组* 前扫所有 =projects/*.el= 里 v0.1 旧写法的 =:groups= ，有项目引用就拒绝并列出项目名。拒绝时磁盘不动。
+- *影响提示*：确认框写明「只删清单定义，容器需用 =D= 销毁」。删组 / 删项目 *只删清单*（组 form 或项目文件），已经在跑的容器不会被自动清理；要清理容器请用 =D= （只覆盖 per-project 项目）或 =docker rm -f=。
+
+新建与修改类的约束：配置名 *组内唯一* 且 *同一项目同一组只允许 1 份配置*（冲突会被拒绝并说明来源配置）；项目名与组名只允许 =[a-z0-9_-]+= ；新增项目时如果 =projects/<name>.el= 已存在会被拒绝（改项目请用「改项目」）；组 scope 只能是 =shared= 或 =per-project= 。
+
+所有写操作都走同一个 *事务*：备份原文 → 同目录临时文件 + =rename-file= 原子写 → 重新加载清单校验 → 失败自动回滚并给出行号；成功则删除备份。写前还会比对文件的 mtime 与大小，如果你在外部改过这个文件，写入会被 *拒绝* 并提示先按 =g= 重载清单，避免覆盖掉你的改动。
+
+写操作的 *目标文件按组名跨文件定位*：组定义在 =groups.el= 或任意 =projects/*.el= 都能被找到（=groups.el= 优先，其次 =projects/*.el= 字典序），「没有 =groups.el=" 不再导致写盘失败；同名组在多处定义时写操作拒绝执行并列出文件（同名组在加载层就是硬错误，见「清单怎么写」一节）。=M= 跨文件移动一份配置时是 *两次事务 + 备份补偿*：第一段从源文件移除、第二段写入目标文件，第二段失败就用第一段的备份把源文件恢复原文，两段都成功才删备份。
 
 ** 主题
 
@@ -338,9 +428,13 @@ point 落在某个配置段内时额外生效。段指右栏里的一份配置�
 - =:extra= 字段原样透传，清单层不做 schema 校验，写错字段会导致 =config -q= 失败。
 - 不做清单与项目 compose 的双向同步；导入是单向的，导出也是单向的。
 - =重启选中= 不补齐 shared 依赖分支（=启动选中= 才会自动先起 shared 批次）；=depends-on= 里的笔误也会被静默剔除。
-- 界面不做清单编辑：清单只能手工编辑 Elisp，改完 =M-x ebasecamp-reload=。
+- 服务 *增删与改名* 仍不支持：增删会让既有容器变孤儿，改名要迁移容器标签与命名，需先有配置维度（见 =openspec/tech-debt.md= #16 / #25 / 新增条目）。服务字段编辑、配置 / 项目 / 组的增删改已支持。
 - 端口冲突只在 =启动选中= 前检测；=unknown= 类探测失败只提示、不阻塞。
 - 组名与项目名只允许 =[a-z0-9_-]+=，其余字符在渲染时直接报错。
+- 顶层 =configs= / =secrets= 的 =content:= 多行字符串不可表达：只支持 =file:= / =external= / =name= 这类单行标量结构，带 =content:= 的顶层段导入后会丢且 =config -q= 仍可能 exit 0（静默错误）。
+- shared 生成物（=ebc-shared=）不输出顶层 =configs= / =secrets= ：shared 组服务引用顶层 config / secret 时需自行处理。
+- v0.5.1 之前导入的清单缺 =:file-configs= / =:file-secrets= ：引用顶层 config 的服务启动会报 =refers to undefined config= ，需对原 compose *重新导入一次* 补齐（插件不自动改清单）。
+- 同一组名在多处定义是加载层硬错误：后加载的文件会 *整体回滚* ，其中项目不会出现在界面中；界面写操作遇到同名组直接拒绝。
 
 * 排查：=M-x ebasecamp= 提示命令不存在
 
@@ -381,6 +475,6 @@ make check EMACS=/path/to/emacs STRAIGHT_BUILD=/path/to/build-XX.X
 - [[file:docs/user-guide.org][用户指南]]：安装、清单写法、界面操作、常见任务、清单自检。
 - [[file:docs/compose-generation.org][compose 生成与导入导出规则]]：清单到 compose 的映射、导入映射表、导出物差异。
 - [[file:docs/troubleshooting.org][排障手册]]：命令不存在 / 界面空白 / 加载报错 / =config -q= 失败 / 导入导出异常 / 端口冲突 / 状态不刷新。
-- =docs/adr/0001-architecture.org=：架构决策（ADR）。
-- =openspec/completed/=：已归档计划（v0.2 / v0.3 / v0.4 与 M1–M3 四份，当前无进行中计划）；=openspec/decisions.md=：决策日志；=openspec/tech-debt.md=：技术债。
+- =docs/adr/0001-architecture.org= ~ =0006-manifest-locate-compose-configs.org=：架构决策（ADR；0005 为清单写盘，扩展 0003 决策 6；0006 为跨文件定位与 compose 顶层 configs/secrets，扩展 0005 决策 1）。
+- =openspec/completed/=：已归档计划（v0.2 / v0.3 / v0.4 与 M1–M3 四份）；=openspec/active/=：进行中计划（v0.5 清单写操作）；=openspec/decisions.md=：决策日志；=openspec/tech-debt.md=：技术债。
 - =AGENTS.md=：仓库地图与不变量清单。

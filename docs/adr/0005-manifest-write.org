@@ -1,0 +1,85 @@
+#+title: ADR-0005 清单写盘（局部写 + 事务 + 表单边界）
+#+date: 2026-10-23
+#+status: 已接受（Accepted）
+
+* 背景
+
+v0.4 的界面是清单的只读投影，写能力收敛在两处：界面按 =e= 打开 =groups.el= 手写 Elisp，或者退出界面自己改 =projects/*.el= 。四类改动因此都绕不开「离开界面 → 找文件 → 找位置 → 对齐缩进 → 回界面按 =g= 」：
+
+1. *改一个容器端口要动整个文件*。想给 mysql 换个宿主端口，得自己定位到那行 =(mysql :ports ((3306 . 3306)) …)= 并手改。改错一个括号，整个清单加载失败。
+2. *调整配置归属要读懂两种写法*。配置的 =:project= 在组侧 =:configs= 里；移动配置等于「从源组 =:configs= 删一项 + 往目标组 =:configs= 加一项」，手改极易只做一半。
+3. *新增 / 删除配置、项目、组全靠手写*。删项目前还得自己确认没有组在引用它，否则加载层报 =:project= 指向未定义项目；删组前还得自己 grep 项目侧旧写法的 =:groups= 。
+4. *没有任何写后校验*。手写清单保存后，错误只在下一次 =ebasecamp-config-load= 时暴露，此时文件已经被改坏。
+
+v0.5 要解决的是「让界面能就地改，但不能把清单改坏」。核心矛盾是：清单是 *人类可读、带注释、有排版* 的 Elisp 文件，而任何「由数据模型重新生成整份文件」的做法都会抹掉用户的注释与排版（=ebasecamp-manifest-group-form= 这个生成器就是给导入用的整份生成，它的输出是规范化的）。
+
+* 决策
+
+** 1. 局部写盘：定位 form + 只替换目标区间
+
+写操作 *不* 从数据模型重新生成整份清单，而是：扫描顶层 form 得到每个 =ebasecamp-define-group= / =ebasecamp-define-project= 的 =[start, end]= 区间 → 只替换目标那一个 form 的文本 → 其余字节（文件头、块间注释、兄弟组、尾随 form）逐字节不变。
+
+扫描器 =ebasecamp-manifest--scan-forms= 不自己写：=emacs-lisp-mode-syntax-table= 下 =forward-comment= 跳过空白与注释，再 =read= 一个顶层 form，用读前读后的 =(point)= 记录区间。两条实测约束写进实现：位置是 *1-based*（字符串切片必须 =(1- pos)= ）；=read= 本身会跳过 =;= 行注释（早期 docstring 的相反论断在 Emacs 31.1 上不成立，已修正）。=#| |#= 块注释 =forward-comment= 与 =read= 都不认、=load= 也不认 —— 扫描器用 =search-forward "|#"= 防御性跳过，但 *写入路径绝不生成* 块注释。
+
+服务字段更新是这条原则的最细粒度应用：只替换组 form 内那个 =(服务名 …)= 子 form，且未编辑的键值从 *原文 plist* 取值带回（不经 model 归一化），因此 =healthcheck= / =labels= / =networks= / =extra= / =entrypoint= / =working-dir= / =user= / =depends-on= 全部保真，=command= 原为字符串就仍是字符串。
+
+** 2. 事务：备份 → 原子写 → 错误集差分回滚 → 外部修改检测
+
+所有写操作（服务字段 / 配置 CRUD / 移动配置 / 项目 CRUD / 组 CRUD）经同一个 =ebasecamp-manifest--write-transaction= （=FILE WRITE-FN=）：
+
+1. 读原文 + 快照 =(file-attributes)= 的 mtime 与 size；快照当前加载的 *错误集* （=ebasecamp-config-error-messages= ）。
+2. WRITE-FN 在 *内存里一次* 得到新全文 —— 移动配置的「源组移除 + 目标组追加」因此不可能出现半成品。
+3. 写前再 stat，mtime 或 size 变化 → 拒绝写入并提示 =g= 重载。
+4. 备份原文到同目录 =.ebasecamp-backup-*= （不带 =.el= 后缀，避免被加载器读到）。
+5. 原子写：同目录 =make-temp-file= + =rename-file= 覆盖，沿用原权限位；符号链接直接拒绝。
+6. 重新加载取新错误集，=cl-set-difference= 出差集；*仅当出现写前没有的新错误才回滚* 。
+7. 成功删备份并返回加载结果；回滚 = 恢复原文 + 删备份 + 重新加载 + =signal 'ebasecamp-config-write-error= （data 含错误摘要与原文件 / 备份路径）。
+
+判据选 *错误集差分* 而不是「零错误」或「条数」：语法错一次产生 2 条错误，且用户其它文件里可能本来就有错 —— 用「零错误」会让既有错误永久阻断写盘。差分只比较消息文本，避免旧错误的行号漂移被误判为新增。
+
+引用完整性在写盘 *之前* 校验（删项目扫所有组 =:configs= 的 =:project= ；删组扫 =projects/*.el= 的旧写法 =:groups= ），且 *读原文* 而不看 model —— model 可能因既有加载错误缺定义，引用判断必须看磁盘真实内容。
+
+** 3. 表单边界：值经 ref 承载，文本不可断言
+
+服务编辑框用 =etaf-dialog= + 6 个 =etaf-text-input= / =etaf-select= 。四条实测约束：①dialog 的 buffer 文本 *永远不含* 内容（root-layer 投影），字段值只能存 =etaf-ref= 并由回调读回，测试只能断言 ref 层；②字段 ref 必须在组件的 =:setup= / =:bindings= 创建，不能在 =:render= 里建；③=:ref= 只接受 symbol / function / nil（传 =etaf-ref= 对象会报错）；④=slot :name 'footer= 必须是 dialog 的 *直接子项* （嵌进 =column= 报 =Unresolved View item: footer=）。
+
+保存流程：先在本地解析校验，失败只更新 error ref、*不关闭* dialog；通过后走 =etaf-next-tick= 调写盘（让「保存中」先渲染），写后 =ebasecamp-reload= + 刷新并恢复选中组。dialog 不能同步返回输入，需要同步输入的地方（选项目 / 选组 / 输入名字）一律 =etaf-call-with-input= + =completing-read= / =read-string= 。
+
+** 4. volumes 用 plist，不用字符串列表
+
+表单文本 =SRC:DST[:ro]= → =(:source SRC :target DST :type bind|volume [:read-only t])= 。model 只接受 plist，字符串列表会被 =ebasecamp-config-load= 拒绝，因此「看起来更简单」的字符串列表方案在写回时必然造成加载错误。源以 =.= 或 =/= 开头视为 =:type bind= ，否则视为命名卷；只写 =DST= 视为匿名卷（=:type volume= 无 =:source= ）；第三段只能是 =ro= （=rw= 不改写、直接报错）。=ports= 单段 =N= 解析为 =((N . N))= 、输出恒写两段（=((80 . 80))= → ="80:80"= ）；=command= 只支持 exec 形式，shell 字符串原值在用户未改动时跳过重写。
+
+* 后果
+
+** 正面
+
+- *注释与排版保真*：改一个服务字段只动那个 =(服务名 …)= 子 form，文件其余部分逐字节不变；改配置 / 移动配置只重渲染目标组 form，兄弟组与文件头不变。
+- *改坏清单不可能落盘*：写后有加载校验，新增错误即回滚并给出错误摘要与原文件 / 备份路径；外部改动被 =mtime + size= 检测挡住，不会覆盖用户在别的 buffer 里的修改。
+- *原子性*：多实体改写（移动配置）在一次事务内完成，不存在「源组已删、目标组没加」的状态。
+- *界面 buffer 仍然只读*：写能力挂在表单与 =completing-read= 上，值经 =etaf-ref= 承载，界面 buffer 里敲的字依然不落任何文件。
+- *单一写盘内核*：服务字段、配置 / 项目 / 组 CRUD 全部经 =--write-transaction= ，安全约束（清单只存 =${VAR}= 引用与相对路径、不读取不打印密钥值）只有一处实现。
+- *引用完整性前置*：删项目 / 删组在写盘前就拒绝并列出引用者，不会产生「加载期报未定义引用」的残缺清单。
+
+** 负面
+
+- *重渲染会规范化排版*：改配置 / 移动配置走 =--replace-group= 重渲染整组，键序固定 title → scope → services → configs；服务子 form 内部的注释会丢、缩进被对齐到原列。要保留服务子 form 内部注释只能手写清单（=e=）。
+- *实现面扩大*：新增两个模块（=ebasecamp-manifest.el= 纯文本层、=ebasecamp-config-write.el= 字段映射 + 实体操作），=ebasecamp-ui.el= 增加服务编辑 dialog 与清单操作菜单，=ebasecamp-import.el= 的三个生成器下沉为 manifest 的薄壳。
+- *无配置维度*：同一项目同一组仍只能 1 份配置（D2），移动 / 新增配置都要先校验冲突 —— 这是容器标签无配置维度的既有约束（技术债 #25），本 ADR 不解决。
+- *TOCTOU 窗口*：mtime+size 检测与 =rename-file= 之间仍有窗口，单用户编辑器场景接受，不做文件锁。
+
+** 已知边界
+
+- 服务子 form 内部注释丢失；组 form 整组重渲染会规范化排版（与导入模板一致）。
+- 移动配置会带走该配置的 =:services= 覆盖；目标组没有同名服务时写后产生新错误 → *整笔回滚* ，源配置原样保留（不静默丢数据）。
+- 服务 *增删与改名* 不支持：增删会让既有容器变孤儿，改名要迁移容器标签与命名（技术债 #16 / #25）。
+- =healthcheck= / =labels= / =networks= / =extra= / =entrypoint= / =working-dir= / =user= / =depends-on= 与配置的 =:services= 覆盖都不在表单里，写回时原样保留（只读展示或完全不可见）。
+
+* 备选方案与否决理由
+
+- *A. 整份重写清单（用模型重新生成 groups.el）*：否决。清单是带注释、带手写排版的人类可读文件；整份重写等于用生成器的规范化输出覆盖用户文件 —— 注释、空行、组间说明、用户自己的键序全部丢失，而这些人写的东西正是「Elisp 作为清单格式」的主要价值。且整份重写在加载有既有错误时无法区分「我的改动引入的错误」与「文件本来就有错」，回滚判据退化为「零错误」，会把用户既有错误变成永久写入阻断。
+- *B. 界面内自由编辑 Elisp（在界面 buffer 里做 text editing）*：否决。①界面 buffer 是 etaf 渲染的投影，一旦可编辑就要处理「渲染内容与文本内容不一致」的双向同步，etaf 没有这个能力；②自由编辑 = 无结构校验，用户敲错括号仍然是坏的清单，等于把 =e= 的能力搬进一个没有 =emacs-lisp-mode= 缩进与语法高亮的 buffer，纯亏；③ADR-0003 已经把界面 buffer 只读化并让 =i= 不再进 insert，这条路会让那份收益全数回吐。
+- *C. 引入 YAML 或数据库式存储（sqlite / 键值库）*：否决。①YAML 需要引入解析器依赖，破坏「零外部依赖（除 etaf / etaf-ui）」这条从 ADR-0001 起就成立的项目约束；②YAML 无法表达条件与复用逻辑，而清单里有 =:scope= 分支与覆盖合并语义；③数据库式存储把「人类可读、可 diff、可手改、可 code review」这一整套性质一次性丢弃，清单会从「仓库里的文件」变成「用户目录里的二进制」，与 ADR-0001「清单为唯一事实源且以文件形式存在」相悖；④迁移成本高（既有用户的 =groups.el= / =projects/*.el= 都要转换），而收益只是「写盘更容易」，用局部写盘 + 事务已经能拿到。
+
+* 状态
+
+*已接受*（2026-10-23，0.5.0）。引用：ADR-0003（UI buffer 只读化与 etaf Host 键位 —— 本 ADR *扩展* 其决策 6「唯一写入口 = =e= 」：v0.5 起写操作可经界面表单 =S= / =E= / =M= / =X= ，但一律走同一写盘事务内核，界面 buffer 仍只读）、ADR-0001（分层与同步模型，UI 层不得直接拼 docker 命令 —— 本 ADR 的写盘全部落在 =ebasecamp-manifest.el= / =ebasecamp-config-write.el= ，UI 只收集输入）、ADR-0002（组内配置与加载期物化，=:configs= 是配置的唯一存放处，本 ADR 的配置 CRUD 只写组侧）。相关技术债：[[file:../../openspec/tech-debt.md][#16]]（shared 容器无清理入口）、[[file:../../openspec/tech-debt.md][#25]]（容器标签无配置维度 → D2 约束）、[[file:../../openspec/tech-debt.md][#26]]（已在本版关闭：界面已提供最小编辑能力）、[[file:../../openspec/tech-debt.md][#29]] / [[file:../../openspec/tech-debt.md][#30]]（与本 ADR 无关的遗留）。实现细节与逐批次实测记录见 =openspec/active/2026-10-23-manifest-write-crud.md= ；写盘机制、字段映射与表单边界的完整说明见 =docs/architecture.org= 的「清单写盘」节。

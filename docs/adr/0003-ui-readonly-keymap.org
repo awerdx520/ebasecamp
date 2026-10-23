@@ -19,6 +19,8 @@ v0.2 的主界面 =*ebasecamp*= 是「没有身份的裸 buffer」：=ebasecamp-
 5. *段级键与段内按钮同源*：=s= / =x= / =r= 的闭包直接调 =ebasecamp-ui--section-action= 并捕获 *该段自己的* instance，=a= / =A= 直接写 =selected-ref= 的该段 key 集合；不引入「当前段」全局状态，避免同组多实例串段。
 6. *唯一写入口 = =e= → =groups.el= 定位*：=ebasecamp-ui-edit-manifest= 取会话的 =selected-group=，打开 =<dir>/groups.el= 并用 =search-forward "(ebasecamp-define-group <组名>"= 定位到该组定义。写只发生在普通 =emacs-lisp-mode= 的清单 buffer 里；UI buffer 保持只读。三条降级路径：无选中组 / 文件不存在 → =user-error=；组定义找不到 → 回 =point-min= + =message=（不 signal，手写清单里组可能不在 =groups.el=）。
 
+   *Superseded 注记（2026-10-23，v0.5）*：本决策的「唯一」已被 [[file:0005-manifest-write.org][ADR-0005]] *扩展* —— v0.5 起，写操作可经界面表单 =S= / =E= / =M= / =X= ，但一律走同一写盘事务内核（=ebasecamp-manifest--write-transaction=：备份 → 原子写 → 仅新增错误才回滚 → 先检测外部修改）；界面 buffer 仍然只读，值经 =etaf-ref= 承载，界面里敲的字依然不落任何文件。=e= 保留为「手写清单」入口，与表单路径并存。
+
 * 后果
 
 ** 正面

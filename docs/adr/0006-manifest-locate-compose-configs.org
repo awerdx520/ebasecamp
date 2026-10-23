@@ -1,0 +1,95 @@
+#+title: ADR-0006 写盘跨文件定位与 compose 顶层 configs/secrets
+#+date: 2026-10-23
+#+status: 已接受（Accepted）
+
+* 背景
+
+v0.5.0 交付了「界面内写清单 + compose 生成」的完整链路，但在真实清单上出现两处 *阻断级* 缺陷（诊断副本与复现脚本见 =/tmp/ebc-diag/=）。
+
+** 根因一：写盘层把「组定义只能在 groups.el」写死
+
+=ebasecamp-config-write--groups-file= 直接把写盘目标固定为 =<清单目录>/groups.el= ；而 *导入层* 把「组 + 项目」一起写进 =projects/<name>.el= （导入后不产生 =groups.el= ），*加载层* 两个文件都读。于是清单完全合法、界面也正常显示，但所有「组侧」写操作都报 =清单文件 …/groups.el 不存在= ：
+
+- 受影响：=add-config= / =update-service-fields= / =update-config-project= / =remove-config= / =move-config= / =update-group= / =remove-group= ；
+- 不受影响：项目 CRUD（=add-project= / =-update-project= / =-remove-project= ），它们本来就写 =projects/*.el= 。
+
+用户清单只有 =projects/datarush-go.el= ，于是「新建配置」「改服务字段」这类最常用的操作全部不可用。
+
+** 根因二：compose 顶层 configs/secrets 被静默丢弃
+
+渲染层只输出 =name= / =services= / =networks= / =volumes= 四段，*没有顶层 =configs:= / =secrets:=* ；服务级 =configs:= 经 =:extra= 原样透传；导入时顶层段被静默丢弃。结果是生成物里「引用存在、定义缺失」，=docker compose up= 报 =service "grafana" refers to undefined config …= 。实测确认（X2.3）：最小合法 compose 亦 exit 0，排除环境问题；删掉两个服务的 =configs:= 块后 =config -q= exit 0 —— 唯一变量就是顶层段缺失。
+
+* 决策
+
+** 1. 写盘按组名跨文件定位；同名组拒绝写
+
+新增 =ebasecamp-config-write--manifest-file-for-group (GROUP-NAME)=：按 =ebasecamp-config--files= 的顺序（=groups.el= 存在时优先，其次 =projects/*.el= 字典序）收集 *含组 form* 的文件，再裁决：
+
+- 1 命中 → 返回该文件绝对路径，写操作写回组真正所在的那个文件；
+- 0 命中 → =user-error= 「清单里没有组 X（已扫描 N 个文件）」；
+- >1 命中 → =user-error= 「组 X 在多个文件中定义（<文件列表>）；请先清理重复定义 —— 同名组会让后加载的文件整体回滚，其中项目不会出现在界面中」。
+
+八个写入口（=update-service-fields= / =-add-config= / =-update-config-project= / =-remove-config= / =-move-config= 的源组与目标组 / =-update-group= / =-remove-group=）全部改走它；=--edit-manifest= 改为接受目标文件；引用扫描 =--config-references= 改为遍历 *所有含组 form 的清单文件*（故意允许多命中），=--legacy-group-references= 仍只扫 =projects/*.el= （它扫的是项目 form 的 v0.1 =:groups= ）。
+
+*同名必须拒绝，不能取第一个* —— 依据是加载层的实测行为（X0.1）：=groups.el= 与 =projects/x.el= 各定义同名组时 =ebasecamp-config-load= 报「组 X 已定义」，并且 *后加载的文件整体回滚* ，同文件里的项目定义一起从界面消失（=--reload= 重放已成功文件，不回补）。静默取第一个会得到「改完没效果」，用户无从判断原因。这也决定了 *不能* 复用 =ebasecamp-manifest--locate-form= ：它按设计「同名多个时返回第一个」，语义只适合「在同一份已扫文本内取唯一 form」，不能用于跨文件的文件裁决。
+
+=add-group= 是唯一例外：新组固定写 =groups.el= （不存在则新建），但写前用 =--group-files= 扫 *全清单* 查重 —— 否则新建的组会与项目文件里的旧组构成同名组。
+
+跨文件 =move-config= 的语义随之变化：同文件移动仍是一次事务 + 两处区段降序替换；*跨文件移动 = 两次事务 + 显式备份补偿，非单事务原子* —— 先对两份原文做统一前置校验，再「源文件事务移除（=:keep-backup t=）→ 目标文件事务追加」，第二段失败就用第一段的备份 *恢复源文件原文*（不依赖错误集差分）后重新 signal，两段都成功才删两个备份。这是对 ADR-0005 决策 2「WRITE-FN 在内存里一次改完」的 *部分退化* ，必须在实现上显式补偿而不是假装原子。
+
+** 2. compose 顶层 configs/secrets 存进项目定义并渲染回去
+
+模型层 =ebasecamp-project= 新增 =file-configs= / =file-secrets= 两个槽（值必须是 nil 或「键为字符串的 alist」，*递归* 校验，判据与渲染层 =ebasecamp-compose--mapping-p= 完全一致）；导入层读取顶层段存入项目、并以 warnings 接口提示未知顶层键（不改变 =parse= 返回值）；落盘层 =ebasecamp-manifest-project-form= 只在非空时输出 =:file-configs= / =:file-secrets= （无顶层段时与历史输出逐字节一致）；渲染层在 *per-project* 生成物输出顶层 =configs:= / =secrets:= ，段序 =name= → =services= → =networks= → =volumes= → =configs= → =secrets= 。
+
+为什么不塞进服务级 =:extra= ：顶层段是 *项目级* 声明（一份 project 的多个服务共享同一 config），放进服务级 =:extra= 会被每个服务的渲染各写一遍，生成物出现重复顶层键（=mapping key "configs" already defined=），而且「哪个服务声明了顶层段」这种信息在 compose 语义里不存在。为什么不选「字符串列表」存引用：字符串列表无法表达 ={file: …} / {external: true} / {name: …} 这些结构，导出时仍要猜形态。
+
+** 3. 启动前做 compose 预校验（在创建网络之前、在派发任何进程之前）
+
+=ebasecamp-command-run= 在 =check-requires= 之后、=ebasecamp-command-ensure-network= *之前* 调 =ebasecamp-command--preflight= ：对本次要使用的每个生成物（shared 与 per-project 各算一个分支）*逐分支写盘 + =ebasecamp-docker-check-compose= 校验*，只写盘与校验、*不派发任何 docker 进程*；首个失败即中止（后续分支连写盘都省掉），返回与成功路径同构的失败载荷（=:failed t= + =:exit= + =:stderr= 原文，UI 展示 stderr 首行），=ebasecamp-command-run= 返回 nil。
+
+三条边界：①位置在 =ensure-network= 之前 —— 生成物不合法时零副作用（不建 external network、不建容器）；②*先全部校验再统一启动* —— start 是串行的，启动后无法回滚，所以校验必须前置到任何派发之前；③只有 =start= / =restart= 校验，=stop= / =down= *不校验* —— 它们作用于已存在容器，生成物暂时不合法时更应先允许把服务停掉。
+
+放 command 层而不是 UI 层：=up= / =down= 的派发入口在 =ebasecamp-command-run= ，UI 只负责收集输入与展示结果；放在 UI 层会让「命令行 / 将来其它入口」绕过校验，且需要在 UI 里重复渲染生成物。
+
+* 后果
+
+** 正面
+
+- *写操作不再依赖 =groups.el=* ：组定义在 =groups.el= 或任意 =projects/*.el= 都能被定位并写回，导入产生的清单（无 =groups.el=）可以直接在界面里改配置、改服务字段、移动配置。
+- *同名组从「静默改错文件」变成「明确拒绝 + 说明后果」* ：错误消息点明「后加载文件整体回滚、其中项目不会出现在界面中」，用户能自己清理重复定义。
+- *服务引用顶层 config / secret 的 compose 可用* ：导入保留顶层段、渲染输出顶层段，真实 docker 闭环 =config -q= exit 0（含往返稳定性：导出物再导入仍稳定，见 v0.5.1 计划 X2.3）。
+- *启动失败从「笼统 stderr」变成「可读错误 + 零副作用」* ：不合法时不创建网络、不启动任何容器，界面展示 stderr 首行（如 =service "api" refers to undefined config web_cfg: invalid compose project=）。
+- *不静默丢数据* ：未知顶层键产生 warning；顶层段在项目 CRUD 中保值（=--project-output-keys= 含两个新键）。
+
+** 负面
+
+- *跨文件移动不是单事务原子* ：两次写盘 + 备份补偿，第二段失败时靠恢复第一段备份回到原状；若「恢复」本身失败（磁盘满、权限变化），源文件可能停在「配置已移除」状态 —— 此时备份路径会在错误信息里给出，需人工恢复。这是相对 ADR-0005 决策 2 的 *部分退化* ，换来的是不做跨文件日志 / 两阶段提交这种复杂度。
+- *定位多一层文件 IO* ：每次写操作先扫一遍清单文件列表并逐个扫描 form（与原有的加载 / 引用扫描同量级），文件名多时写操作前置成本上升（技术债 #7 的同类问题）。
+- *shared 生成物仍不含顶层段* ：=ebc-shared= 只渲染 shared 组服务，shared 组服务引用顶层 config / secret 时仍会失败，需用户自行处理（技术债新增条目）。
+- *导入仍是单向补齐通道* ：已有清单不会被自动修正，用户必须对原 compose 重新导入一次才能拿到 =:file-configs= / =:file-secrets= 。
+
+** 已知边界
+
+- =content:= 多行字符串 *不可表达* ：=--yaml-map= 只支持单行标量，顶层 config 的 =content:= 会被 =--literal= 转义成单行且 =config -q= 仍可能 exit 0（静默错误），第一版只保证 =file:= / =external= / =name= 形态往返。
+- *shared 生成物不含顶层段* （同上，记入技术债）。
+- *迁移需重新导入* ：v0.5.1 之前导入的清单缺两个槽，服务级 =configs:= 引用在但顶层段缺失 → =up= 报 =refers to undefined config= ；修法是对原 compose 重新导入一次，插件不改用户清单。
+- *界面不编辑顶层段* ：只保证「导入 → 渲染往返不丢」，没有编辑 =:file-configs= / =:file-secrets= 的界面入口。
+- *同名组在加载层仍是硬错误* ：本 ADR 只让 *写操作* 拒绝，不做加载期降级或自动合并（同名组语义上就是冲突，自动合并会掩盖用户错误）。
+- *预校验不覆盖 =stop= / =down=* ，也不覆盖「生成物合法但镜像拉取失败」这类运行期错误。
+
+* 备选方案与否决理由
+
+- *A. 自动创建 =groups.el= 来修定位问题*：否决。写盘时若发现目标文件不存在就新建一份 =groups.el= 并把组 form 复制过去，等于 *制造同名组* —— 原组还在 =projects/<name>.el= 里，下次加载立刻触发「组 X 已定义 + 后加载文件整体回滚」，其中项目从界面消失。用「修一个问题」的方式引入更严重的、只在下次加载时暴露的问题，是最坏的取舍。正解是让定位函数承认「组可以在任意清单文件里」，而不是把文件布局改成写盘层方便的样子。
+- *B. 把顶层 configs/secrets 塞进服务级 =:extra=*：否决。①顶层段是 *项目级* 声明，塞进服务级 =:extra= 会被每个引用它的服务各渲染一遍，生成物出现重复顶层键（=mapping key "configs" already defined=），=config -q= 直接失败；②「哪个服务声明了顶层段」在 compose 语义里不存在，等于自造语义；③导出 / 导入往返会漂移（每次导入从不同服务里捞顶层段）。存进项目定义才与 compose 的作用域一致。
+- *C. 用字符串列表存 configs / secrets 引用*：否决。字符串列表（如 =("web_cfg")= ）只能表达「名字」，无法表达 ={file: ./web.conf}= / ={external: true}= / ={name: …}= 这些结构，导出时必须靠猜或额外约定补全；而 compose 的顶层条目本来就是映射，用户清单里保存 *原样映射*（字符串键 alist）才能保证导入 → 渲染往返不丢字段。代价是模型层必须做 *递归字符串键校验* （=--yaml-map= 只认字符串键，符号键会被当序列渲染成错误 YAML），这个代价用「模型判据 = 渲染判据」的方式一次付清。
+
+* 状态
+
+*已接受*（2026-10-23，0.5.1）。
+
+两处 *扩展注记* ：
+
+- *扩展 ADR-0005 决策 1（「局部写盘：定位 form + 只替换目标区间」）* ：该决策只规定「定位并替换目标 form」，隐含目标是单一文件；本 ADR 把定位扩到 *跨文件* （组定义在 =groups.el= 或 =projects/*.el= ），并规定同名多命中必须拒绝而不是取第一个 —— 因为 =--locate-form= 的「返回第一个」语义只适合单一已扫文本内的 form 定位，不能用于文件裁决。局部写盘、逐字节保真、错误集差分回滚三条原则不变。
+- *ADR-0003 决策 6 中「唯一写入口 =e= → =groups.el= 」的表述已过时* ：ADR-0005 已把写入口扩展为界面表单（=S= / =E= / =M= / =X= ），本 ADR 进一步让 =e= 与所有写操作都 *按组名跨文件定位* （组定义在 =groups.el= 或 =projects/*.el= ），=groups.el= 不再是被固定的写目标。ADR-0003 决策 6 中「=e= → =groups.el= 定位」这一句仅作为 v0.4 的历史记录保留，当前语义以 ADR-0005 + ADR-0006 为准。
+
+引用：ADR-0005（清单写盘 —— 本 ADR 扩展其决策 1；跨文件移动对其决策 2 构成部分退化，已在本 ADR 记录）、ADR-0003（UI buffer 只读化 —— 其决策 6 的写入口表述已在 ADR-0005 扩展、本 ADR 再扩定位范围）、ADR-0001（分层与同步模型 —— 读取项目 compose / 校验生成物仍只经 =ebasecamp-docker.el= ，UI 不拼命令）、ADR-0002（组内配置与加载期物化 —— 配置仍只存组侧 =:configs= ）。相关技术债：[[file:../../openspec/tech-debt.md][shared 生成物不含顶层 configs/secrets]]、[[file:../../openspec/tech-debt.md][顶层 configs 的 =content:= 多行不可表达]]。实现记录见 =openspec/active/2026-10-23-manifest-locate-compose-configs.md= 的 X0–X3 节；机制说明见 =docs/architecture.org= 「清单写盘」节的「跨文件定位」「compose 顶层 =configs= / =secrets=」「启动前预校验」三小节。

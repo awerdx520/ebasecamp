@@ -17,10 +17,10 @@ ebasecamp 是 Emacs 的 Docker 环境分组管理插件：定义可复用的基�
 | 路径 | 职责 | 状态 |
 |---|---|---|
 | `ebasecamp.el` | 包入口：`defcustom` 组、autoload 的 `ebasecamp` 命令、引导空态 | 规划中（批次 2 / T2.4 产出） |
-| `lisp/` | 实现模块：`ebasecamp-model.el`、`-config.el`、`-compose.el`、`-docker.el`、`-status.el`、`-data.el`、`-ui.el`、`-command.el`、`-import*.el`、`-export.el` | 已建，模块随批次 1–4 落地 |
+| `lisp/` | 实现模块：`ebasecamp-model.el`、`-config.el`、`-compose.el`、`-docker.el`、`-status.el`、`-data.el`、`-ui.el`、`-command.el`、`-import*.el`、`-export.el`、`ebasecamp-manifest.el`（清单文本层：form 定位 / 替换 / 生成器 / 写盘事务）、`ebasecamp-config-write.el`（字段映射 + 实体操作 + 引用扫描） | 已建，模块随批次 1–4 落地 |
 | `test/` | ERT 测试套件 `*-tests.el` | 已建 |
 | `test/fixtures/` | 测试用 fixture（实测的 docker / compose 输出片段） | 已建 |
-| `docs/` | 文档与 ADR；`docs/adr/0001-architecture.org`（分层与同步模型）、`docs/adr/0002-group-configs.org`（组内配置与加载期物化）、`docs/adr/0003-ui-readonly-keymap.org`（UI buffer 只读化与 etaf Host 键位）、`docs/adr/0004-ui-layout-theme.org`（flex 三段式布局 / 主题两层 / 区域跳转 / 项目定位）为架构决策 | 已建 |
+| `docs/` | 文档与 ADR；`docs/adr/0001-architecture.org`（分层与同步模型）、`docs/adr/0002-group-configs.org`（组内配置与加载期物化）、`docs/adr/0003-ui-readonly-keymap.org`（UI buffer 只读化与 etaf Host 键位）、`docs/adr/0004-ui-layout-theme.org`（flex 三段式布局 / 主题两层 / 区域跳转 / 项目定位）、`docs/adr/0005-manifest-write.org`（清单写盘：局部写 + 事务 + 表单边界；扩展 ADR-0003 决策 6）、`docs/adr/0006-manifest-locate-compose-configs.org`（写盘跨文件定位 + compose 顶层 configs/secrets + 启动前预校验；扩展 ADR-0005 决策 1）为架构决策 | 已建 |
 | `openspec/` | 计划工件：`active/`（进行中）、`completed/`（归档）、`decisions.md`（决策日志）、`tech-debt.md`（技术债） | 已建 |
 | `Makefile` | 验证入口：`check-parens` / `compile` / `test` / `check` / `clean` | 已建 |
 | `.gitignore` | 忽略字节编译产物与测试临时目录 | 已建 |
@@ -65,8 +65,9 @@ LOAD_PATH         = -L . -L lisp $(ELPA_LOAD_PATH)
 9. **组与项目的关联只在组侧声明**（`:configs` 的 `:project`）；项目文件不再写 `:groups` 关联（旧写法保留兼容，但同一项目对同一组重复引用一律加载报错 `ebasecamp-config-duplicate-group-ref`，不做静默合并）。
 10. **shared 组至多 1 份配置，且该配置的 `:project` 必填**（宿主，仅作渲染上下文与容器标签归属，非业务绑定）；多份直接报加载错误。
 11. **物化产物键名必须为 `:service-overrides`**（形态 `(:group SYMBOL :scope SCOPE :service-overrides ALIST)`）——写 `:services` 会导致覆盖被 `ebasecamp-model-resolve-services` / `ebasecamp-compose-render` / `ebasecamp-import` 静默丢弃。
-12. **UI buffer 必须只读**（`ebasecamp-ui-mode`，派生 `special-mode` + `buffer-read-only t`），并以最外层 Host 的 `:key-scope 'local` 吞掉未绑定 printing key；写操作只允许经 `e` 打开的清单文件（`groups.el`）。
+12. **UI buffer 保持只读**（`ebasecamp-ui-mode`，派生 `special-mode` + `buffer-read-only t`），并以最外层 Host 的 `:key-scope 'local` 吞掉未绑定 printing key；写操作经界面表单（`S` / `E` / `M` / `X`）或 `e` 打开的清单文件，均须走 `ebasecamp-manifest--write-transaction`。
 13. **UI 样式不得硬编码色值**——只允许出现在 palette / token 定义区（`ebasecamp-ui--palette-light` / `-palette-dark`）与 `defcustom` 默认值里，render 区一律走 `etaf-theme-token`；扫描范围由测试的 render 函数名清单界定（`render-region-has-no-literal-colors`）。
+14. **清单写盘必须经 `ebasecamp-manifest--write-transaction`**（备份 → 原子写 → 仅新增错误才回滚 → 先检测外部修改）；回滚判据是**错误集差分**（`ebasecamp-config-error-messages` 的 `:message` 差集），不是「零错误」也不是条数。
 
 ## 已知特性（勿当作缺陷）
 
@@ -77,12 +78,12 @@ LOAD_PATH         = -L . -L lisp $(ELPA_LOAD_PATH)
 
 ## 当前状态
 
-- 进行中计划：**无**。v0.2 `2026-10-22-group-centric-ui.md`（组为中心 UI）、v0.3 `2026-10-23-ui-readonly-keymap.md`（UI 只读 + 完整键位）、v0.4 `2026-10-23-ui-layout-theme-nav.md`（布局、主题与导航）三份计划已归档到 `openspec/completed/`（2026-10-23；三份计划的用户目检均由用户在 v0.4 期间的实机使用确认）。
-- 已归档：`openspec/completed/` 现含上述三份 + `ebasecamp-m1-m3.md`（M1–M3 计划；T5.2 由 v0.2 的 E1 文档批次覆盖完成，计划关闭）。
-- 测试基线：**358**（`make check` 全绿：`make test` 358 expected / 0 unexpected、`compile` 零 warning、`check-parens` 通过；357 → 358 来自代码审查修复新增用例 `ebasecamp-ui-test-split-ratio-defcustom-out-of-range-clamped`）。
-- 下一步：v0.5（写操作）与 v0.6（观测）待规划；遗留技术债见 `openspec/tech-debt.md` #29 / #30。
+- 进行中计划：**v0.5.1 `2026-10-23-manifest-locate-compose-configs.md`**（写盘跨文件定位 + compose 顶层 configs/secrets + 启动前预校验）—— 批次 X0–X4 已落地（X0 探针 / X1 跨文件定位 / X2 顶层段 / X3 预校验 / X4 文档），**待 X4.6 用户目检**。上一轮 v0.5 `2026-10-23-manifest-write-crud.md`（清单写操作：编辑 container 配置 / 移动配置 / 配置·项目·组 CRUD）W0–W5 已落地，其目检项已并入本次目检。已归档：v0.2 `2026-10-22-group-centric-ui.md`（组为中心 UI）、v0.3 `2026-10-23-ui-readonly-keymap.md`（UI 只读 + 完整键位）、v0.4 `2026-10-23-ui-layout-theme-nav.md`（布局、主题与导航）、v0.5 `2026-10-23-manifest-write-crud.md`（清单写操作）四份计划已归档到 `openspec/completed/`（2026-10-23；前三份的用户目检均由用户在 v0.4 期间的实机使用确认，v0.5 的 W5.8 目检发现的两处阻断缺陷由 v0.5.1 承接修复）。
+- 已归档：`openspec/completed/` 现含上述四份 + `ebasecamp-m1-m3.md`（M1–M3 计划；T5.2 由 v0.2 的 E1 文档批次覆盖完成，计划关闭）。
+- 测试基线：**415**（`make check` 全绿：`make test` 415 expected / 0 unexpected、`compile` 零 warning、`check-parens` 通过；392 → 400 来自 v0.5.1 X1 新增 8 项写盘/UI 用例，400 → 412 来自 X2 新增 12 项模型/导入/渲染/导出用例，412 → 415 来自 X3 新增 3 项预校验用例）。
+- 下一步：**v0.5.1 X4.6 用户目检**（在 `datarush-go` 上新建配置不再报 `groups.el` 缺失；`s` 遇不合法生成物时提示可读且不启动；重新导入该 compose 后 `s` 能通过校验/启动），随后 **v0.5.2**（project `:root` 可选，无 root 不参与项目定位、导出须显式选路径），之后 v0.6（观测：按钮旁显示键 / `hjkl` / avy）；遗留技术债见 `openspec/tech-debt.md` #29 / #30 与新增的 shared 顶层段 / `content:` 条目。
 - 决策日志：`openspec/decisions.md`
-- 架构决策：`docs/adr/0001-architecture.org`（分层与同步模型）、`docs/adr/0002-group-configs.org`（组内配置与加载期物化）、`docs/adr/0003-ui-readonly-keymap.org`（UI buffer 只读化与 etaf Host 键位）、`docs/adr/0004-ui-layout-theme.org`（布局、主题与导航：flex 三段式 / 主题两层 / 宽度持久化 / 区域跳转 / 项目定位）
+- 架构决策：`docs/adr/0001-architecture.org`（分层与同步模型）、`docs/adr/0002-group-configs.org`（组内配置与加载期物化）、`docs/adr/0003-ui-readonly-keymap.org`（UI buffer 只读化与 etaf Host 键位）、`docs/adr/0004-ui-layout-theme.org`（布局、主题与导航：flex 三段式 / 主题两层 / 宽度持久化 / 区域跳转 / 项目定位）、`docs/adr/0005-manifest-write.org`（清单写盘：局部写 + 事务 + 表单边界；扩展 ADR-0003 决策 6）、`docs/adr/0006-manifest-locate-compose-configs.org`（写盘跨文件定位 + compose 顶层 configs/secrets + 启动前预校验；扩展 ADR-0005 决策 1，并标注 ADR-0003 决策 6 中「`e` → groups.el」已过时）
 - 技术债：`openspec/tech-debt.md`
 
 每批次完成必须更新计划文件的「## 当前状态」区块。

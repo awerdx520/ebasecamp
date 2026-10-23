@@ -258,7 +258,12 @@ etaf 只在 *边界 Host* 内吞掉未绑定的 printing key。边界指 =:key-s
 
 ** 编辑入口边界
 
-UI buffer 只读，唯一写入口是 =ebasecamp-ui-edit-manifest= ，绑在根级键 =e= 上。它的流程是取会话的 =selected-group= ，用 =find-file= 打开 =<dir>/groups.el= ，再定位到 =(ebasecamp-define-group <组名>= 那一行。三条降级路径：无选中组、文件不存在时走 =user-error= ；文件里找不到组定义时退到 =point-min= 并 =message= 提示，不 signal。函数只打开文件，不读取也不打印任何密钥值；保存后的重载由 =g= 走 =ebasecamp-reload= 完成。这意味着「写」只发生在 =emacs-lisp-mode= 的清单 buffer 里，界面永远只是投影。
+UI buffer 只读，写操作有两条路，但 *共用同一写盘事务内核* （见「清单写盘」一节）：
+
+1. *界面表单*（v0.5 起）：=S= 编辑 point 所在服务的 6 个字段、=E= 改配置的 =:project= 、=M= 移动配置、=X= 打开清单操作菜单（配置 / 项目 / 组的 CRUD）。这些入口只在界面 buffer 里收键，实际写入由 =ebasecamp-config-write.el= 调 =ebasecamp-manifest--write-transaction= 完成，界面 buffer 本身仍然只读。
+2. *手写清单*：=ebasecamp-ui-edit-manifest= （根级键 =e= ）取会话的 =selected-group= ，用 =find-file= 打开 =<dir>/groups.el= ，再定位到 =(ebasecamp-define-group <组名>= 那一行。三条降级路径：无选中组、文件不存在时走 =user-error= ；文件里找不到组定义时退到 =point-min= 并 =message= 提示，不 signal。函数只打开文件，不读取也不打印任何密钥值；保存后的重载由 =g= 走 =ebasecamp-reload= 完成。
+
+无论走哪条路，「写」最终都落在清单文件上：表单路径经事务内核（含备份、原子写、错误集差分回滚），手写路径由用户自己保存。ADR-0003 的决策 6（唯一写入口 = =e= ）已由 ADR-0005 扩展，界面 buffer 只读这一条不变。
 
 * 布局与主题
 
@@ -335,6 +340,118 @@ etaf *没有* 「跳到某个 group」的 API，可用的是 =etaf-focus-within=
 - *无匹配不选中*：命中不到项目、或该项目没有配置时，保持既有「无选中组」态（右栏显示「选择左侧的组」），*不是* 回退到第一个组 —— 自动选中会删掉未选中态。
 - *只算一次*：定位只在 =ebasecamp-ui-open= 建会话时算，=ebasecamp-ui-refresh= / =g= 都不覆盖用户手选的组；关闭后重开才重算。
 
+* 清单写盘
+
+v0.5 把「界面只读 + 手写 Elisp」扩展成「界面可改，但写盘走同一个事务内核」。实现集中在两个新模块：=lisp/ebasecamp-manifest.el= （纯文本层：定位 / 替换 / 追加 / 删除 form、生成器、写盘事务）与 =lisp/ebasecamp-config-write.el= （字段映射 + 实体操作 + 引用扫描）。=ebasecamp-import.el= 的三个生成器改为调用 manifest 的薄壳，避免两处格式漂移。设计决策见 [[file:adr/0005-manifest-write.org][ADR-0005]]。
+
+** form 定位（=ebasecamp-manifest--scan-forms=）
+
+不自己写扫描器：=with-syntax-table emacs-lisp-mode-syntax-table= 下逐段 =forward-comment= 跳过空白 / 注释，再 =read= 一个顶层 form，用读前读后的 =(point)= 记下区间与 =(kind . name)= （=kind= 取 =group= / =project= ，其余 form 两者皆 nil）。
+
+三条实测出来的边界：
+
+1. *位置是 1-based*。=read= 前后的 =(point)= 是 buffer 位置，做字符串切片必须 =(1- pos)= 。扫描器返回的 =:start= / =:end= 一律按位置使用，调用方自己减 1，不预先转成下标 —— 否则每层调用都要猜「这是位置还是下标」。
+2. *=read= 自己会跳过 =;= 行注释*。早期 docstring 里「read 不认 =;= 注释」的论断在 Emacs 31.1 上不成立（已修正）。=forward-comment= 保留只为与既有实现口径一致，它不是「否则必失败」的前置条件。
+3. *=#| |#= 块注释不支持*。=forward-comment= 与 =read= 都不认（后者直接 =invalid-read-syntax= ），扫描器用 =search-forward "|#"= 跳过并记一条 note、=#|= 未闭合时 =user-error= ，但这只是防御性能力：*实测 =load= 本身也不认块注释*，带块注释的清单 =ebasecamp-config-load= 会直接报错。因此写入路径 *绝不生成* 块注释 —— 这是「扫描器能跳过」与「写入可以产生」之间必须切开的一条线。
+
+替换只替换目标 form 的区间，form 之外的字节（文件头、块间注释、兄弟组、尾随 form）逐字节保留；多处替换用 =--replace-forms= 按 =:start= *降序* 应用，前面替换的长度变化不会影响后面位置。写盘路径必须在 *同一份内存全文* 上定位（=--scan-text-forms= ），不能重新读盘 —— 否则 mtime 快照与原子性同时失效。
+
+** 跨文件定位（=ebasecamp-config-write--manifest-file-for-group=）
+
+清单里的组可以定义在 =groups.el= ，也可以定义在任意 =projects/*.el= （导入功能默认把「组 + 项目」一起写进 =projects/<name>.el= ），因此写操作 *不能假定目标文件是 =groups.el=* 。定位分两层：
+
+1. *收集*：=--group-manifest-files= 遍历 =ebasecamp-config--files= （顺序恒为 =groups.el= （存在时）→ =projects/*.el= 字典序，后者由 =--project-files= 用 =string<= 排序），只保留 *含组 form* 的文件（不含组 form 的文件不可能定义组，跳过不改变结果）；=--group-files= 在同一批文件里收集定义指定组的 *全部* 文件，不做唯一性裁决（供 =add-group= 查重与引用扫描复用）。
+2. *裁决*：0 命中 → =user-error= 「清单里没有组 X（已扫描 N 个文件）」；>1 命中 → =user-error= 「组 X 在多个文件中定义（<文件列表>）；请先清理重复定义——同名组会让后加载的文件整体回滚，其中项目不会出现在界面中」；1 命中 → 返回该文件绝对路径。
+
+不能复用 =ebasecamp-manifest--locate-form= ：它明确「同名多个时返回第一个」，语义只适合「在同一份已扫文本里取唯一 form」（=--replace-form= / =--remove-form= 的前提）。跨文件的 *文件裁决* 是另一个问题 —— 同名组在加载层就是硬错误：=--register-group= signal「组 X 已定义」，并且 *后加载的文件整体回滚* ，同文件里的项目定义一起消失、不会出现在界面中（X0.1 实测）。静默取第一个会让「改完没效果」而无从判断，因此必须拒绝并说明后果。
+
+八个写入口（=update-service-fields= / =-add-config= / =-update-config-project= / =-remove-config= / =-move-config= 的源组与目标组各自定位 / =-update-group= / =-remove-group=）都先定位再开事务；=--edit-manifest= 签名改为 =(FILE EDITOR)= ，=ebasecamp-ui-edit-manifest= 定位失败时降级为打开文件头 + =message= （不阻断）。=add-group= 是例外：新组固定写 =groups.el= （不存在则新建），但写前用 =--group-files= 扫 *全清单* 查重 —— 否则新建的组会与项目文件里的旧组构成同名组，下次加载整体回滚。
+
+引用扫描的口径随之分化，且 *故意不同*：=--config-references= （删项目前的引用保护）改为遍历 *所有含组 form 的清单文件*，允许多命中 —— 引用扫描只需全覆盖；=--legacy-group-references= （删组前）继续只遍历 =projects/*.el= ，因为它扫的是项目 form 的 v0.1 旧写法 =:groups= 。
+
+** 写盘事务（=ebasecamp-manifest--write-transaction=）
+
+七步，顺序不能变：
+
+1. 读原文 + 快照 =(file-attributes)= 的 *mtime + size* ；同时快照当前 =ebasecamp-config-load= 的 *错误集* （=ebasecamp-config-error-messages= 取 =:errors= 的 =:message= 列表）。
+2. 调 WRITE-FN 在 *内存里一次* 得到新全文。WRITE-FN 内不许分两次写盘 —— 移动配置的「源组移除 + 目标组追加」必须在同一次全文改写里完成，否则会出现「源删了、目标没加」的中间态。
+3. *写前再 stat* ：mtime 或 size 任一变化 → =user-error= 「文件已被外部修改，先 =g= 重载」。mtime 精度在某些文件系统上是 1 秒，size 兜底。
+4. 备份原文（同目录 =.ebasecamp-backup-*= 隐藏文件，*不带* =.el= 后缀以免被加载器读到）。
+5. *原子写*：同目录 =make-temp-file= + =rename-file= 覆盖，沿用原文件权限位。符号链接在事务开始时即拒绝（=rename-file= 会替换链接本身而不是目标）。
+6. 重新 =ebasecamp-config-load= 取新错误集，=cl-set-difference= 出差集；*仅当出现「写前没有的新错误」时才回滚* 。判据是 *错误集差分* ，不是「错误为空」也不是「条数」—— 语法错一次会产生 2 条错误，且用户其它文件里可能本来就有错，用「零错误」当判据会让既有错误永久阻断写盘。
+7. 成功删备份并返回加载结果；回滚 = 用备份恢复原文 + 删备份 + 重新加载 + =signal 'ebasecamp-config-write-error= （data 含新错误摘要、原文件路径、备份路径）。恢复本身失败时 *保留备份* 并在 message 里给出手工恢复路径，不静默。
+
+差分只比较 *消息文本* ，避免同一旧错误的行号 / 路径漂移被误判为「新错误」。mtime+size 检测与写入之间仍有 TOCTOU 窗口，单用户编辑器场景接受该窗口。
+
+实体操作在写盘 *之前* 就做校验（D2 冲突 = 「同一项目同一组只允许 1 份配置」、组 / 配置 / 项目不存在、名字非法、scope 非法），选在原文 plist 上校验而非 model 对象：写前就能判定，避免把冲突变成一次无谓的写盘 + 恢复。
+
+** 引用完整性（两处扫描不可混用）
+
+- *删项目*：用 =--config-references= 读 =groups.el= 原文，按每个组 form 的 =:configs= 逐项比 =:project= ，返回「组/配置」字符串（如 =alpha/dev= ）。被引用即 =user-error= 并列出清单。
+- *删组*：用 =--legacy-group-references= 遍历 =ebasecamp-config--project-files= ，=read= 每个项目 form 的 v0.1 旧写法 =:groups= ，按引用项 =car= 比组名。被引用即 =user-error= 并列出项目名。
+
+两处都 *读原文而不看 model* —— model 可能因既有加载错误缺定义，而引用判断必须看磁盘真实内容。删项目走 =--delete-file-transaction= （校验路径归属 → 记录原文与权限位 → =delete-file= → 重新加载 → 仅新增错误时写回原文并恢复权限位）；删组不需要它，组是 =groups.el= 里的 form，走 =--remove-form= + 写盘事务即可。
+
+** compose 顶层 =configs= / =secrets=（模型与渲染）
+
+compose 允许服务引用顶层声明的 config / secret。v0.5.1 之前这条链路有两处缺口：导入把顶层段 *静默丢弃* （服务级 =configs:= 经 =:extra= 透传，于是生成物里出现「引用存在、定义缺失」），渲染层也只输出 =name= / =services= / =networks= / =volumes= 四段 —— 结果是 =docker compose up= 报 =service "x" refers to undefined config= 。
+
+现状：
+
+- *模型*：=ebasecamp-project= 新增 =file-configs= / =file-secrets= 两个槽（放在 =export-file= 之后，保持既有槽位顺序），=ebasecamp-model--project-keywords= 加入 =:file-configs= / =:file-secrets= 。值必须是 nil 或「元素全为 =(字符串键 . 值)= 的 proper list」；校验分 *入口* 与 *递归* 两层 —— 入口判形态，递归层下钻时允许标量，但 *凡是映射层（列表首元素是 cons）的所有键都必须是字符串* 。判据与渲染层 =ebasecamp-compose--mapping-p= 完全一致，于是「模型放行」与「渲染正确」是同一规则，不会出现「加载通过但渲染成垃圾 YAML」（=--yaml-map= 会把符号键当序列渲染，实测）。
+- *导入*：=ebasecamp-import-parse-json= 把顶层 =configs= / =secrets= 存进项目结构；提示经动态变量 =ebasecamp-import--last-warnings= （每次导入重置）+ 访问器 =ebasecamp-import-warnings= 承载（如「顶层键 x-unknown 暂不支持，已忽略」），且 *不改变 =parse= / =parse-json= 的返回值* —— 仍是 project 对象，=ebasecamp-import-service-plists= 等既有调用点零改动。
+- *落盘*：=ebasecamp-manifest-project-form= 只在非空时追加 =:file-configs= / =:file-secrets= （值经 =--literal= 原样 =prin1= ，=${VAR}= 与相对路径不插值）；无顶层段时输出与历史实现 *逐字节一致* 。=ebasecamp-config-write--project-output-keys= 同步加入这两个键并改为「非空才写」，因此 =-update-project= 改 title / root 时两个槽保值。
+- *渲染*：=ebasecamp-compose--file-declarations-section= 用 =--yaml-map= 输出顶层段（键一层缩进 2、嵌套层 4），段顺序 =name= → =services= → =networks= → =volumes= → =configs= → =secrets= （与 docker 惯例一致）。是否输出由 refs 是否 *全为 shared* 决定：全 shared 时省略，故 =ebc-shared= 生成物 *不含* 顶层段；其余情况输出，于是 =ebasecamp-export--deployment-project= 的副本（只留 per-project refs）自然带上顶层段，导出侧无需改动。
+
+两条已知边界：=content:= 多行字符串 *不可表达* （=--yaml-map= 只有单行标量写法，双引号标量折行会静默改内容且 =config -q= 仍 exit 0），第一版只保证 =file:= / =external= / =name= 形态往返；=shared= 生成物不含顶层段（shared 组服务引用顶层 config / secret 需自行处理）。
+
+** 字段映射（表单文本 ↔ 结构）
+
+六个字段的双向纯函数在 =ebasecamp-config-write.el= ，无 IO；解析失败一律 =user-error= 带 *行号* （1-based，空行占号但不参与解析），消息格式 =「第 N 行：<说明>，得到 "<原文>"」= 。
+
+| 字段 | 文本 → 结构 | 结构 → 文本 | 边界 |
+|------+------------+------------+------|
+| =ports= | 每行 =HOST:CONTAINER= ；*单段 =N= → =((N . N))=* （只有容器端口） | *恒写两段*（=((80 . 80))= → ="80:80"= ，不折叠） | 非整数 / 负号 / 缺段 / 多冒号 → 报错 |
+| =environment= | 每行 =KEY=VALUE= ，按 *首个* = = 切分 | =KEY=VALUE= 逐行 | 缺 = = / 空键 / 重复键 → 报错（重复键附首次出现行号）；=${VAR}= 原样 |
+| =volumes= | =SRC:DST[:ro]= ；*源以 =.= 或 =/= 开头即 =:type bind= ，否则 =:type volume=* ；单段 =DST= → =(:target DST :type volume)= | 有 =:source= 写三段，缺源只写 =DST= | 段数 > 3 / 空段 / 第三段非 =ro= → 报错（=tmpfs=、=:rw= 不改写、直接报错） |
+| =command= | 含换行 → 每行一个参数（行内空格保留）；不含换行 → 按空白切分 | 每行一个参数 | *只支持 exec 形式*；原值是 shell 字符串且用户未改动时 *跳过重写* ，不强制转换 |
+| =restart= | =string-trim= 后空 → nil | 原样 | 四个枚举外的自由值（="on-failure:5"= ）原值往返 |
+| =image= | =string-trim= ，空即报错 | —（单行） | 必填 |
+
+*volumes 必须是 plist* ：=(:source S :target T :type bind|volume [:read-only t])= 。字符串列表会被 =ebasecamp-config-load= 拒绝，所以表单文本 → 结构必须产出 plist，而不是「字符串列表」。
+
+服务字段更新 *不经 model 对象重建*：用 =read= 取该组 form 的原始 =:services= plist，只把被编辑的键替换为新值、其余键值原样带回，再生成该 *服务子 form* 文本并替换组 form 内对应的 =(服务名 …)= 子 form。这样 =healthcheck= / =labels= / =networks= / =extra= / =entrypoint= / =working-dir= / =user= / =depends-on= 全部保真，=command= 原为字符串就仍是字符串。*某字段被清空 = 删除该键*（传 nil），不是写空串；*未改动的字段直接跳过重写* 。
+
+** UI 表单边界
+
+服务编辑框是 =etaf-dialog= ，四条实测约束（=lisp/ebasecamp-ui.el= 的 Commentary 与代码注释同源）：
+
+1. *dialog 的 buffer 文本永远不含内容*（root-layer 投影）。因此测试只能断言 *ref 层* ：预填后读 6 个字段 ref 的值、非法保存后读 error ref 非空且 =:open= 仍为 t。*不能* 断言渲染出来的可见文本。
+2. *字段 ref 必须在组件的 =:setup= / =:bindings= 创建* ，不能在 =:render= 里建；字段值全部经 =etaf-ref= 承载，回调读回。
+3. *:ref= 只接受 symbol / function / nil* 。传 =etaf-ref= 对象会报错 —— 字段用 =:bind= 绑 ref，按钮用 symbol ref。
+4. *=slot :name 'footer= 必须是 dialog 的直接子项*（嵌进 =column= 会报 =Unresolved View item: footer= ）。保存 / 取消按钮与错误 label 都放在这个 slot 里。
+
+保存流程：先在本地跑一遍字段解析做校验，失败只更新 error ref、*不关闭* dialog；通过后走 =etaf-next-tick= 调写盘（让「保存中」状态先渲染），写后 =ebasecamp-reload= + 刷新并恢复选中组，成功 notice，最后关闭 dialog。dialog 不能同步返回用户输入，需要同步输入的地方（选项目 / 选组 / 输入名字）一律 =etaf-call-with-input= + =completing-read= / =read-string= ，与既有 =I= / =o= / =e= 一致。
+
+** 启动前预校验（=ebasecamp-command--preflight=）
+
+生成物是否合法原先只在 docker 那一步暴露：=up= 直接失败，界面只看到 =invalid compose project= 这类笼统 stderr。v0.5.1 把校验前置到 =ebasecamp-command-run= —— 位置在 =check-requires= 之后、=ebasecamp-command-ensure-network= *之前* ，因此生成物不合法时连 external network 都不创建（零副作用），随后才建网络并派发。
+
+实现要点：
+
+- *逐分支写 + 逐分支校验，但不派发*：=--preflight (OBJECT BRANCHES)= 对本次要用的每个分支（shared 与 per-project 各算一个）调 =ebasecamp-compose-write= 写生成物、再调 =ebasecamp-docker-check-compose= 校验；只写盘与校验、不启动任何 docker 进程，所以「先全部校验、再统一启动」成立 —— 不会出现「已启动一部分容器、后面失败无法回滚」的部分启动。首个失败即停止后续校验（后面的分支连写盘都省掉）。
+- *写盘不重复*：=--preflight= 把实际生成物路径以 =:written= 追加到分支 plist，*不复用 =:file=* —— =:file= 是 =--branch-shell= 预算的缓存路径，再追加会让 =plist-get= 取到前者并破坏既有用例断言；=--dispatch= 的 launch 改为「有 =:written= 就复用、没有（stop / down 等未预校验路径）就照旧写一次」。
+- *失败载荷与成功路径同构*：失败时返回与 =--dispatch= 的 report 同字段的结果 plist（=:action= / =:project= / =:ok= / =:results= / =:auto-started-shared= / =:order= ），失败分支带 =:failed t= + =:exit= + =:stderr= 原文（UI 的 =ebasecamp-ui--report-result= 用 =ebasecamp-docker--first-line= 展示首行），其余分支标 =:skipped t=，=:order= 为 nil（一个都没派发）；=ebasecamp-command-run= 此时返回 nil。
+- *动作范围只有 =start= / =restart=* （=ebasecamp-command--validated-actions=）：=stop= / =down= 不校验 —— 它们作用于已存在的容器，生成物暂时不合法时更应先允许把服务停掉。测试里把 =down= 的 =check-compose= 桩成 =error= 来守住这条不变量。
+- *既有用例显式打桩 =ebasecamp-docker-check-compose=* ：此前它们只打桩 =run-sync= ，校验会经同一桩「侥幸」通过；显式打桩让用例不再依赖 =check-compose= 的内部实现。
+
+** 已知边界
+
+- *服务子 form 内部的注释会丢*：替换子 form 时按生成器重渲染，排列也会被规范化（缩进对齐到原列，其余字节不动）。
+- *组 form 整组重渲染会规范化排版*：改配置 / 移动配置走 =--replace-group= 重渲染整组，键序固定 title → scope → services → configs，服务子 form 与配置项各占一行；组 form *之外*（文件头、块间注释、兄弟组、尾随 form）逐字节保留。
+- *移动配置会带走 =:services= 覆盖*：覆盖指向的组内服务名在目标组不存在时，写后产生新错误 → 事务 *整笔回滚* ，源配置原样保留（不静默丢数据）。
+- *服务增删与改名不支持*：会让既有容器变孤儿，改名还要迁移容器标签与命名，需先有配置维度（技术债 #16 / #25）。
+
 * 已删除 / 不再使用的机制
 
 后来者不要按 v0.1 的记忆找这些符号：
@@ -350,19 +467,21 @@ etaf *没有* 「跳到某个 group」的 API，可用的是 =etaf-focus-within=
 
 * 模块公开 API
 
-口径：=defun= / =cl-defun= / =defmacro= 定义、名字中不含 =--= 的非私有符号（HEAD 实测合计 72 个）。
+口径：=defun= / =cl-defun= / =defmacro= 定义、名字中不含 =--= 的非私有符号（HEAD 实测合计 100 个）。
 
 | 文件 | 公开 API 数 | 主要符号 |
 |------+-------------+----------|
 | =ebasecamp.el= | 3 | =ebasecamp= / =ebasecamp-create-sample-config= / =ebasecamp-reload= |
 | =ebasecamp-model.el= | 12 | =ebasecamp-define-group= / =ebasecamp-define-project=（宏）、=ebasecamp-model-group= / =-groups= / =-project= / =-projects= / =-reset=、=ebasecamp-model-group-configs= / =-config= / =-config-project=、=ebasecamp-model-resolve-services=、=ebasecamp-model-link-configs= |
-| =ebasecamp-config.el= | 3 | =ebasecamp-config-load= / =ebasecamp-config-project-file= / =ebasecamp-config-ensure-directory= |
+| =ebasecamp-config.el= | 4 | =ebasecamp-config-load= / =ebasecamp-config-project-file= / =ebasecamp-config-ensure-directory= / =ebasecamp-config-error-messages= |
 | =ebasecamp-compose.el= | 4 | =ebasecamp-compose-project-name= / =-render= / =-cache-file= / =-write= |
 | =ebasecamp-docker.el= | 8 | =ebasecamp-docker-run-sync= / =-run-async= / =-classify-error= / =-check-compose= / =-parse-labels= / =-parse-ps-output= / =-ps= / =-version-check= |
 | =ebasecamp-status.el= | 9 | =ebasecamp-status-normalize= / =-aggregate= / =-group-records= / =-snapshot= / =-last-records= / =-last-error= / =-running-p= / =-start= / =-stop= |
 | =ebasecamp-command.el= | 7 | =ebasecamp-command-service-key= / =-split-keys= / =-compose-args= / =-ensure-network= / =-pending-p= / =-run= / =-port-conflicts= |
 | =ebasecamp-data.el= | 2 | =ebasecamp-data-project-records= / =ebasecamp-data-group-instances= |
 | =ebasecamp-import.el= | 7 | =ebasecamp-import-parse= / =-parse-json= / =-suggest-name= / =-service-plists= / =-service-plist= / =-apply= / =-file= |
+| =ebasecamp-manifest.el= | 5 | =ebasecamp-manifest-service-form= / =-group-form= / =-group-form-from-plist= / =-config-form= / =-project-form= （文本层：form 生成器；定位 / 替换 / 写盘事务走 =--= 私有符号） |
+| =ebasecamp-config-write.el= | 23 | 字段映射 12 个（=ebasecamp-config-write-ports-to-text= / =-text-to-ports= / =-environment-*= / =-volumes-*= / =-command-*= / =-restart-*= / =-text-to-image= ）、实体操作 11 个（=update-service-fields= / =-add-config= / =-update-config-project= / =-remove-config= / =-move-config= / =-add-project= / =-update-project= / =-remove-project= / =-add-group= / =-update-group= / =-remove-group=） |
 | =ebasecamp-export.el= | 3 | =ebasecamp-export-default-file= / =-project= / =-compose= |
 | =ebasecamp-ui.el= | 14 | =ebasecamp-ui-open= / =-close= / =-view= / =-refresh= / =-session= / =-selected-keys= / =-confirm= / =-dismiss-confirm= / =-import-compose= / =-export-compose= / =-destroy-environment= / =-report-counts= / =-edit-manifest= / =-mode= （buffer 身份与键位） |
 
@@ -383,6 +502,7 @@ etaf *没有* 「跳到某个 group」的 API，可用的是 =etaf-focus-within=
 - [[file:adr/0002-group-configs.org][ADR-0002 组内配置与加载期物化]]
 - [[file:adr/0003-ui-readonly-keymap.org][ADR-0003 UI buffer 只读化与 etaf Host 键位]]
 - [[file:adr/0004-ui-layout-theme.org][ADR-0004 布局、主题与导航]]
+- [[file:adr/0005-manifest-write.org][ADR-0005 清单写盘（局部写 + 事务 + 表单边界）]]
 - [[file:compose-generation.org][compose 生成与导入导出规则]]
 - [[file:user-guide.org][用户指南]]
 - [[file:troubleshooting.org][故障排查]]

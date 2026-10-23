@@ -2,6 +2,47 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/) 与 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式。
 
+## [0.5.1] - 2026-10-23
+
+修复两处阻断级缺陷：清单没有 `groups.el` 时界面写操作全部失败；服务引用 compose 顶层 `configs` / `secrets` 时启动失败。另把 compose 校验前置到启动之前。
+
+### 修复
+
+- **「新建配置 / 改服务字段」在清单没有 `groups.el` 时报错**：写盘层原先把目标文件固定为 `<清单目录>/groups.el`，而导入层把「组 + 项目」一起写进 `projects/<name>.el` —— 于是合法清单上 `-add-config` / `-update-service-fields` / `-update-config-project` / `-remove-config` / `-move-config` / `-update-group` / `-remove-group` 全部报「清单文件 …/groups.el 不存在」。改为 `ebasecamp-config-write--manifest-file-for-group` 按组名跨文件定位（`groups.el` 存在时优先 → `projects/*.el` 字典序），写回组真正所在的那个文件；`e`（`ebasecamp-ui-edit-manifest`）同样定位真实文件，定位失败时降级为打开文件头 + 提示、不阻断。
+- **服务引用 compose 顶层 `configs` / `secrets` 时启动失败**：导入把顶层段静默丢弃、渲染层也不输出顶层段，生成物里「引用存在、定义缺失」，`docker compose up` 报 `service "x" refers to undefined config …`。现在 `ebasecamp-project` 新增 `:file-configs` / `:file-secrets` 槽（nil 或键为字符串的 alist，递归校验），导入保留顶层段（未知顶层键经 `ebasecamp-import-warnings` 提示、不阻断导入），per-project 生成物渲染顶层段（段序 `name → services → networks → volumes → configs → secrets`），真实 docker 闭环 `config -q` 退出码 0。v0.5.1 之前导入的清单需对原 compose **重新导入一次** 才能补齐这两个槽（插件不自动改清单）。
+
+### 变更
+
+- **启动前做 compose 预校验**：`ebasecamp-command-run` 在创建 external network 之前 *逐分支*（shared 与 per-project）写生成物并用 `config -q` 校验，全部通过才派发 `up`；任一生效物不合法时零副作用（不建网络、不启动任何容器）并显示 stderr 首行的可读错误。只有 `start` / `restart` 校验，`stop` / `down` 不校验。
+- **同名组在多文件定义时写操作拒绝**：同名组在加载层是硬错误（后加载文件整体回滚，其中项目不会出现在界面中），因此写操作对「>1 文件命中」直接 `user-error` 并列出文件，不再静默取第一个；`add-group` 写前扫全清单查重。
+- **跨文件移动配置 = 两次事务 + 备份补偿**：源文件移除用 `:keep-backup t` 保留备份，目标文件写入失败时用该备份恢复源文件原文（非单事务原子，见 ADR-0006）。
+
+## [0.5.0] - 2026-10-23
+
+界面内清单写操作：服务 6 个字段的编辑、配置 / 项目 / 组的增删改、配置跨组移动，全部经同一个写盘事务内核（备份 → 原子写 → 错误集差分回滚 → 外部修改检测）。界面 buffer 仍然只读。
+
+### 新增
+
+- **界面内编辑 container 配置（`S`）**：`etaf-dialog` 表单预填 6 个字段 —— `image` / `ports` / `environment` / `volumes` / `command` / `restart`，各字段有独立解析器与带行号的错误提示；保存只提交 *改动过* 的字段，其余字段从清单原文保真带回（`healthcheck` / `labels` / `networks` / `extra` / `entrypoint` / `working-dir` / `user` / `depends-on` 原样保留，`command` 原为 shell 字符串则保持字符串）；某字段被清空 = 删除该键。解析失败时表单不关闭、不写盘。
+- **配置操作**：`E` 改配置的 `:project`（`completing-read` 选项目）；`M` 把配置移动到其他组的其他项目（两级选择，写盘在一次事务内完成「源组移除 + 目标组追加」，配置自带的 `:services` 覆盖随之搬走）。
+- **配置 / 项目 / 组 CRUD（`X` 清单操作菜单）**：`completing-read` 里 8 项 —— 新建 / 删除配置、项目的新建 / 改 / 删、组的新建 / 改 / 删。新增配置校验「配置名组内唯一」与 D2（同一项目同一组只允许 1 个引用）；新增 / 改项目写 `projects/<name>.el`；新增 / 改组写 `groups.el` 的组 form。
+- **新模块 `lisp/ebasecamp-manifest.el`**（纯文本层，无 UI 依赖）：`--scan-forms` / `--scan-text-forms` / `--scan-forms-in-region`（顶层与两级区域 form 定位）、`--locate-form` / `--replace-form` / `--replace-forms` / `--append-form` / `--remove-form`、`--write-transaction` / `--write-new-file` / `--backup` / `--write-file`、以及 `service-form` / `group-form` / `group-form-from-plist` / `config-form` / `project-form` 五个生成器。
+- **新模块 `lisp/ebasecamp-config-write.el`**：6 个字段的双向映射纯函数（`ports` / `environment` / `volumes` / `command` / `restart` / `image`，解析失败 `user-error` 带行号）+ 11 个实体操作（`-update-service-fields` / `-add-config` / `-update-config-project` / `-remove-config` / `-move-config` / `-add-project` / `-update-project` / `-remove-project` / `-add-group` / `-update-group` / `-remove-group`）+ 两处引用扫描（`--config-references` / `--legacy-group-references`）。
+- **`ebasecamp-config-error-messages`**（`lisp/ebasecamp-config.el`）：取加载结果 `:errors` 的 `:message` 列表，供写盘事务做错误集差分。
+- **删除的引用保护与影响提示**：删 *项目* 前扫所有组 `:configs` 的 `:project`，被引用则拒绝并列出「组/配置」；删 *组* 前扫 `projects/*.el` 的旧写法 `:groups`，被引用则拒绝并列出项目名。确认框统一写明「只删清单定义，容器需用 `D` 销毁」。
+
+### 变更
+
+- **写盘走「form 定位 + 事务 + 错误集差分」**：定位只替换目标 form，文件头 / 块间注释 / 兄弟组 / 尾随 form 逐字节不变；写盘七步为「快照错误集 → 内存一次改完 → mtime+size 检测 → 备份 → 同目录临时文件 + `rename-file` 原子写 → 重新加载取新错误集 → 仅新增错误才回滚」，成功删备份，回滚 `signal 'ebasecamp-config-write-error` 并给原文件 / 备份路径。外部修改过清单文件时写入被拒绝并提示 `g` 重载。
+- **配置 / 项目 / 组操作带引用保护与写前校验**：D2 冲突、实体不存在、名字非法、scope 非法、项目文件已存在都在写盘 *之前* 用 `user-error` 拒绝，选在清单原文 plist 上校验而非 model 对象。
+- **根级键位 12 → 16 条**：新增 `S` / `E` / `M` / `X`，全部带中文 LABEL 并通过 `etaf--keys-validate`。
+- **`ebasecamp-import.el` 的三个生成器下沉为 thin wrapper**：`--service-form` / `--group-form` / `--project-form` 调用 `ebasecamp-manifest-service-form` / `-group-form` / `-project-form`，`--literal` 等辅助函数移入 manifest 成为唯一实现，避免两处格式漂移（生成结果字节一致）。同时修正 `--read-forms` docstring 里「`read` 不认 `;` 注释」的错误论断（实测 Emacs 31.1 会跳过）。
+- **`volumes` 写回必须是 plist**：`(:source … :target … :type bind|volume [:read-only t])`；`ports` 单段 `N` 解析为 `((N . N))` 且输出恒写两段；`command` 只支持 exec 形式。
+
+### 修复
+
+- **修复批次内的兄弟组丢失缺陷（未发布，仅内部）**：`-add-config` / `-update-config-project` / `-remove-config` / 同组 `-move-config` 原先把组 form 的 *渲染片段* 当作写盘事务的「整份新全文」返回，等于把 `groups.el` 覆盖成单个组（兄弟组、文件头、注释全部丢失）。改为 `--replace-group`（用 `--replace-form` 包住渲染结果）后四处调用点统一修正，并给 `add-config` 用例补「兄弟组与文件头逐字节保留」的回归断言。
+
 ## [0.4.0] - 2026-10-23
 
 界面骨架重构：根布局改为 flex 三段式（底栏常驻、左右两栏各自内部滚动）、配色改为跟随 Emacs 主题、左栏宽度可拖动并跨会话记住、新增 `1` / `2` / `3` 区域跳转、在项目目录内打开时自动定位到该项目的配置。
