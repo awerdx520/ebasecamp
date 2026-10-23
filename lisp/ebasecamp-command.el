@@ -1,7 +1,7 @@
 ;;; ebasecamp-command.el --- ebasecamp 生命周期命令与端口冲突检测 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.2.0
+;; Version: 0.4.0
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 

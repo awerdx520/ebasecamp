@@ -1,7 +1,7 @@
 ;;; ebasecamp-ui.el --- ebasecamp 只读主界面（etaf / etaf-ui） -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.2.0
+;; Version: 0.4.0
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -85,6 +85,16 @@
 ;; 展开状态同步更新。注意 `etaf-button' 的 `:disabled' 只接受布尔值（传 ref
 ;; 对象会 signal `etaf-renderer-error'），必须在渲染时读取其值。
 ;;
+;; 配色（v0.4 批次 T）：两层 —— 基础色（前景 / 背景 / 面板 / 边框）从 Emacs
+;; face 取，状态色（success / warning / danger / info / disabled / accent /
+;; button / checkbox / table-selected）取内置的明暗两套 palette，按
+;; `background-mode' 帧参数选择（见 `ebasecamp-ui--theme-plist'）。整套 token 由
+;; `ebasecamp-ui--theme'（一个 `etaf-ref'）承载，经 `etaf-theme-provide' 在
+;; `ebasecamp-ui-app' 的 `:setup' 里提供给整棵子树；`load-theme' 切换时
+;; `enable-theme-functions' / `disable-theme-functions' 钩子重算 ref，只刷新属性
+;; 不整树重挂载。render 区因此**不含任何色值字面量**（全部走
+;; `etaf-theme-token'），由测试机械守护。
+;;
 ;; 本模块不拼任何 docker 命令（那是 `ebasecamp-docker' / `ebasecamp-command'
 ;; 的职责），只消费 `ebasecamp-status'、`ebasecamp-data' 与
 ;; `ebasecamp-command' 的公开接口。
@@ -114,10 +124,413 @@
   :type 'number
   :group 'ebasecamp)
 
-(defconst ebasecamp-ui--split-ratio 0.38
-  "左侧组树的宽度占比（`etaf-splitter' 的 `:ratio'）。
-0.38 而非更窄：组节点文案在旧写法（=旧 · N 项目=）时仍需完整可见，实测
-0.32 会把尾部「· N 项目」截掉。")
+;; 默认左栏宽度占比的**单一来源**：defcustom 默认值、两处 fallback、保存时的
+;; fallback 与新建会话的 ref 初值全部引用本常量 —— 改默认值只需改这一处，否则
+;; 「删掉状态文件后重置」的行为会取决于走的是哪条路径。
+(defconst ebasecamp-ui--split-ratio-default 0.26
+  "左侧组树默认宽度占比（`etaf-splitter' 的 `:ratio'）的唯一来源。
+`ebasecamp-ui--split-ratio' 的 defcustom 默认值、`--load-ui-state' /
+`--current-split-ratio' / `--save-ui-state' 的 fallback、以及新建会话的 ref
+初值都引用本常量。")
+
+(defcustom ebasecamp-ui--split-ratio ebasecamp-ui--split-ratio-default
+  "左侧组树的默认宽度占比（`etaf-splitter' 的 `:ratio'）。
+只是**默认值**：会话里真正生效的是 `ebasecamp-ui-session-split-ratio'（一个
+`etaf-ref'），拖动分隔线后写入会话并持久化到 `ebasecamp-ui--ui-state-file'。
+默认值见 `ebasecamp-ui--split-ratio-default' 而非旧的 0.38 —— 组节点
+文案已改短（不再拼「· N 项目」），该宽度足够显示组名与勾选框，把宽度让给右栏
+的服务表格。
+越界值在读入时钳制到 `[ebasecamp-ui--split-ratio-min, -max]'：fallback 路径
+同样过钳制，因此直接 `setq' 本变量也不会导致渲染失败。"
+  :type 'number
+  :group 'ebasecamp)
+
+(defconst ebasecamp-ui--split-ratio-min 0.15
+  "左栏宽度占比下限（`etaf-splitter' 的 `:min-ratio'）。
+再窄组名会被截断到不可读；同时它是钳制下界 —— 越界值不钳制会让
+`etaf-splitter' 的 `:ratio' 校验在渲染期 signal。")
+
+(defconst ebasecamp-ui--split-ratio-max 0.55
+  "左栏宽度占比上限（`etaf-splitter' 的 `:max-ratio'）。
+再宽右栏的服务表格会被挤到无法阅读；同时它是钳制上界（见上）。")
+
+(defun ebasecamp-ui--clamp-ratio (value)
+  "把 VALUE 钳制到 `[ebasecamp-ui--split-ratio-min, -max]' 并返回。
+VALUE 不是数字时返回 nil（调用方据此跳过写入，而不是替用户猜一个值）。
+钳制是**渲染前置条件**：`etaf-splitter' 的 `:ratio' 校验为
+`(<= min-ratio ratio max-ratio)'，越界值会让 `etaf-check-prop' 在渲染期
+signal，界面直接打不开。"
+  (when (numberp value)
+    (max ebasecamp-ui--split-ratio-min
+         (min ebasecamp-ui--split-ratio-max value))))
+
+;;; 左栏宽度的运行时状态（ui-state.el）
+
+;; `ui-state.el' 是**运行时状态缓存**（位于 `ebasecamp-cache-directory'），不是
+;; 清单：不参与 `ebasecamp-config-load'，不经界面 `e'（编辑清单）入口，可随时
+;; 删除（下次打开回默认）。因此它不破坏 ADR-0003 的「清单唯一写入口」不变量。
+
+(defun ebasecamp-ui--ui-state-file ()
+  "返回界面运行时状态文件路径：`<ebasecamp-cache-directory>/ui-state.el'。"
+  (expand-file-name "ui-state.el" ebasecamp-cache-directory))
+
+(defun ebasecamp-ui--load-ui-state ()
+  "读 `ebasecamp-ui--ui-state-file'，返回左栏宽度占比（浮点）。
+回退规则：文件不存在 / 读不出 / 形态不是 `(:split-ratio NUMBER)' 时返回
+**经钳制**的 `ebasecamp-ui--split-ratio'（defcustom 默认）。defcustom 被用户
+`setq' 成越界值时同样钳到 `[min, max]'，非数字则回退
+`ebasecamp-ui--split-ratio-default'；读到数字后一律
+经 `ebasecamp-ui--clamp-ratio' 钳制（越界值不得进入渲染）。
+只接受 `(:split-ratio NUMBER)' 一种形态：`car' 必须是 `:split-ratio'，其余
+（`(foo)'、裸字符串、空文件、`(:other 1)'、ratio 为字符串或 nil）全按非法处理。
+**不执行文件中的代码**：Emacs 31.1 起 `#.' 读语法默认禁用（`(read \"#.(+ 1 2)\")'
+返回 `invalid-read-syntax \"#.\"'），且 `read-eval' 变量已不存在（实测 `boundp'
+为 nil，写 `(let ((read-eval nil)) ...)' 会触发「Unused lexical variable」编译
+错误）。为了在旧版 Emacs（其 `read-eval' 默认 t）上也不执行代码，读前显式拒绝
+含 `#.' 的文本 —— 合法状态文件永远不会有这个序列。"
+  (let ((file (ebasecamp-ui--ui-state-file)))
+    (or (and (file-readable-p file)
+             (condition-case nil
+                 (with-temp-buffer
+                   (insert-file-contents file)
+                   (let ((text (buffer-string)))
+                     (unless (string-match-p "#\\." text)
+                       (goto-char (point-min))
+                       (let ((form (read (current-buffer))))
+                         (when (and (consp form) (eq :split-ratio (car form)))
+                           (ebasecamp-ui--clamp-ratio (cadr form)))))))
+               ((error quit) nil)))
+        ;; fallback 也不得把 defcustom 原样放行：它可能被 `setq' 成越界值
+        ;; （渲染期 `etaf-splitter' 的 `:ratio' 校验会 signal）；非数字时
+        ;; `--clamp-ratio' 返回 nil，回退默认值常量。
+        (or (ebasecamp-ui--clamp-ratio ebasecamp-ui--split-ratio)
+            ebasecamp-ui--split-ratio-default))))
+
+(defun ebasecamp-ui--current-split-ratio ()
+  "返回当前会话的左栏宽度占比；没有会话时返回（钳制后的）defcustom 默认值。"
+  (let ((session ebasecamp-ui--session))
+    (if session
+        (etaf-value (ebasecamp-ui-session-split-ratio session))
+      (or (ebasecamp-ui--clamp-ratio ebasecamp-ui--split-ratio)
+          ebasecamp-ui--split-ratio-default))))
+
+(defun ebasecamp-ui--set-split-ratio (value)
+  "把当前会话的左栏宽度占比设为 VALUE（先钳制），返回会话里的新值。
+VALUE 不是数字时忽略（不写 ref、不 signal）。只写 ref 不重渲染整棵树：
+splitter 的 `:ratio' 收的就是这个 ref，`etaf-ui--reactive-value' 的追踪读取
+让**只有 splitter 自己**在值变化时重渲染。"
+  (let ((ratio (ebasecamp-ui--clamp-ratio value)))
+    (when ratio
+      (etaf-set-value (ebasecamp-ui-session-split-ratio (ebasecamp-ui-session))
+                      ratio))
+    (ebasecamp-ui--current-split-ratio)))
+
+(defun ebasecamp-ui--save-ui-state ()
+  "把当前左栏宽度占比写入 `ebasecamp-ui--ui-state-file'，返回路径（失败 nil）。
+目录不存在时 `make-directory' 递归创建；先写同目录 `make-temp-file' 生成的唯一
+临时文件，再 `rename-file' 原子覆盖目标 —— 避免写一半留下损坏文件（那会让下次
+打开回退默认）。内容只有 `(:split-ratio FLOAT)'：不含密钥、不含清单内容。
+写盘失败只 `message' 不 signal：本函数在 `ebasecamp-ui-close' 与拖动回调里
+调用，缓存目录不可写不应阻断关闭界面。"
+  (let ((file (ebasecamp-ui--ui-state-file))
+        ;; `--current-split-ratio' 恒返回数字：会话在时取 ref 值（由
+        ;; `--load-ui-state' / `--set-split-ratio' 写入，均已钳制），无会话时
+        ;; 返回钳制后的 defcustom 默认值或默认常量，因此不需要再 `or' 兜底。
+        (ratio (ebasecamp-ui--current-split-ratio)))
+    (condition-case err
+        (let* ((directory (file-name-directory file))
+               (temp nil))
+          (make-directory directory t)
+          (setq temp (make-temp-file (expand-file-name "ui-state-" directory)
+                                     nil ".el"))
+          (unwind-protect
+              (progn
+                (with-temp-file temp
+                  (prin1 (list :split-ratio ratio) (current-buffer))
+                  (insert "\n"))
+                (rename-file temp file t))
+            (when (file-exists-p temp)
+              (ignore-errors (delete-file temp)))))
+      ((error quit)
+       (message "ebasecamp: 保存界面状态失败：%S" err)
+       (setq file nil)))
+    file))
+
+;;; 拖动分隔线（`etaf-splitter' 的 `:on-change'）
+
+(defun ebasecamp-ui--splitter-drag-ratio (gesture)
+  "把拖动 GESTURE 折算成新的左栏宽度占比（浮点）或 nil。
+`etaf-splitter' 的 `:on-change' 收到的**不是新比例数字，而是原始手势 plist**：
+它被原样接到分隔线 Host 的 `:on-drag' 上（`etaf-ui-desktop.el' 的
+`etaf-splitter' `:render' 与 `etaf-ui--splitter-overlay-divider'），形态来自
+`ebox-keymap-create' 的 `:drag' 协议 —— `:phase'（`start' / `move' / `end' /
+`cancel'）、`:position'（指针 `(X . Y)'，X 为像素）、`:delta'（相对按下点的
+`(DX . DY)' 像素）、`:node'（分隔线节点）、`:keyboard'（`t' 表示来自
+`etaf-drag-step' 的键盘拖动）。
+指针拖动按「指针 X − 容器左边界」/ 容器宽度折算，容器取分隔线节点的父节点
+（splitter 的 flex 根）；键盘拖动没有绝对坐标（`:position' 只有 (0 . 0) 与位移），
+改按「当前比例 + DX / 容器宽度」折算。容器几何拿不到时返回 nil（调用方跳过）。"
+  (let* ((node (plist-get gesture :node))
+         (parent (and node (ebox-node-parent node)))
+         (geometry (and parent (ignore-errors (ebox-node-geometry parent))))
+         (left (plist-get geometry :x))
+         (width (plist-get geometry :width)))
+    (when (and (numberp left) (numberp width) (> width 0))
+      (if (plist-get gesture :keyboard)
+          (let ((dx (car-safe (plist-get gesture :delta))))
+            (when (numberp dx)
+              (ebasecamp-ui--clamp-ratio
+               (+ (ebasecamp-ui--current-split-ratio) (/ (float dx) width)))))
+        (let ((x (car-safe (plist-get gesture :position))))
+          (when (numberp x)
+            (ebasecamp-ui--clamp-ratio (/ (float (- x left)) width))))))))
+
+(defun ebasecamp-ui--splitter-on-change (gesture)
+  "`etaf-splitter' 的 `:on-change' 回调：拖动时更新并持久化左栏宽度占比。
+`move' 阶段只写会话 ref（布局即时跟随，ref 变化自然驱动重渲染 —— 这里**不**
+手动重渲染整棵树，否则每次鼠标移动都重建整个界面）；`end' 阶段写回并落盘一次
+（跨会话记住）；`start' / `cancel' 不动状态（手势被取消时不该固化中间态）。"
+  (pcase (plist-get gesture :phase)
+    ('move
+     (when-let* ((ratio (ebasecamp-ui--splitter-drag-ratio gesture)))
+       (ebasecamp-ui--set-split-ratio ratio)))
+    ('end
+     (when-let* ((ratio (ebasecamp-ui--splitter-drag-ratio gesture)))
+       (ebasecamp-ui--set-split-ratio ratio)
+       (ebasecamp-ui--save-ui-state)))))
+
+;;; 主题（face 基础色 + 明暗两套 palette 状态色）
+
+;; 两层设计（见 `openspec/completed/2026-10-23-ui-layout-theme-nav.md' 的 T1）：
+;;
+;; - **基础色（9 个）**：从 Emacs face 取（`default' / `mode-line-inactive' /
+;;   `shadow' / `fringe'），因此跟随用户当前的 `load-theme'；
+;; - **状态色（26 个）**：success / warning / danger / info / disabled / accent /
+;;   button / checkbox / table-selected。etaf-ui 的 `etaf-ui--style-palette' 只有
+;;   一套浅色值，暗色主题下 badge / alert 仍是浅色块；这里内置明暗两套，按
+;;   `(frame-parameter nil \\='background-mode)' 选择；
+;; - **回退**：`face-attribute' 返回 `unspecified'（batch / TTY 下 `default' 的
+;;   前景背景是 `\"unspecified-fg\"' / `\"unspecified-bg\"' 伪色）时，基础色回退到
+;;   内置 palette 的**同名键**，不回退到 `default' 的同名属性（避免自指）；
+;; - **覆盖**：`ebasecamp-ui-theme' 非 nil 时按键覆盖生成结果（plist）。
+;;
+;; 色值字面量在这里集中（palette 与 defcustom 默认值），render 区一律用
+;; `etaf-theme-token'，由 `test/ebasecamp-ui-tests.el' 的
+;; `ebasecamp-ui-test-render-region-has-no-literal-colors' 机械守护。
+
+(defcustom ebasecamp-ui-theme nil
+  "覆盖内置主题 token 的 plist；nil 表示完全跟随（face + 明暗 palette）。
+非 nil 时按键覆盖 `ebasecamp-ui--theme-plist' 的生成结果（同键以本值优先），
+键用 `:ui-*' 关键字，值为色值字符串，例如
+`(:ui-accent \"#B45309\" :ui-accent-soft-bg \"#FDF2E3\")'。
+只覆盖确有需要的键：未覆盖的键仍按「face → 内置 palette」生成。"
+  :type '(plist :key-type symbol :value-type color)
+  :group 'ebasecamp)
+
+(defconst ebasecamp-ui--palette-light
+  '(:ui-fg "#252A2E"
+    :ui-bg "#FFFDF8"
+    :ui-panel-fg "#252A2E"
+    :ui-panel-bg "#F7F4EC"
+    :ui-panel-border "#C9D0DA"
+    :ui-muted-fg "#526174"
+    :ui-border "#687386"
+    :ui-divider-bg "#DCE3EB"
+    :ui-table-border "#687386"
+    :ui-accent "#2F6FE4"
+    :ui-accent-fg "#FFFFFF"
+    :ui-accent-soft-bg "#DCE7FA"
+    :ui-success-fg "#2F6B43"
+    :ui-success-bg "#DCEBDD"
+    :ui-success-border "#6D8A73"
+    :ui-warning-fg "#8A4B08"
+    :ui-warning-bg "#FFF3D6"
+    :ui-warning-border "#D99A2B"
+    :ui-danger-fg "#C0392B"
+    :ui-danger-bg "#FDECEA"
+    :ui-danger-border "#CF6A6A"
+    :ui-info-fg "#155E75"
+    :ui-info-bg "#E0F2FE"
+    :ui-info-border "#38A3C7"
+    :ui-disabled-fg "#687386"
+    :ui-disabled-bg "#E5E7EB"
+    :ui-disabled-border "#9CA3AF"
+    :ui-button-primary-fg "#FFFFFF"
+    :ui-button-primary-bg "#2F6FE4"
+    :ui-button-secondary-fg "#1F4FB0"
+    :ui-button-secondary-bg "#DCE7FA"
+    :ui-button-ghost-fg "#252A2E"
+    :ui-checkbox-enabled-fg "#252A2E"
+    :ui-table-selected-fg "#2F6B43"
+    :ui-table-selected-bg "#DCEBDD")
+  "浅色 palette：9 个基础色回退值 + 26 个状态色。
+基础色那 9 个键只在对应 face 的属性为 `unspecified' 时使用（face 有值时 face
+优先）；状态色一律取本 palette。")
+
+(defconst ebasecamp-ui--palette-dark
+  '(:ui-fg "#D7DEE8"
+    :ui-bg "#1B1F24"
+    :ui-panel-fg "#D7DEE8"
+    :ui-panel-bg "#23282F"
+    :ui-panel-border "#3C4450"
+    :ui-muted-fg "#8A94A6"
+    :ui-border "#4A5260"
+    :ui-divider-bg "#2F353D"
+    :ui-table-border "#4A5260"
+    :ui-accent "#6EA8FF"
+    :ui-accent-fg "#0B1220"
+    :ui-accent-soft-bg "#223C5C"
+    :ui-success-fg "#7BC98F"
+    :ui-success-bg "#1E3A28"
+    :ui-success-border "#3E6B4E"
+    :ui-warning-fg "#E5B567"
+    :ui-warning-bg "#3D2E12"
+    :ui-warning-border "#8A6A2B"
+    :ui-danger-fg "#FF8A80"
+    :ui-danger-bg "#3E1F1F"
+    :ui-danger-border "#A34A4A"
+    :ui-info-fg "#7FCBE8"
+    :ui-info-bg "#10333F"
+    :ui-info-border "#2A6B80"
+    :ui-disabled-fg "#8A94A6"
+    :ui-disabled-bg "#2A2F37"
+    :ui-disabled-border "#4A5260"
+    :ui-button-primary-fg "#0B1220"
+    :ui-button-primary-bg "#6EA8FF"
+    :ui-button-secondary-fg "#BFD8FF"
+    :ui-button-secondary-bg "#223C5C"
+    :ui-button-ghost-fg "#D7DEE8"
+    :ui-checkbox-enabled-fg "#D7DEE8"
+    :ui-table-selected-fg "#9FE0B0"
+    :ui-table-selected-bg "#1E3A28")
+  "暗色 palette：键集合与 `ebasecamp-ui--palette-light' 完全相同。
+低亮度背景（success-bg 等）不是「把浅色值调暗一点」，而是独立取的低饱和深色，
+以保证暗色主题下 badge / alert 的文字对比度。")
+
+(defun ebasecamp-ui--background-mode ()
+  "返回当前帧的明暗模式：`dark' 或 `light'。
+来源是 `background-mode' 帧参数（`load-theme' 加载 modus 主题时会被改写）；
+缺省（nil）按 `light' 处理。纯函数。"
+  (if (eq (frame-parameter nil 'background-mode) 'dark) 'dark 'light))
+
+(defun ebasecamp-ui--palette (mode)
+  "返回 MODE（`light' / `dark'）对应的内置 palette。纯函数。"
+  (if (eq mode 'dark) ebasecamp-ui--palette-dark ebasecamp-ui--palette-light))
+
+(defun ebasecamp-ui--color-value-p (value)
+  "返回 VALUE 是否为可用色值（非空字符串且不是 `unspecified' 伪色）。
+`face-attribute' 在无显示环境（batch / TTY）下对 `default' 的前景背景返回
+字符串 `\"unspecified-fg\"' / `\"unspecified-bg\"'（实测 Emacs 31.1），其他 face
+返回符号 `unspecified' —— 两者都必须判为「无值」。纯函数。"
+  (and (stringp value)
+       (not (string-empty-p value))
+       (not (string-prefix-p "unspecified" value))))
+
+(defun ebasecamp-ui--face-color (face attribute &optional key palette)
+  "返回 FACE 的 ATTRIBUTE 颜色；无值时回退到 PALETTE 里 KEY 的值。
+`face-attribute' 用 `(face-attribute FACE ATTRIBUTE nil t)'（inherit 打开，取
+最终生效值）；FACE 未定义时（`Invalid face'）同样按无值处理。
+**不**回退到 `default' 的同名属性：那会让 `:ui-panel-*' 等键退化成与
+`:ui-fg' / `:ui-bg' 完全相同（自指），丢失面板层次。纯函数（只读 face）。"
+  (let ((value (condition-case nil
+                   (face-attribute face attribute nil t)
+                 (error nil))))
+    (cond
+     ((ebasecamp-ui--color-value-p value) value)
+     (key (plist-get palette key))
+     (t nil))))
+
+(defun ebasecamp-ui--border-color (palette key)
+  "返回边框类颜色：`fringe' 前景 → `mode-line-inactive' 背景 → PALETTE 的 KEY。
+`fringe' 前景在默认主题下是 `unspecified'（实测 31.1，modus 也不定义），
+所以真正的常用来源是 `mode-line-inactive' 背景（分隔线/面板边框取它最协调）。
+纯函数。"
+  (or (ebasecamp-ui--face-color 'fringe :foreground)
+      (ebasecamp-ui--face-color 'mode-line-inactive :background)
+      (plist-get palette key)))
+
+(defun ebasecamp-ui--theme-merge (override base)
+  "把 OVERRIDE 的键覆盖到 BASE 之上，返回新 plist（同键以 OVERRIDE 为准）。
+两份都是 `:keyword value' 形式的 plist；结果按键去重（不含重复键），以免
+`etaf-theme-provide' 的默认值展开出现重复条目。纯函数。"
+  (let ((result (cl-copy-list override)))
+    (cl-loop for (key value) on base by #'cddr
+             unless (plist-member result key)
+             do (setq result (plist-put result key value)))
+    result))
+
+(defun ebasecamp-ui--theme-plist (&optional mode)
+  "返回提供给 etaf 的主题 plist（计划 T4 的 35 个 `:ui-*' token）。
+基础色（9 个）取 face（未指定时回退 palette 同名键），状态色（26 个）取
+MODE 对应的内置 palette；两份合并后按键去重。MODE 缺省读
+`(frame-parameter nil \\='background-mode)'，显式传入便于按指定明暗生成（测试
+与「预览另一套主题」场景）。`ebasecamp-ui-theme' 非 nil 时其键最后覆盖。
+纯函数（除读 face 与帧参数外无副作用）。"
+  (let* ((palette (ebasecamp-ui--palette
+                   (or mode (ebasecamp-ui--background-mode))))
+         (base (list :ui-fg (ebasecamp-ui--face-color
+                             'default :foreground :ui-fg palette)
+                     :ui-bg (ebasecamp-ui--face-color
+                             'default :background :ui-bg palette)
+                     :ui-panel-fg (or (ebasecamp-ui--face-color
+                                       'mode-line-inactive :foreground)
+                                      (ebasecamp-ui--face-color
+                                       'default :foreground :ui-panel-fg palette))
+                     :ui-panel-bg (or (ebasecamp-ui--face-color
+                                       'mode-line-inactive :background)
+                                      (ebasecamp-ui--face-color
+                                       'default :background :ui-panel-bg palette))
+                     :ui-panel-border (ebasecamp-ui--border-color
+                                       palette :ui-panel-border)
+                     :ui-muted-fg (ebasecamp-ui--face-color
+                                   'shadow :foreground :ui-muted-fg palette)
+                     :ui-border (ebasecamp-ui--border-color palette :ui-border)
+                     :ui-divider-bg (ebasecamp-ui--border-color
+                                     palette :ui-divider-bg)
+                     :ui-table-border (ebasecamp-ui--border-color
+                                       palette :ui-table-border))))
+    (ebasecamp-ui--theme-merge ebasecamp-ui-theme
+                               (ebasecamp-ui--theme-merge base palette))))
+
+(defvar ebasecamp-ui--theme (etaf-ref (ebasecamp-ui--theme-plist)
+                                      :name 'ebasecamp-ui-theme)
+  "承载当前主题 plist 的 `etaf-ref'。
+`ebasecamp-ui-app' 的 `:setup' 用 `etaf-theme-provide' 把它提供给整棵子树，
+因此根子树里所有 Host 的 `etaf-theme-token'（含 etaf-ui 组件的 badge / alert /
+button / table）都从这里取值。ref 被 Host 订阅：值变化只刷新属性，不整树重挂载
+（探针实测：同一节点身份不变而 `:bgcolor' 从旧值变为新值）。")
+
+(defun ebasecamp-ui--refresh-theme ()
+  "重新计算主题 plist 并写回 `ebasecamp-ui--theme'，返回新 plist。
+主题钩子（`ebasecamp-ui--theme-hook'）与切换明暗的测试都走这里；写 ref 触发
+属性级刷新。"
+  (let ((plist (ebasecamp-ui--theme-plist)))
+    (when (and ebasecamp-ui--theme
+               (not (equal plist (etaf-value ebasecamp-ui--theme))))
+      (etaf-set-value ebasecamp-ui--theme plist))
+    plist))
+
+(defun ebasecamp-ui--theme-hook (_theme)
+  "`enable-theme-functions' / `disable-theme-functions' 的回调：重算主题。
+参数（刚启用/停用的主题名）不使用 —— face 与 `background-mode' 都是**全量**
+状态，重算整份 plist 比按 theme 增量推断更简单也更不容易漏（主题层叠时
+最后一次 `load-theme' 的 face 才是当前生效值）。"
+  (ebasecamp-ui--refresh-theme))
+
+(defun ebasecamp-ui--theme-hooks-install ()
+  "挂载主题钩子（`ebasecamp-ui-open' 调用）。
+`enable-theme-functions' / `disable-theme-functions' 是 Emacs 29+ 的 abnormal
+hook（本机 31.1 实测存在且 `load-theme' 时会调用，参数为被启用/停用的主题名）；
+`add-hook' 对同一函数幂等，重复 open 不会重复挂载。"
+  (add-hook 'enable-theme-functions #'ebasecamp-ui--theme-hook)
+  (add-hook 'disable-theme-functions #'ebasecamp-ui--theme-hook))
+
+(defun ebasecamp-ui--theme-hooks-remove ()
+  "卸载主题钩子（`ebasecamp-ui-close' 调用，与 install 严格对称）。
+界面关闭后 ref 不再需要跟随主题；残留钩子会在每次 `load-theme' 时白算一遍
+plist，且让「关掉界面就与主题解耦」的语义失真。"
+  (remove-hook 'enable-theme-functions #'ebasecamp-ui--theme-hook)
+  (remove-hook 'disable-theme-functions #'ebasecamp-ui--theme-hook))
 
 ;;; 会话
 
@@ -125,11 +538,12 @@
   "一次界面会话的可变状态。
 STATE 为整棵树的渲染数据（plist，见 `ebasecamp-ui--build-state'）；
 SELECTED-GROUP 为当前选中的组名（symbol 或 nil）；EXPANDED 为 `etaf-tree'
-的展开 key 列表；SELECTED-REF / BUSY / NOTICE / CONFIRM 均为 `etaf-ref'；
-CONFIRM-ACTION 为等待确认的动作 symbol（无则 nil）；NOTICE-TIMER 为临时的
-提示自动清除定时器（无则 nil，必须随会话一起取消）。"
+的展开 key 列表；SELECTED-REF / BUSY / NOTICE / CONFIRM / SPLIT-RATIO 均为 `etaf-ref'；
+SPLIT-RATIO 是左栏宽度占比（初始值来自 `ebasecamp-ui--load-ui-state'，拖动时
+更新并落盘）；CONFIRM-ACTION 为等待确认的动作 symbol（无则 nil）；
+NOTICE-TIMER 为临时的提示自动清除定时器（无则 nil，必须随会话一起取消）。"
   state selected-group expanded selected-ref busy notice confirm confirm-action
-  notice-timer)
+  split-ratio notice-timer)
 
 (defvar ebasecamp-ui--session nil
   "当前界面会话（`ebasecamp-ui-session' 对象）；未打开时为 nil。")
@@ -155,18 +569,83 @@ CONFIRM-ACTION 为等待确认的动作 symbol（无则 nil）；NOTICE-TIMER �
             (ebasecamp-ui--group-key (symbol-name (ebasecamp-group-name group))))
           (ebasecamp-model-groups)))
 
+;;; 项目上下文（`default-directory' → 项目 → 第一份配置所在组）
+
+(defun ebasecamp-ui--project-for-directory (dir)
+  "返回 DIR 所属的项目对象（最长 `:root' 前缀匹配）；无命中返回 nil。
+三类输入直接给 nil：DIR 为 nil / 非字符串 / 不是已存在的目录。DIR 与每个项目
+的 `:root' 都先 `expand-file-name' 再 `file-truename' 归一（`~'、`..'、软链
+因此等价），比较前统一成 `file-name-as-directory' 形态 —— 只匹配**整段目录**，
+`/tmp/a2' 不会被 root `/tmp/a' 命中。**大小写敏感**：`string-prefix-p' 默认
+即敏感，这里既不传第三参数也不绑 `case-fold-search'（`/tmp/A' 与 `/tmp/a' 是
+两个目录）。`:root' 为空串或目录不存在的项目跳过；多个命中取 root 最长者
+（`/a/b/c' 同时命中 `/a/b' 与 `/a' 时取 `/a/b'）。纯函数。"
+  (when (and (stringp dir) (file-directory-p dir))
+    (let ((target (file-name-as-directory (file-truename (expand-file-name dir))))
+          (best nil)
+          (best-length 0))
+      (dolist (project (ebasecamp-model-projects))
+        (let ((root (ebasecamp-project-root project)))
+          (when (and (stringp root) (not (string-empty-p root))
+                     (file-directory-p root))
+            (let* ((prefix (file-name-as-directory
+                            (file-truename (expand-file-name root))))
+                   (length (length prefix)))
+              (when (and (> length best-length)
+                         (string-prefix-p prefix target))
+                (setq best project
+                      best-length length))))))
+      best)))
+
+(defun ebasecamp-ui--first-group-for-project (project)
+  "返回 PROJECT 的**第一份配置**所在组名（symbol），无命中返回 nil。
+PROJECT 为项目名 symbol（也接受项目对象，内部归一为名字 —— 传对象却按 `eq'
+比名字会静默返回 nil，是这个函数最容易踩的坑）。
+「第一份」= 按 `ebasecamp-model-groups' 的组顺序、组内 `:configs' 顺序，首个
+`:project' 命中 PROJECT 的配置。因此顺序契约只由清单的组定义顺序决定，不看项目
+`groups' 槽（物化产物里也有该组，但物化顺序不是契约）。纯函数。"
+  (let ((name (if (ebasecamp-project-p project)
+                  (ebasecamp-project-name project)
+                project)))
+    (when name
+      (cl-loop for group in (ebasecamp-model-groups)
+               when (cl-loop for cell in (ebasecamp-model-group-configs group)
+                             thereis (eq name
+                                         (ebasecamp-model-config-project
+                                          (cdr cell))))
+               return (ebasecamp-group-name group)))))
+
 (defun ebasecamp-ui--new-session ()
-  "创建并返回新的界面会话（state / selected-group / expanded 及各 ref）。"
-  (ebasecamp-ui--session-create
-   :state (etaf-ref (ebasecamp-ui--build-state) :name 'ebasecamp-ui-state)
-   :selected-group (etaf-ref nil :name 'ebasecamp-ui-selected-group)
-   :expanded (etaf-ref (ebasecamp-ui--default-expanded)
-                       :name 'ebasecamp-ui-expanded)
-   :selected-ref (etaf-ref nil :name 'ebasecamp-ui-selected)
-   :busy (etaf-ref nil :name 'ebasecamp-ui-busy)
-   :notice (etaf-ref nil :name 'ebasecamp-ui-notice)
-   :confirm (etaf-ref nil :name 'ebasecamp-ui-confirm)
-   :confirm-action nil))
+  "创建并返回新的界面会话（state / selected-group / expanded 及各 ref）。
+左栏宽度占比在这里从 `ebasecamp-ui--ui-state-file' 载入（拖动过就用记住的值，
+没拖过 / 文件非法就是 defcustom 默认）；本函数只读缓存文件，不写盘。
+
+**项目上下文默认定位（P1/P2）**：按 `default-directory' 找所属项目
+（`ebasecamp-ui--project-for-directory'），再取该项目第一份配置所在组
+（`ebasecamp-ui--first-group-for-project'）作为初始选中组；任一跳落空就保持
+既有行为（无选中组，右栏显示「选择左侧的组」）。只在这里算**一次** ——
+`ebasecamp-ui-refresh' / `g' 只按现有 selected-group 重建 state，不覆盖用户
+手选的组。"
+  (let* ((project (ebasecamp-ui--project-for-directory default-directory))
+         (group (and project
+                     (ebasecamp-ui--first-group-for-project
+                      (ebasecamp-project-name project)))))
+    (ebasecamp-ui--session-create
+     :state (etaf-ref (ebasecamp-ui--build-state group) :name 'ebasecamp-ui-state)
+     :selected-group (etaf-ref group :name 'ebasecamp-ui-selected-group)
+     :expanded (etaf-ref (ebasecamp-ui--default-expanded)
+                         :name 'ebasecamp-ui-expanded)
+     :selected-ref (etaf-ref nil :name 'ebasecamp-ui-selected)
+     ;; 双保险：`--load-ui-state' 已钳过，这里再钳一次兜住任何绕过它的路径 ——
+     ;; 越界 ratio 会让 `etaf-splitter' 的 `:ratio' 校验在渲染期 signal。
+     :split-ratio (etaf-ref (or (ebasecamp-ui--clamp-ratio
+                                 (ebasecamp-ui--load-ui-state))
+                                ebasecamp-ui--split-ratio-default)
+                            :name 'ebasecamp-ui-split-ratio)
+     :busy (etaf-ref nil :name 'ebasecamp-ui-busy)
+     :notice (etaf-ref nil :name 'ebasecamp-ui-notice)
+     :confirm (etaf-ref nil :name 'ebasecamp-ui-confirm)
+     :confirm-action nil)))
 
 (defun ebasecamp-ui-session ()
   "返回当前会话；不存在时创建。
@@ -345,6 +824,25 @@ nil → \"-\"；healthy → OK；unhealthy → BAD；starting → STARTING；其
          (updated (if next
                       (if (member key keys) keys (cons key keys))
                     (delete key (copy-sequence keys)))))
+    (etaf-set-value ref updated)))
+
+(defun ebasecamp-ui--select-instance (session group-name instance &optional select)
+  "把 INSTANCE 这一段的全部服务加入（SELECT 非 nil）或移出 SESSION 的选中集合。
+key 沿用段内身份 \"组名/服务名\"（见 `ebasecamp-ui--instance-key'），数据结构与
+`ebasecamp-ui--toggle-selected' 完全一致 —— 都写
+`ebasecamp-ui-session-selected-ref' 里的字符串列表，因此段头 checkbox 与段级
+`a' / `A' 互相可见，不存在第二套选中表示。
+只改 INSTANCE 自己记录对应的 key：其它段、其它组的 key 原样保留（同组多份配置
+共享同名服务的 key 是 `--instance-key' 已声明的语义）。返回更新后的选中列表。"
+  (let* ((ref (ebasecamp-ui-session-selected-ref session))
+         (keys (etaf-value ref))
+         (section (mapcar (lambda (record)
+                            (ebasecamp-ui--instance-key group-name record))
+                          (plist-get instance :records)))
+         (updated (if select
+                      (append (cl-set-difference section keys :test #'equal)
+                              keys)
+                    (cl-set-difference keys section :test #'equal))))
     (etaf-set-value ref updated)))
 
 (defun ebasecamp-ui--instance-key (group-name record)
@@ -580,15 +1078,111 @@ CONFIG 为 state 的配置项 plist。纯函数。"
                      (plist-get group :configs)))))
    (plist-get state :groups)))
 
+(defconst ebasecamp-ui--checkbox-ref-prefix "ebasecamp-ui-check-"
+  "服务行 checkbox 的 ref 前缀。
+`--select-cell' 用它生成 ref，`--checkbox-ref-at-point' 用它识别 ref。
+与既有 ref（`ebasecamp-ui-refresh' / `ebasecamp-ui-selected' /
+`ebasecamp-ui-state' / `ebasecamp-ui-expanded' / `ebasecamp-ui-busy' /
+`ebasecamp-ui-notice' / `ebasecamp-ui-confirm'）不冲突。")
+
+(defun ebasecamp-ui--checkbox-ref (key)
+  "返回选中 key（\"组名/服务名\"）对应的 checkbox ref 符号。纯函数。
+同组多份配置共享同一个 key（见 `ebasecamp-ui--instance-key'），因此 ref 也
+共享 —— 与既有选中语义一致：两段里的同名服务行勾选状态本就联动。"
+  (intern (format "%s%s" ebasecamp-ui--checkbox-ref-prefix key)))
+
+(defconst ebasecamp-ui--row-ref-prefix "ebasecamp-ui-row-"
+  "服务表整行 ref 的前缀。
+`--service-table' 用它生成行 ref，`--ref-at-point' 用它识别「point 落在行内任意
+单元格」的情形。行 ref 与 checkbox ref（`--checkbox-ref-prefix'）由同一个 key
+派生，因此从行 ref 可还原出该行的 checkbox ref —— 行级切换键 `t' 据此派发。")
+
+(defun ebasecamp-ui--row-ref (key)
+  "返回选中 key（\"组名/服务名\"）对应的行 ref 符号。纯函数。
+与 `--checkbox-ref' 同源（同一 key），两者只差前缀。"
+  (intern (format "%s%s" ebasecamp-ui--row-ref-prefix key)))
+
 (defun ebasecamp-ui--select-cell (session group-name record)
   "选中列的单元格：checkbox 写回 SESSION 的选中列表。
-key 为段内身份 \"组名/服务名\"（见 `ebasecamp-ui--instance-key'）。"
-  (let ((key (ebasecamp-ui--instance-key group-name record)))
+key 为段内身份 \"组名/服务名\"（见 `ebasecamp-ui--instance-key'），同时用作
+checkbox 的稳定 `:ref'（见 `ebasecamp-ui--checkbox-ref'）：ref 由 key 派生，
+重渲染/刷新后身份不变，因此不需要额外的「ref → 动作」登记表。"
+  (let* ((key (ebasecamp-ui--instance-key group-name record))
+         (ref (ebasecamp-ui--checkbox-ref key)))
     (etaf-view
      (etaf-checkbox
+      :ref ref
       :checked (ebasecamp-ui--selected-p session key)
       :on-change (lambda (next)
                    (ebasecamp-ui--toggle-selected session key next))))))
+
+(defun ebasecamp-ui--ref-at-point (&rest prefixes)
+  "返回 point 所在节点向上最近、名字以 PREFIXES 之一开头的显式 ref 符号。
+找不到返回 nil。实现要点（探针实测）：
+- point 落在 mark / label 文本内部时，最近的 Host 是它自己的生成 ref
+  （`(etaf-host MOUNT-ID ID)'），取不到显式 ref，因此要沿 `ebox-node-parent'
+  逐级向上再试（`etaf-runtime-node-host-ref' 每次跳到最近的已注册 Host）；
+- 返回类型可能是生成 ref（list），只有前缀匹配的**符号**才算命中。"
+  (let* ((runtime (etaf-runtime-for-buffer (current-buffer)))
+         (node (and runtime (ignore-errors (ebox-node-at (point)))))
+         found)
+    (while (and runtime node (not found))
+      (let ((ref (etaf-runtime-node-host-ref runtime node)))
+        (if (and (symbolp ref)
+                 (cl-some (lambda (prefix)
+                            (string-prefix-p prefix (symbol-name ref)))
+                          prefixes))
+            (setq found ref)
+          (setq node (ebox-node-parent node)))))
+    found))
+
+(defun ebasecamp-ui--checkbox-ref-at-point ()
+  "返回 point 所在节点向上最近的服务行 checkbox ref（见 `--select-cell'）。
+找不到返回 nil。只查 checkbox 前缀，是 `--ref-at-point' 的薄封装：行级切换键
+`t' 用通用版本（同时识别行 ref，见 `--toggle-at-point'），测试与探针用它断言
+checkbox ref 的稳定性（见 `checkbox-refs-are-stable'）。"
+  (ebasecamp-ui--ref-at-point ebasecamp-ui--checkbox-ref-prefix))
+
+(defun ebasecamp-ui--toggle-row (session group-name record)
+  "切换 RECORD 这一行的勾选状态，返回 nil。
+`etaf-table' 的 `:on-row-press' 入口（鼠标点击行、焦点在行上按 `RET'）：
+与行级键 `t'（`--toggle-at-point'）写同一个 `--toggle-selected'，不存在第二套
+选中表示。"
+  (let ((key (ebasecamp-ui--instance-key group-name record)))
+    (ebasecamp-ui--toggle-selected
+     session key (not (ebasecamp-ui--selected-p session key)))))
+
+(defun ebasecamp-ui--toggle-at-point ()
+  "切换 point 所在服务行的勾选状态，返回 nil。绑在根级键 `t' 上。
+point 落在行内任意单元格（命中行 ref）或 checkbox 上（命中 checkbox ref）都生效：
+行 ref 先还原出同一行的 checkbox ref，确认该 checkbox 在本 buffer 里已渲染后派发
+`press'，事件落在 checkbox 的 `:on-change' 上。
+point 不在任何服务行上时**静默** no-op（不写 notice）：Tab / 误按时不应刷出提示。
+
+派发方式刻意不用 `etaf-activate'：U4 步骤 0 探针实测它按的是**焦点**宿主
+（无焦点时按 point 处节点的 `RET' 绑定），而界面里段内「启动选中 / 停止选中 /
+重启选中」按钮就在同一 buffer —— 用 activate 会把误触直接变成起停容器。
+`SPC' 不能用作行级切换键：`[32]' 属 `ebox--activation-keys'，节点级
+char-property keymap 先于 etaf 键层，写进 `:keys' 也永远收不到该事件（它仍是 ebox
+的「激活当前控件」语义，见 `spc-activates-checkbox'）。"
+  (interactive)
+  (let* ((runtime (etaf-runtime-for-buffer (current-buffer)))
+         (ref (and runtime
+                   (ebasecamp-ui--ref-at-point
+                    ebasecamp-ui--checkbox-ref-prefix
+                    ebasecamp-ui--row-ref-prefix))))
+    (when ref
+      (let* ((name (symbol-name ref))
+             (check-ref
+              (if (string-prefix-p ebasecamp-ui--checkbox-ref-prefix name)
+                  ref
+                (ebasecamp-ui--checkbox-ref
+                 (substring name (length ebasecamp-ui--row-ref-prefix))))))
+        ;; 只派发已渲染的 checkbox：ref 由 key 派生，未渲染的 ref 没有 handler，
+        ;; `etaf-dispatch-event' 会 signal。
+        (when (etaf-runtime-host-node runtime check-ref)
+          (etaf-dispatch-event runtime check-ref 'press)))))
+  nil)
 
 (defun ebasecamp-ui--state-cell (record)
   "状态列的单元格：semantic badge 呈现状态文案。"
@@ -946,25 +1540,72 @@ DISABLED 为真时禁用 —— `etaf-button' 的 `:disabled' 只接受布尔值
 
 (defun ebasecamp-ui--service-table (session group-name instance)
   "返回段的服务表：列见 `ebasecamp-ui--columns'，行为实例的 `:records'。
-`:row-key' 用段内身份 \"组名/服务名\"，段内唯一。"
+`:row-key' / `:row-ref' 都用段内身份 \"组名/服务名\"（段内唯一）。
+`:on-row-press' 必须给：`etaf-table' 只在「行可交互」时采用调用方提供的
+`:row-ref'（`etaf-ui--table-row-node' 的 `interactive-p' 分支），否则行 Host 退回
+实例内生成 ref，行级切换键 `t' 就取不到行身份；它同时让行可聚焦（`:tab-index 0'）。
+行被按下（鼠标点击、焦点在行上按 `RET'）即切换该行勾选，与 `t' 同语义。"
   (etaf-view
    (etaf-table
     :columns (ebasecamp-ui--columns session group-name)
     :rows (plist-get instance :records)
     :row-key (lambda (record)
-               (ebasecamp-ui--instance-key group-name record)))))
+               (ebasecamp-ui--instance-key group-name record))
+    :row-ref (lambda (record)
+               (ebasecamp-ui--row-ref
+                (ebasecamp-ui--instance-key group-name record)))
+    :on-row-press (lambda (record)
+                    (ebasecamp-ui--toggle-row session group-name record)))))
+
+(defun ebasecamp-ui--section-keys (group-name instance)
+  "返回配置段（GROUP-NAME + INSTANCE）的 `:keys' 列表，每条 (KEY COMMAND LABEL)。
+这是**段级键位的单一事实源**：`ebasecamp-ui--instance-section' 的段 Host 直接
+消费它，测试也断言它的键集合，避免「渲染里绑了但帮助/测试里没有」。
+
+语义（与段头按钮同源）：
+- `s' / `x' / `r' → `ebasecamp-ui--section-action' 传 `start' / `stop' /
+  `restart'，捕获**该段自己的** INSTANCE（不引入「当前段」全局状态，同组多实例
+  不会串段）；
+- `a' / `A' → `ebasecamp-ui--select-instance' 全选 / 全不选**该段**服务。
+
+COMMAND 必须是**无参** command：`etaf--keys-run' 对 commandp 用
+`call-interactively'，所以闭包必须带 `(interactive)'。
+每条的 LABEL 不能省 —— `etaf-help' 会跳过没有 LABEL 的条目。"
+  (let ((session (ebasecamp-ui-session)))
+    (list (list "s" (lambda () (interactive)
+                      (ebasecamp-ui--section-action 'start instance))
+                "启动该段选中")
+          (list "x" (lambda () (interactive)
+                      (ebasecamp-ui--section-action 'stop instance))
+                "停止该段选中")
+          (list "r" (lambda () (interactive)
+                      (ebasecamp-ui--section-action 'restart instance))
+                "重启该段选中")
+          (list "a" (lambda () (interactive)
+                      (ebasecamp-ui--select-instance
+                       session group-name instance t))
+                "全选该段服务")
+          (list "A" (lambda () (interactive)
+                      (ebasecamp-ui--select-instance
+                       session group-name instance nil))
+                "全不选该段服务"))))
 
 (defun ebasecamp-ui--instance-section (session group-name instance)
-  "返回一份配置的段：`etaf-panel'（bordered）。
+  "返回一份配置的段：`etaf-panel'（bordered）包在带 `:keys' 的 `box' Host 里。
+段 Host 声明段级键（见 `ebasecamp-ui--section-keys'）：etaf 键链从 point/焦点
+所在 Host 向上找，因此只有 point 落在本段内时 `s' / `x' / `r' / `a' / `A' 才
+命中；段外按键被根 Host 的 `:key-scope`（值 local）边界吞掉。
 header 槽为段头行（见 `ebasecamp-ui--instance-header'，busy 在渲染期取值）；
 default 槽为分隔线 + 服务表（见 `ebasecamp-ui--service-table'）。"
   (etaf-view
-   (etaf-panel :variant 'bordered :width 'stretch
-     (slot :name 'header
-       (expr (ebasecamp-ui--instance-header
-              instance (ebasecamp-ui--busy-p session))))
-     (etaf-divider)
-     (expr (ebasecamp-ui--service-table session group-name instance)))))
+   (box :width 'stretch
+        :keys (ebasecamp-ui--section-keys group-name instance)
+     (etaf-panel :variant 'bordered :width 'stretch
+       (slot :name 'header
+         (expr (ebasecamp-ui--instance-header
+                instance (ebasecamp-ui--busy-p session))))
+       (etaf-divider)
+       (expr (ebasecamp-ui--service-table session group-name instance))))))
 
 (defun ebasecamp-ui--group-header-row (group)
   "返回右栏顶部的组标题行：组标题 + scope 徽标 + \"N 配置\"。
@@ -1054,10 +1695,205 @@ GROUP 为 state 的组项 plist；服务名取自 `:service-names'（组定义�
   "返回 ebasecamp 主界面的视图（`etaf-view' 规范化后的对象）。"
   (etaf-view (ebasecamp-ui-app)))
 
+;;; 根级键位（单一事实源）
+
+;; 根宿主的 `:keys' 与 `ebasecamp-ui-mode-map' 的兜底绑定都从这里派生/对齐，
+;; 避免「键在渲染里绑了但帮助里没有」「测试断言的集合与实现漂移」。
+;; 键表只列**本阶段已实现**的键：`e'（编辑清单）在 U5、`SPC'（切换勾选）在
+;; U4 加入；完整集合由 U6 的最终断言覆盖。
+
+(declare-function ebasecamp-reload "ebasecamp" ())
+
+(defun ebasecamp-ui--group-names (state)
+  "返回 STATE 里的组名列表（symbol，与 `selected-group' 同类型）。
+顺序与 `:groups' 一致（即左树的组顺序）；组名为空串的组也包含在内 ——
+`n' / `p' 的循环必须与渲染出来的组一一对应，不做任何过滤。纯函数。"
+  (mapcar (lambda (group)
+            (intern (or (plist-get group :name) "")))
+          (plist-get state :groups)))
+
+(defun ebasecamp-ui--set-selected-group (session group)
+  "把 SESSION 的选中组写成 GROUP（symbol 或 nil），并按 GROUP 重建 state。
+写 selected-group 与 state 两个 ref，渲染依赖因此同时失效（树的选择态与
+右栏段同步更新）。返回 nil。"
+  (etaf-set-value (ebasecamp-ui-session-selected-group session) group)
+  (etaf-set-value (ebasecamp-ui-session-state session)
+                  (ebasecamp-ui--build-state group))
+  nil)
+
+(defun ebasecamp-ui--switch-group (step)
+  "按 STEP（1 = 下一个，-1 = 上一个）切换 SESSION 的选中组，返回新组名或 nil。
+无选中组时 STEP 为 1 取第一个、为 -1 取最后一个；有选中组时按 state 里
+`:groups' 的顺序循环，越界回绕。选中的组已不在清单里（例如清单被重载删除）
+时按「无选中组」处理。清单为空时写 info notice 并 no-op（返回 nil）。
+补的是 `etaf-tree' 的缺口：分支节点的 `:on-press' 只做展开/收起，
+`on-select' 只对叶子调用，按 RET 无法选中组。"
+  (let* ((session (ebasecamp-ui-session))
+         (names (ebasecamp-ui--group-names
+                 (etaf-value (ebasecamp-ui-session-state session))))
+         (current (etaf-value (ebasecamp-ui-session-selected-group session)))
+         (index (and current (cl-position current names)))
+         (count (length names)))
+    (cond
+     ((zerop count)
+      (ebasecamp-ui--set-notice session 'info "清单里没有组"
+                                "先在 groups.el 里定义至少一个组")
+      nil)
+     ((null index)
+      (let ((target (if (> step 0) (car names) (car (last names)))))
+        (ebasecamp-ui--set-selected-group session target)
+        target))
+     (t
+      (let ((target (nth (mod (+ index step) count) names)))
+        (ebasecamp-ui--set-selected-group session target)
+        target)))))
+
+(defun ebasecamp-ui--next-group ()
+  "切换到下一个组（末尾回绕），见 `ebasecamp-ui--switch-group'。"
+  (interactive)
+  (ebasecamp-ui--switch-group 1))
+
+(defun ebasecamp-ui--previous-group ()
+  "切换到上一个组（开头回绕），见 `ebasecamp-ui--switch-group'。"
+  (interactive)
+  (ebasecamp-ui--switch-group -1))
+
+(defun ebasecamp-ui--reload-and-refresh ()
+  "重载清单并刷新界面（根级 `g'）。
+界面刷新完全由 `ebasecamp-reload' 内部完成：它检测到界面 buffer 存在时调用
+`ebasecamp-ui-refresh'。这里**不**再手工调用 `ebasecamp-ui-refresh' ——
+否则一次按键会跑两遍 `docker ps'（一次来自 refresh，一次来自状态轮询）。
+返回 `ebasecamp-reload' 的结果 plist。"
+  (interactive)
+  (ebasecamp-reload))
+
+;;; 区域跳转（根级 `1' / `2' / `3'）
+
+(defconst ebasecamp-ui--region-refs
+  '((tree . ebasecamp-ui-tree)
+    (detail . ebasecamp-ui-detail)
+    (footer . ebasecamp-ui-footer))
+  "区域 symbol 到该区域根 Host 的 `:ref' 的映射。
+三个 ref 由 `ebasecamp-ui-app' 的 render 声明（空清单分支没有底栏，因此
+`footer' 可能查不到 Host，见 `ebasecamp-ui--focus-region'）。")
+
+(defun ebasecamp-ui--region-ref (region)
+  "返回 REGION 对应的区域根 `:ref'；未知区域返回 nil。纯函数。"
+  (alist-get region ebasecamp-ui--region-refs))
+
+(defun ebasecamp-ui--focus-region (region)
+  "把焦点移到 REGION 的首个停靠点，返回焦点节点或 nil。
+REGION 取 `tree'（左树）/ `detail'（右栏）/ `footer'（底栏），映射见
+`ebasecamp-ui--region-ref'。
+
+停靠点由 ebox 排序决定，**不保证**落在区域 Host 本身（通常是区域内第一个
+可聚焦控件），因此本函数只承诺「焦点进入该区域子树」。
+
+三类静默 no-op（不 signal、不写 notice）：
+① 未知 REGION；
+② 当前 buffer 没有已挂载的 ETAF 运行时（`M-x' 在别的 buffer 里误触、
+`with-temp-buffer' 里的探针）；
+③ 该区域 Host 未渲染（空清单没有底栏）。
+静默是刻意的：本函数是按键回调，异常不该弹到用户面前。`etaf-focus-within'
+对缺失 Host 会 `user-error'（经 `etaf--event-host-node'），所以「Host 存在」
+必须在调用前判掉。
+
+不传 COUNT：`etaf-focus-within' 的 nil COUNT 即「子树第一个停靠点」。"
+  (interactive
+   (list (intern (completing-read
+                  "跳到区域："
+                  (mapcar (lambda (cell) (symbol-name (car cell)))
+                          ebasecamp-ui--region-refs)
+                  nil t))))
+  (let ((runtime (etaf-runtime-for-buffer (current-buffer)))
+        (ref (ebasecamp-ui--region-ref region)))
+    (when (and runtime ref (etaf-runtime-host-node runtime ref))
+      (etaf-focus-within runtime ref))))
+
+;; 三个零参命令只为给根级键 `1' / `2' / `3' 做绑定用：`etaf--keys-run' 走
+;; `call-interactively'，带 interactive 参数的 `--focus-region' 直接绑上去会在
+;; 按键时去 `completing-read' 问区域。
+(defun ebasecamp-ui--focus-tree ()
+  "跳到左栏（`1'），见 `ebasecamp-ui--focus-region'。"
+  (interactive)
+  (ebasecamp-ui--focus-region 'tree))
+
+(defun ebasecamp-ui--focus-detail ()
+  "跳到右栏（`2'），见 `ebasecamp-ui--focus-region'。"
+  (interactive)
+  (ebasecamp-ui--focus-region 'detail))
+
+(defun ebasecamp-ui--focus-footer ()
+  "跳到底栏（`3'），见 `ebasecamp-ui--focus-region'。"
+  (interactive)
+  (ebasecamp-ui--focus-region 'footer))
+
+(defun ebasecamp-ui--root-keys ()
+  "返回根宿主的 `:keys' 列表，每条为 (KEY COMMAND LABEL)。
+这是根级键位的单一事实源：`ebasecamp-ui-app' 的根 Host 直接消费它，
+`ebasecamp-ui-mode-map' 的兜底绑定与之对齐，测试也断言它的键集合。
+LABEL 必须非空 —— `etaf-help' 会跳过没有 LABEL 的条目，那是键位可发现性的
+唯一来源。
+不能绑框架保留键（`escape' / `M-g' / `C-g' / `?` / Tab 系列 / 方向键）：
+`etaf--keys-validate' 会 signal；需要方向语义时用 `:on-direction'。
+`SPC' **不在**本表：`[32]' 属 ebox 的 `ebox--activation-keys'，节点级
+char-property keymap 先于 etaf 键层，写进来也收不到事件（它由 ebox 内建处理，
+等价于「激活当前控件」= `RET'）；行级切换勾选用 `t'。
+`1' / `2' / `3' 是区域跳转（左栏 / 右栏 / 底栏的首个停靠点）。它们是
+printing key，绑定后 evil 的数字前缀在界面内失效 —— 与 `q' / `g' 同理，
+可接受。"
+  (list (list "q" #'ebasecamp-ui-close "关闭界面")
+        (list "g" #'ebasecamp-ui--reload-and-refresh "重载清单并刷新")
+        (list "n" #'ebasecamp-ui--next-group "下一个组")
+        (list "p" #'ebasecamp-ui--previous-group "上一个组")
+        (list "1" #'ebasecamp-ui--focus-tree "跳到左栏")
+        (list "2" #'ebasecamp-ui--focus-detail "跳到右栏")
+        (list "3" #'ebasecamp-ui--focus-footer "跳到底栏")
+        (list "e" #'ebasecamp-ui-edit-manifest "编辑当前组清单")
+        (list "t" #'ebasecamp-ui--toggle-at-point "切换勾选")
+        (list "I" #'ebasecamp-ui-import-compose "导入 compose")
+        (list "o" #'ebasecamp-ui-export-compose "导出 compose")
+        (list "D" #'ebasecamp-ui-destroy-environment "销毁环境")))
+
+;;; 编辑入口（界面唯一的写入口）
+
+(defun ebasecamp-ui-edit-manifest ()
+  "打开清单 `groups.el' 并把 point 定位到当前选中组的定义（根级 `e'）。
+这是界面**唯一的写入口**：界面 buffer 是只读的（见 `ebasecamp-ui-mode'），
+写只能发生在 `emacs-lisp-mode' 的清单 buffer 里；保存后按 `g' 重载清单并
+刷新界面。本函数只打开文件，不读取也不打印任何密钥值。
+
+三种失败/降级路径：无选中组 → `user-error'；清单文件不存在 → `user-error'
+并提示 `M-x ebasecamp-create-sample-config'；文件里找不到
+`(ebasecamp-define-group <组名>' → 退到文件头并 `message' 说明，**不 signal**
+（清单可以手写，组也可能不在 groups.el 里，定位失败不该阻断编辑）。"
+  (interactive)
+  (let ((group (etaf-value (ebasecamp-ui-session-selected-group
+                            (ebasecamp-ui-session))))
+        (file (expand-file-name "groups.el" ebasecamp-config-directory)))
+    (unless group
+      (user-error "请先在左栏选中一个组"))
+    (unless (file-regular-p file)
+      (user-error "清单文件不存在：%s；先 M-x ebasecamp-create-sample-config" file))
+    (find-file file)
+    (goto-char (point-min))
+    (unless (search-forward (format "(ebasecamp-define-group %s"
+                                    (symbol-name group))
+                            nil t)
+      (goto-char (point-min))
+      (message "未在 groups.el 中找到组 %s 的定义" group))
+    (current-buffer)))
+
 (etaf-define-component ebasecamp-ui-app ()
   "渲染 ebasecamp 主界面：顶栏（标题 + 统计 + 刷新）、组树、右栏配置段。"
   :setup
   (let ((session (ebasecamp-ui-session)))
+    ;; 主题必须在这里 provide（`:setup' 阶段），不能在 `:render' 里 ——
+    ;; `etaf-provide' 有 `etaf--assert-not-rendering' 守卫，render 期调用会
+    ;; signal `etaf-render-side-effect-error (provide-context)'（探针实测）。
+    ;; 传 ref 本身即可（`etaf-theme-provide' 对 ref/computed 保留响应式），
+    ;; 因此 `ebasecamp-ui--refresh-theme' 写 ref 只刷新属性、不重挂载。
+    (etaf-theme-provide ebasecamp-ui--theme)
     (etaf-on-mounted
      (lambda ()
        (ebasecamp-status-start
@@ -1077,19 +1913,38 @@ GROUP 为 state 的组项 plist；服务名取自 `:service-names'（组定义�
     ;; （树自身也读 expanded，这里显式读是为了让骨架整体对两者敏感）。
     (etaf-value (ebasecamp-ui-session-selected-group session))
     (etaf-value (ebasecamp-ui-session-expanded session))
+    ;; 三段式布局（L0 探针结论，见 openspec/completed/2026-10-23-ui-layout-theme-nav.md）：
+    ;; - 根必须是 `flex' 纵向节点：只有 tag 为 `flex' 的节点走 `ebox--layout-flex'，
+    ;;   `column' / `row' 会忽略子节点的 `:flex-grow' / `:flex-shrink'；
+    ;; - 顶栏与底栏 `:flex-shrink 0'（不写会被压缩到 0 行，文本直接从 buffer 消失）；
+    ;; - 中间区 `:flex-grow 1 :min-height '(lh 0)'` 承担全部收缩，因此整窗永不滚动；
+    ;; - 两个 pane 各包一层 `:height 'stretch :overflow 'scroll'` 的列，各自内部滚动
+    ;;   （splitter 的 slot 内容必须显式 `:height 'stretch'`，否则 pane `vh == ch'、
+    ;;   `etaf-scroll-by' 恒返回 0）。
+    ;; 空清单分支没有底栏（只显示空态），因此不声明 `ebasecamp-ui-footer` ref。
     (if (plist-get state :empty-p)
         (etaf-view
-         (box :width 'stretch :padding '((lh 2) (px 3)) :bgcolor "#F8F5EE"
-              (etaf-empty
-               :title "还没有 ebasecamp 清单"
-               :description
-               (format "在 %s 下定义 groups.el 与 projects/*.el 后重新打开。"
-                       ebasecamp-config-directory))))
+         (flex :flex-direction 'column :width 'stretch :height 'stretch
+               :key-scope 'local :keys (ebasecamp-ui--root-keys)
+               :ref 'ebasecamp-ui-root
+               :bgcolor (etaf-theme-token :ui-bg) :color (etaf-theme-token :ui-fg)
+               :padding '((lh 1) (px 2))
+           (box :width 'stretch :flex-grow 1 :min-height '(lh 0)
+                :padding '((lh 2) (px 3))
+             (etaf-empty
+              :title "还没有 ebasecamp 清单"
+              :description
+              (format "在 %s 下定义 groups.el 与 projects/*.el 后重新打开。"
+                      ebasecamp-config-directory)))))
       (etaf-view
-       (column :width 'stretch :height 'stretch :bgcolor "#F8F5EE"
-               :color "#252A2E" :padding '((lh 1) (px 2))
-               :item-gap '(lh 1)
-         (row :width 'stretch :cross-align 'center :item-gap '(ch 2)
+       (flex :flex-direction 'column :width 'stretch :height 'stretch
+             :key-scope 'local :keys (ebasecamp-ui--root-keys)
+             :ref 'ebasecamp-ui-root
+             :bgcolor (etaf-theme-token :ui-bg) :color (etaf-theme-token :ui-fg)
+             :padding '((lh 1) (px 2)) :row-gap '(lh 1)
+         ;; ① 顶栏（固定）
+         (row :ref 'ebasecamp-ui-header :width 'stretch :flex-shrink 0
+              :cross-align 'center :item-gap '(ch 2)
            (etaf-label :text "ebasecamp" :variant 'strong)
            (etaf-label :text (plist-get state :summary) :variant 'muted)
            (box :flex-grow 1)
@@ -1097,17 +1952,37 @@ GROUP 为 state 的组项 plist；服务名取自 `:service-names'（组定义�
                         :ref 'ebasecamp-ui-refresh
                         :on-press (lambda () (ebasecamp-ui-refresh))))
          (etaf-divider)
-         (etaf-splitter
-          :orientation 'horizontal
-          :ratio ebasecamp-ui--split-ratio
-          (slot :name 'first
-            (expr (ebasecamp-ui--tree-view session)))
-          (slot :name 'second
-            (expr (ebasecamp-ui--detail-view session state))))
+         ;; ② 中间区（撑满剩余高度；左右各一个内部滚动容器）
+         (box :ref 'ebasecamp-ui-body :width 'stretch :flex-grow 1
+              :min-height '(lh 0)
+           (etaf-splitter
+            :orientation 'horizontal
+            ;; ratio 传 **ref 本身**（不是 `etaf-value` 的值）：splitter 内部经
+            ;; `etaf-ui--reactive-value' 追踪读取，因此只有它自己在拖动时重渲染，
+            ;; 不会连带整个 `ebasecamp-ui-app` 重建（拖动是逐鼠标移动的高频事件）。
+            :ratio (ebasecamp-ui-session-split-ratio session)
+            :min-ratio ebasecamp-ui--split-ratio-min
+            :max-ratio ebasecamp-ui--split-ratio-max
+            :on-change #'ebasecamp-ui--splitter-on-change
+            (slot :name 'first
+              (column :ref 'ebasecamp-ui-tree :width 'stretch :height 'stretch
+                      :overflow 'scroll
+                (expr (ebasecamp-ui--tree-view session))))
+            (slot :name 'second
+              (column :ref 'ebasecamp-ui-detail :width 'stretch
+                      :height 'stretch :overflow 'scroll
+                ;; 内容列自身 `:height 'stretch'，直接放进滚动列会「被拉成滚动的视口高」
+                ;; （pane 的 ch 等于子节点的 border-box → `vh == ch` → 滚不动）。
+                ;; 中间垫一层 `box'（高度取内容），内容列才恢复自然高度并溢出，滚动生效。
+                (box :width 'stretch
+                  (expr (ebasecamp-ui--detail-view session state)))))))
          (etaf-divider)
-         (expr (ebasecamp-ui--footer-view))
-         (expr (ebasecamp-ui--notice-view session))
-         (ebasecamp-ui-confirm-dialog))))))
+         ;; ③ 底栏（固定）：动作行 + 提示行 + 二次确认框
+         (flex :flex-direction 'column :ref 'ebasecamp-ui-footer
+               :width 'stretch :flex-shrink 0
+           (expr (ebasecamp-ui--footer-view))
+           (expr (ebasecamp-ui--notice-view session))
+           (ebasecamp-ui-confirm-dialog)))))))
 
 ;;; 导入 / 导出入口
 
@@ -1327,11 +2202,22 @@ display-buffer-same-window)))'：batch 实测 `display-buffer-reuse-window' 在
   (interactive)
   (ebasecamp-ui--ensure-manifest)
   (ebasecamp-ui-session)
+  ;; 主题跟随：open 挂钩子、close 卸载（严格对称）。必须在挂载前挂上，首帧即
+  ;; 用最新的 face / 明暗得到配色（挂载后再挂会让首帧用旧 plist）。
+  (ebasecamp-ui--theme-hooks-install)
+  (ebasecamp-ui--refresh-theme)
   (let ((buffer (get-buffer-create ebasecamp-ui-buffer-name))
         (previous (window-buffer (selected-window))))
     (ebasecamp-ui--display-buffer buffer)
     (condition-case err
         (with-current-buffer buffer
+          ;; 主模式必须**先于**挂载建立：`special-mode' 会
+          ;; `kill-all-local-variables'，若放在 `etaf-mount' 之后会清掉 ebox 的
+          ;; buffer-local 挂载状态（`ebox--buffer-mount'），`ebox-focus-scope' /
+          ;; `ebox-node-at' 随即报 "No mounted Ebox tree"，键盘焦点与键层全部
+          ;; 失效（实测）。只读也在这里一次设好：etaf 自己的写入用
+          ;; `inhibit-read-only'，不受影响（U0.2 探针结论）。
+          (ebasecamp-ui-mode)
           (unless (etaf-runtime-for-buffer buffer)
             (etaf-mount buffer (ebasecamp-ui-view))))
       ((error quit)
@@ -1367,8 +2253,13 @@ state 的 running / total 统计由 `ebasecamp-ui--build-state' 经
 
 (defun ebasecamp-ui-close ()
   "关闭主界面：卸载运行时（触发 unmounted 收尾）、kill buffer、停轮询、
-取消提示定时器、销毁会话。返回 nil。"
+取消提示定时器、卸载主题钩子、销毁会话。返回 nil。
+关闭前把左栏宽度占比落盘一次（拖动结束时已存过，这里保证「拖到一半直接关闭」
+也记住；写盘失败不阻断关闭，见 `ebasecamp-ui--save-ui-state'）。"
   (interactive)
+  (ebasecamp-ui--theme-hooks-remove)
+  (when ebasecamp-ui--session
+    (ebasecamp-ui--save-ui-state))
   (when-let* ((buffer (get-buffer ebasecamp-ui-buffer-name)))
     (when-let* ((runtime (etaf-runtime-for-buffer buffer)))
       (etaf-unmount runtime))
@@ -1378,6 +2269,40 @@ state 的 running / total 统计由 `ebasecamp-ui--build-state' 经
     (ebasecamp-ui--cancel-notice-timer session)
     (setq ebasecamp-ui--session nil))
   nil)
+
+;;; 主模式（buffer 身份与键位）
+
+(declare-function evil-set-initial-state "evil" (mode state))
+
+(define-derived-mode ebasecamp-ui-mode special-mode "EBEcamp"
+  "ebasecamp 主界面的主模式。
+派生自 `special-mode'：界面内容由 etaf 渲染，本 buffer 不接受用户编辑 ——
+所有写操作都发生在清单文件（`groups.el' / `projects/*.el'）里，界面只是它的
+投影。因此 body 把 `buffer-read-only' 置为 t，把「写」的能力从界面移除。
+
+键位分两层：etaf 的 Host `:keys' 层（装在 `emulation-mode-map-alists' 最前面，
+优先级更高，负责界面内的全部操作键，见 `ebasecamp-ui--root-keys'）与本模式的
+`ebasecamp-ui-mode-map'（兜底，重绑 `q' 与 `g'）。
+
+**实测事实**：本 map 上的 printing key 会被 etaf 的 runtime 键层遮住 ——
+U1 实测 `(lookup-key ebasecamp-ui-mode-map (kbd \"q\"))` 为
+`ebasecamp-ui-close'，但 `(key-binding (kbd \"q\"))` 返回 `ignore'
+（local 边界对未绑定 printing key 一律回 `ignore'）。因此这里的绑定只是
+「没装 etaf 键层时」的兜底，不能作为界面上按键生效的依赖；界面内按键必须
+声明在根宿主的 `:keys' 里。"
+  (setq-local buffer-read-only t))
+
+;; `special-mode' 自带的 `q' 绑的是 `quit-window'（只切走窗口）；关闭界面必须
+;; 走 `ebasecamp-ui-close'：卸载运行时、停轮询、取消提示定时器、销毁会话。
+;; `g' 同理：`special-mode' 没有 `g' 的默认绑定，这里补的是「etaf 键层不可用」
+;; 时的装饰性兜底（正常路径走根 Host `:keys'）。
+(define-key ebasecamp-ui-mode-map (kbd "q") #'ebasecamp-ui-close)
+(define-key ebasecamp-ui-mode-map (kbd "g") #'ebasecamp-ui--reload-and-refresh)
+
+;; 装了 evil 时让该 mode 一进入就是 normal state（`i' 不再进 insert）。
+;; 不引入 evil 依赖：未装 evil 时 `with-eval-after-load' 永不触发。
+(with-eval-after-load 'evil
+  (evil-set-initial-state 'ebasecamp-ui-mode 'normal))
 
 (provide 'ebasecamp-ui)
 ;;; ebasecamp-ui.el ends here

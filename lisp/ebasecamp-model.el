@@ -1,7 +1,7 @@
 ;;; ebasecamp-model.el --- ebasecamp 清单数据模型 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.2.0
+;; Version: 0.4.0
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 

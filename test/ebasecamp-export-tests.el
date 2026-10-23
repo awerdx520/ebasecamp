@@ -4,7 +4,7 @@
 
 ;; T4.3 导出（清单 → 部署用 compose 文件）的 ERT 测试。
 ;;
-;; 导出语义（见 openspec/active/ebasecamp-m1-m3.md 的 T4.3）：
+;; 导出语义（见 openspec/completed/ebasecamp-m1-m3.md 的 T4.3）：
 ;; - 只导出 per-project 组的服务；shared 组的服务由部署环境自行提供；
 ;; - 不声明 `ebasecamp' external network —— 导出时用项目副本
 ;;   （`copy-ebasecamp-project' + `:shared-network' 置 nil），服务原有的自定义
