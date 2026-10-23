@@ -1,7 +1,7 @@
 ;;; ebasecamp.el --- Emacs 中的 Docker 环境分组管理 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.4.0
+;; Version: 0.5.1
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "29.1") (etaf "0.2.3") (etaf-ui "0.1.3"))
 

@@ -1,7 +1,7 @@
 ;;; ebasecamp-ui.el --- ebasecamp 只读主界面（etaf / etaf-ui） -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.4.0
+;; Version: 0.5.1
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -107,6 +107,7 @@
 (require 'etaf-ui)
 (require 'ebasecamp-model)
 (require 'ebasecamp-config)
+(require 'ebasecamp-config-write)
 (require 'ebasecamp-import)
 (require 'ebasecamp-export)
 (require 'ebasecamp-status)
@@ -1695,6 +1696,557 @@ GROUP 为 state 的组项 plist；服务名取自 `:service-names'（组定义�
   "返回 ebasecamp 主界面的视图（`etaf-view' 规范化后的对象）。"
   (etaf-view (ebasecamp-ui-app)))
 
+;;; 同步输入助手（事件回调 / M-x / ERT 三态统一）
+
+;; `etaf-call-with-input' 只在 Host 事件回调里可用，否则 signal
+;; `etaf-event-error'；下面三个函数把「事件内 / 事件外」两种上下文统一起来，
+;; 导入导出与「清单写操作」（`S' / `E' / `M' / `X'）共用。
+
+(defun ebasecamp-ui--error-text (err)
+  "从错误对象 ERR（`(SYMBOL . DATA)'）取主消息字符串。纯函数。"
+  (let ((data (cdr err)))
+    (cond
+     ((and data (stringp (car data))) (car data))
+     (t (error-message-string err)))))
+
+(defun ebasecamp-ui--error-detail (err)
+  "从错误对象 ERR 取可展示的细节（DATA 中主消息之后的项）；无则 nil。纯函数。"
+  (let ((rest (cddr err)))
+    (when rest
+      (mapconcat (lambda (item) (if (stringp item) item (format "%S" item)))
+                 rest "\n"))))
+
+(defun ebasecamp-ui--call-with-input (reader)
+  "在有 etaf 事件上下文时用 `etaf-call-with-input' 执行 READER，否则直接执行。
+`etaf-call-with-input' 只在 Host 事件回调（按钮 `:on-press'）里可用，否则
+signal `etaf-event-error'；因此 `M-x' 直接调用与 ERT 场景降级为裸调用。
+只捕获该错误类型：READER 自身的错误必须原样上抛，否则会被执行两次。"
+  (if (fboundp 'etaf-call-with-input)
+      (condition-case nil
+          (etaf-call-with-input reader)
+        (etaf-event-error (funcall reader)))
+    (funcall reader)))
+
+;;; 清单写操作（W4：服务编辑 dialog + `S' / `E' / `M' / `X'）
+
+;; 界面 buffer 仍然只读（ADR-0003）：写操作全部经 `ebasecamp-config-write' 的实体
+;; 操作落盘（内部走 `ebasecamp-manifest--write-transaction'：备份 → 原子写 →
+;; 仅新增错误才回滚 → 先检测外部修改），界面只是清单的投影。
+;;
+;; 三条 W0.3 实测约束决定了实现形态：
+;; ① `etaf-dialog' 的 buffer 文本**永远不含** dialog 内容（root-layer 投影）→
+;;    字段值只能存 `etaf-ref' 并由回调读回，测试断言 ref 而非文本；
+;; ② `:ref' 只接受 symbol / function / nil（传 `etaf-ref' 对象会报错）→ 字段用
+;;    `:bind' 绑 ref，按钮用 symbol ref；
+;; ③ `slot :name 'footer` 必须是 dialog 的**直接子项**（嵌进 column 会报
+;;    `Unresolved View item: footer`）；
+;; ④ 写盘 + 重载是重活，放在 `etaf-next-tick' 里执行，让「保存中」先渲染。
+
+(defvar ebasecamp-ui--service-editor nil
+  "服务编辑 dialog 的 ref 注册表（plist）。
+键：`:open' / `:group'（组名字符串）/ `:service'（服务名字符串）/ `:original'（打开
+时的 6 字段文本 alist）/ `:image' / `:ports' / `:environment' / `:volumes' /
+`:command' / `:restart' / `:error'。全部是 `etaf-ref'（统一形态，无需区分
+「ref 还是值」）。
+由 `ebasecamp-ui-service-dialog' 的 `:bindings' 在挂载时写入；未打开过界面时为 nil。
+测试与 `--open-service-editor' / `--service-dialog-save' 都从这里取 ref。")
+
+(defconst ebasecamp-ui--service-field-parsers
+  '((:image . ebasecamp-config-write-text-to-image)
+    (:ports . ebasecamp-config-write-text-to-ports)
+    (:environment . ebasecamp-config-write-text-to-environment)
+    (:volumes . ebasecamp-config-write-text-to-volumes)
+    (:command . ebasecamp-config-write-text-to-command)
+    (:restart . ebasecamp-config-write-text-to-restart))
+  "服务表单字段 → 文本解析函数（W2 的 `text-to-*'，失败时 `user-error' 带行号）。
+顺序即错误报告顺序：镜像优先（它是唯一必填字段）。")
+
+(defun ebasecamp-ui--service-editor-new ()
+  "创建服务编辑 dialog 的 ref 注册表，记进 `ebasecamp-ui--service-editor' 并返回。
+只能在组件 `:bindings'（或其它非渲染期）调用 —— `etaf-ref' 禁止在 `:render' 内创建。"
+  (setq ebasecamp-ui--service-editor
+        (list :open (etaf-ref nil :name 'ebasecamp-ui-service-open)
+              :group (etaf-ref nil :name 'ebasecamp-ui-service-group)
+              :service (etaf-ref nil :name 'ebasecamp-ui-service-service)
+              :original (etaf-ref nil :name 'ebasecamp-ui-service-original)
+              :image (etaf-ref "" :name 'ebasecamp-ui-service-image)
+              :ports (etaf-ref "" :name 'ebasecamp-ui-service-ports)
+              :environment (etaf-ref "" :name 'ebasecamp-ui-service-environment)
+              :volumes (etaf-ref "" :name 'ebasecamp-ui-service-volumes)
+              :command (etaf-ref "" :name 'ebasecamp-ui-service-command)
+              :restart (etaf-ref "" :name 'ebasecamp-ui-service-restart)
+              :error (etaf-ref nil :name 'ebasecamp-ui-service-error))))
+
+(defun ebasecamp-ui--service-field-text (service)
+  "返回 SERVICE（`ebasecamp-service' 对象）的 6 个表单字段文本，alist 形态。
+多行字段保留换行（`ports' / `environment' / `volumes' 每行一条，`command' 每行
+一个参数）；`${VAR}' 与相对路径原样输出（不做任何插值）。"
+  (list (cons :image (or (ebasecamp-service-image service) ""))
+        (cons :ports (ebasecamp-config-write-ports-to-text
+                      (ebasecamp-service-ports service)))
+        (cons :environment (ebasecamp-config-write-environment-to-text
+                            (ebasecamp-service-environment service)))
+        (cons :volumes (ebasecamp-config-write-volumes-to-text
+                        (ebasecamp-service-volumes service)))
+        (cons :command (ebasecamp-config-write-command-to-text
+                        (ebasecamp-service-command service)))
+        (cons :restart (ebasecamp-config-write-restart-to-text
+                        (ebasecamp-service-restart service)))))
+
+(defun ebasecamp-ui--service-field-changes (editor)
+  "把 EDITOR 里**改动过**的字段解析成 `-update-service-fields' 的属性 plist。
+只返回文本与 `:original' 不同的字段：未改动的字段不进写盘请求，因此 shell 形式的
+`command' 原值（字符串）不会被强制改写成 exec 形式列表（W2 口径：shell 形式不在
+表单编辑范围内）。
+任一字段解析失败即 `user-error'（消息带行号，直接取自 W2 的 `text-to-*'）。"
+  (let ((original (etaf-value (plist-get editor :original)))
+        (fields nil))
+    (dolist (cell ebasecamp-ui--service-field-parsers)
+      (let ((key (car cell))
+            (text (etaf-value (plist-get editor (car cell)))))
+        (unless (equal text (alist-get key original))
+          (setq fields (append fields
+                               (list key (funcall (cdr cell) text)))))))
+    fields))
+
+(defun ebasecamp-ui--restart-options (current)
+  "返回 `etaf-select' 的 restart 选项（alist）。
+固定含「默认」（空串）+ 四个枚举 + 当前值（free-form 如 `on-failure:5' 必须作为
+一个选项出现，否则 `etaf-select' 会因「值不在 options 里」报错）+「自定义…」。"
+  (append '(("" . "（默认）"))
+          (mapcar (lambda (value) (cons value value))
+                  ebasecamp-config-write-restart-values)
+          (when (and (stringp current)
+                     (not (string-empty-p current))
+                     (not (member current ebasecamp-config-write-restart-values)))
+            (list (cons current current)))
+          '(("__custom__" . "自定义…"))))
+
+(defun ebasecamp-ui--service-dialog-error-view (text)
+  "错误提示视图：TEXT 非空时返回 danger label，否则 nil（占 0 行）。
+dialog 内容不进 buffer 文本（W0.3），这里是校验错误的**唯一**展示位。"
+  (when (and (stringp text) (not (string-empty-p text)))
+    (etaf-view (etaf-label :text text :variant 'danger))))
+
+(etaf-define-component ebasecamp-ui-service-dialog ()
+  "服务字段编辑 dialog（根级 `S'）。
+组件**始终挂载**：`:open' 为 nil 时 dialog 不显示，但 `:bindings' 里的 ref 一直
+可用，`ebasecamp-ui--open-service-editor' 因此能在打开前把 6 个字段与 `:open'
+一次写完（`etaf-batch' 只发布一次）。
+`slot :name \\='footer\\='` 是 dialog 的直接子项（W0.3 约束 ③）；内容文案不落 buffer，
+所以错误只用 `--service-dialog-error-view' 渲染、靠 `:error' ref 断言。"
+  :bindings ((editor (ebasecamp-ui--service-editor-new)))
+  :render
+  (etaf-view
+   (etaf-dialog
+    :open (plist-get editor :open)
+    :title "编辑服务"
+    :width '(ch 56)
+    :close-label nil
+    :on-close (lambda () (etaf-set-value (plist-get editor :open) nil))
+    (column :width 'stretch :item-gap '(lh 1)
+      (etaf-label :text (format "%s / %s"
+                                (or (etaf-value (plist-get editor :group)) "")
+                                (or (etaf-value (plist-get editor :service)) ""))
+                  :variant 'muted)
+      (etaf-text-input :bind (plist-get editor :image)
+                       :label "镜像（image）"
+                       :ref 'ebasecamp-ui-service-image)
+      (etaf-text-input :bind (plist-get editor :ports)
+                       :label "端口（每行 HOST:CONTAINER）" :rows 4
+                       :ref 'ebasecamp-ui-service-ports)
+      (etaf-text-input :bind (plist-get editor :environment)
+                       :label "环境变量（每行 KEY=VALUE）" :rows 4
+                       :ref 'ebasecamp-ui-service-environment)
+      (etaf-text-input :bind (plist-get editor :volumes)
+                       :label "卷（每行 SRC:DST[:ro]）" :rows 4
+                       :ref 'ebasecamp-ui-service-volumes)
+      (etaf-text-input :bind (plist-get editor :command)
+                       :label "命令（每行一个参数）" :rows 3
+                       :ref 'ebasecamp-ui-service-command)
+      (etaf-select :value (etaf-value (plist-get editor :restart))
+                   :options (ebasecamp-ui--restart-options
+                             (etaf-value (plist-get editor :restart)))
+                   :label "重启策略（restart）"
+                   :presentation 'dropdown
+                   :ref 'ebasecamp-ui-service-restart
+                   :on-change
+                   (lambda (value)
+                     (if (equal value "__custom__")
+                         (let ((text (ebasecamp-ui--call-with-input
+                                      (lambda ()
+                                        (read-string "重启策略（如 on-failure:5）： ")))))
+                           (when (and (stringp text)
+                                      (not (string-empty-p (string-trim text))))
+                             (etaf-set-value (plist-get editor :restart)
+                                             (string-trim text))))
+                       (etaf-set-value (plist-get editor :restart) value))))
+      (expr (ebasecamp-ui--service-dialog-error-view
+             (etaf-value (plist-get editor :error)))))
+    (slot :name 'footer
+      (row :width 'stretch :cross-align 'center :item-gap '(ch 2)
+        (etaf-button :label "取消" :variant 'secondary
+                     :ref 'ebasecamp-ui-service-cancel
+                     :on-press (lambda ()
+                                 (etaf-set-value (plist-get editor :open) nil)))
+        (etaf-button :label "保存" :variant 'primary
+                     :ref 'ebasecamp-ui-service-save
+                     :on-press (lambda () (ebasecamp-ui--service-dialog-save))))))))
+
+(defun ebasecamp-ui--row-key-at-point ()
+  "返回 point 所在服务行的段内身份 `\"组名/服务名\"`；不在服务行时返回 nil。
+行 ref 与 checkbox ref 都接受（点在勾选框上也应能编辑该行服务），两者前缀不同
+但后缀是同一个 key（`ebasecamp-ui--instance-key'）。"
+  (let ((ref (ebasecamp-ui--ref-at-point ebasecamp-ui--row-ref-prefix
+                                         ebasecamp-ui--checkbox-ref-prefix)))
+    (when ref
+      (let ((name (symbol-name ref)))
+        (if (string-prefix-p ebasecamp-ui--row-ref-prefix name)
+            (substring name (length ebasecamp-ui--row-ref-prefix))
+          (substring name (length ebasecamp-ui--checkbox-ref-prefix)))))))
+
+(defun ebasecamp-ui--split-instance-key (key)
+  "把 KEY（`\"组名/服务名\"`）按**首个** `/` 切成 `(组名 服务名)`，都是字符串。
+不用 `split-string' 默认的全切：服务名本身可能不含 `/`，但用首个 `/` 是计划
+明确的口径，避免任何歧义。无法切分时 `user-error'。"
+  (let ((slash (string-match "/" key)))
+    (unless slash
+      (user-error "无法从行标识 %s 解析组名与服务名" key))
+    (list (substring key 0 slash) (substring key (1+ slash)))))
+
+(defun ebasecamp-ui--open-service-editor ()
+  "编辑 point 所在服务（根级 `S'）：预填 6 个字段并打开 dialog，返回 t。
+定位链：`--ref-at-point' 取行 / checkbox ref → 剥前缀得 `组名/服务名' →
+`ebasecamp-model-group' + `ebasecamp-group-services' 取服务对象（**从组定义**
+取值而非改后 model 归一化，未编辑字段写回时由写盘层从原文 plist 保真）→
+`--service-field-text' 渲染 6 个字段文本 → `etaf-batch' 一次写完并置 `:open'。
+point 不在服务行 / 清单里查不到该服务 → `user-error'。"
+  (interactive)
+  (let ((editor ebasecamp-ui--service-editor))
+    (unless editor
+      (user-error "服务编辑框未就绪（先打开 ebasecamp 主界面）"))
+    (let ((key (or (ebasecamp-ui--row-key-at-point)
+                   (user-error "请把光标移到服务行"))))
+      (pcase-let ((`(,group ,service) (ebasecamp-ui--split-instance-key key)))
+        (let* ((group-object (ebasecamp-model-group (intern group)))
+               (service-object
+                (and group-object
+                     (cl-find service (ebasecamp-group-services group-object)
+                              :key (lambda (item)
+                                     (symbol-name (ebasecamp-service-name item)))
+                              :test #'equal))))
+          (unless service-object
+            (user-error "清单里找不到组 %s 的服务 %s" group service))
+          (let ((texts (ebasecamp-ui--service-field-text service-object)))
+            (etaf-batch
+              (etaf-set-value (plist-get editor :group) group)
+              (etaf-set-value (plist-get editor :service) service)
+              (etaf-set-value (plist-get editor :original) texts)
+              (dolist (cell ebasecamp-ui--service-field-parsers)
+                (etaf-set-value (plist-get editor (car cell))
+                                (alist-get (car cell) texts)))
+              (etaf-set-value (plist-get editor :error) nil)
+              (etaf-set-value (plist-get editor :open) t)))
+          t)))))
+
+(defun ebasecamp-ui--service-dialog-save ()
+  "服务编辑 dialog 的保存回调：本地解析 → 写盘 → 重载刷新 → 关闭，返回 t 或 nil。
+失败路径**不关闭**：解析失败（W2 的 `user-error' 带行号）与写盘失败（事务回滚后
+signal）都把消息写进 `:error' ref 并保持 dialog 打开，用户可继续修正。
+无字段改动 → 直接关闭且不写盘。
+写盘放在 `etaf-next-tick'：让「保存中」先渲染；batch / 非批处理上下文里它立即执行。"
+  (interactive)
+  (let ((editor ebasecamp-ui--service-editor))
+    (unless editor
+      (user-error "服务编辑框未就绪（先打开 ebasecamp 主界面）"))
+    (condition-case err
+        (let ((fields (ebasecamp-ui--service-field-changes editor))
+              (group (etaf-value (plist-get editor :group)))
+              (service (etaf-value (plist-get editor :service))))
+          (etaf-set-value (plist-get editor :error) nil)
+          (cond
+           ((null fields)
+            (etaf-set-value (plist-get editor :open) nil)
+            nil)
+           (t
+            (let ((open (plist-get editor :open))
+                  (error-ref (plist-get editor :error))
+                  (session (ebasecamp-ui-session)))
+              (etaf-next-tick
+               (lambda ()
+                 (condition-case write-error
+                     (progn
+                       (ebasecamp-config-write-update-service-fields
+                        group service fields)
+                       (etaf-set-value open nil)
+                       (ebasecamp-ui--after-write
+                        session group "服务已更新"
+                        (format "%s / %s" group service)))
+                   ((error quit)
+                    (etaf-set-value error-ref
+                                    (error-message-string write-error))))))
+              t))))
+      (user-error
+       (etaf-set-value (plist-get editor :error) (error-message-string err))
+       nil))))
+
+(defun ebasecamp-ui--prompt (prompt &optional collection require-match initial)
+  "在事件回调安全地问一句并返回字符串（`completing-read'）。
+COLLECTION 为 nil 时允许自由输入（新增实体名用）。事件上下文里经
+`etaf-call-with-input' 走 Ebox 的输入边界；`M-x' / ERT 场景降级为裸调用
+（见 `ebasecamp-ui--call-with-input'）。"
+  (ebasecamp-ui--call-with-input
+   (lambda () (completing-read prompt collection nil require-match initial))))
+
+(defun ebasecamp-ui--confirm (prompt)
+  "在事件回调安全地做一次 y-or-n 确认；用户否决时 `user-error'「已取消」。"
+  (unless (ebasecamp-ui--call-with-input (lambda () (y-or-n-p prompt)))
+    (user-error "已取消")))
+
+(defun ebasecamp-ui--read-name (prompt &optional initial)
+  "收集一个实体名（允许自由输入），返回去首尾空白的字符串。
+空输入 `user-error'；名字合法性与唯一性由写盘层校验（`--entity-name' / D2），
+界面层不重复实现。"
+  (let ((text (string-trim (ebasecamp-ui--prompt prompt nil nil initial))))
+    (when (string-empty-p text)
+      (user-error "%s不能为空" prompt))
+    text))
+
+(defun ebasecamp-ui--group-name-strings ()
+  "返回清单里全部组名（字符串），供 `completing-read' 使用。"
+  (mapcar (lambda (group) (symbol-name (ebasecamp-group-name group)))
+          (ebasecamp-model-groups)))
+
+(defun ebasecamp-ui--require-project (prompt)
+  "用 `completing-read' 从清单里选一个已存在的项目，返回项目名 symbol。
+清单无项目时 `user-error'（与 `--read-project' 的「安静返回 nil」不同：这里是
+写操作的必要参数，静默返回会让调用方在半途放弃）。"
+  (let ((names (mapcar (lambda (project)
+                         (symbol-name (ebasecamp-project-name project)))
+                       (ebasecamp-model-projects))))
+    (unless names
+      (user-error "清单里没有项目"))
+    (intern (ebasecamp-ui--prompt prompt names t))))
+
+(defun ebasecamp-ui--require-group (group)
+  "返回选中组 GROUP（symbol）的字符串名；无选中组时 `user-error'。"
+  (unless group
+    (user-error "请先在左栏选中一个组"))
+  (symbol-name group))
+
+(defun ebasecamp-ui--require-group-object (group-object)
+  "返回选中的组对象 GROUP-OBJECT；未选中或清单里查不到时 `user-error'。"
+  (unless group-object
+    (user-error "请先在左栏选中一个组"))
+  group-object)
+
+(defun ebasecamp-ui--choose-config (group-object prompt)
+  "返回 GROUP-OBJECT 里要操作的配置名（symbol）。
+只有 1 份配置时直接返回（不提问，`M' / `E' 因此在单配置组上只问必要参数）；
+多份时用 `completing-read' 选。组内无配置 → `user-error'。"
+  (let ((configs (ebasecamp-model-group-configs group-object)))
+    (cond
+     ((null configs)
+      (user-error "组 %s 没有任何配置" (ebasecamp-group-name group-object)))
+     ((null (cdr configs))
+      (car (car configs)))
+     (t
+      (intern (ebasecamp-ui--prompt
+               prompt
+               (mapcar (lambda (cell) (symbol-name (car cell))) configs)
+               t))))))
+
+(defun ebasecamp-ui--after-write (session group title message)
+  "写操作成功后的统一收尾：成功 notice → 重载清单（内部刷新界面）→ 恢复选中组。
+GROUP 为组名字符串：写后该组仍存在才恢复选中，否则清空选中（不留指向已删除组的
+悬空选择）。展开状态是会话里的 key 列表，重载后 key 不变，无需重设。"
+  (when session
+    (ebasecamp-ui--set-notice session 'success title message))
+  (ebasecamp-reload)
+  (when session
+    (let ((name (and (stringp group) (intern group))))
+      (ebasecamp-ui--set-selected-group
+       session (and name (ebasecamp-model-group name) name))))
+  nil)
+
+(defun ebasecamp-ui--open-config-editor ()
+  "改当前配置关联的项目（根级 `E'），返回 `--after-write' 的结果或 nil。
+链路：选中组 → 选配置（单配置组不提问）→ `completing-read' 选项目（当前配置的
+项目作为默认输入）→ `ebasecamp-config-write-update-config-project'（D2 冲突由
+写盘层拒绝）→ 重载刷新并保留选中组。
+`quit'（用户取消）静默返回 nil；写盘错误转成 error notice。"
+  (interactive)
+  (let* ((session (ebasecamp-ui-session))
+         (group (etaf-value (ebasecamp-ui-session-selected-group session)))
+         (group-name (ebasecamp-ui--require-group group))
+         (group-object (or (ebasecamp-model-group group)
+                           (user-error "清单里找不到组 %s" group)))
+         (config (ebasecamp-ui--choose-config group-object "要改的配置： "))
+         (current (ebasecamp-model-config-project
+                   (cdr (assoc config (ebasecamp-model-group-configs group-object)))))
+         (names (mapcar (lambda (project)
+                          (symbol-name (ebasecamp-project-name project)))
+                        (ebasecamp-model-projects)))
+         (_ (unless names (user-error "清单里没有项目")))
+         (project (intern (ebasecamp-ui--prompt
+                           (format "新项目（当前 %s）： " (or current "无"))
+                           names t (and current (symbol-name current))))))
+    (condition-case err
+        (progn
+          (ebasecamp-config-write-update-config-project
+           group-name config project)
+          (ebasecamp-ui--after-write session group-name
+                                     "配置已更新"
+                                     (format "%s → %s" config project)))
+      (quit nil)
+      (error
+       (ebasecamp-ui--set-notice session 'error "更新配置失败"
+                                 (error-message-string err))
+       nil))))
+
+(defun ebasecamp-ui--move-config ()
+  "把选中组的配置移到「其他组 + 项目」（根级 `M'），返回 `--after-write' 结果或 nil。
+链路：选中组 → 选配置（单配置组不提问）→ 选目标组（候选里排除当前组）→ 选目标
+项目 → `ebasecamp-config-write-move-config'（**一次事务**内源组移除 + 目标组追加）。
+没有其它组可接收时 `user-error'。"
+  (interactive)
+  (let* ((session (ebasecamp-ui-session))
+         (group (etaf-value (ebasecamp-ui-session-selected-group session)))
+         (group-name (ebasecamp-ui--require-group group))
+         (group-object (or (ebasecamp-model-group group)
+                           (user-error "清单里找不到组 %s" group)))
+         (config (ebasecamp-ui--choose-config group-object "要移动的配置： "))
+         (targets (delq nil (mapcar (lambda (other)
+                                      (let ((name (ebasecamp-group-name other)))
+                                        (unless (eq name group)
+                                          (symbol-name name))))
+                                    (ebasecamp-model-groups))))
+         (_ (unless targets (user-error "没有其它组可以接收配置")))
+         (target (intern (ebasecamp-ui--prompt "目标组： " targets t)))
+         (project (ebasecamp-ui--require-project "目标项目： ")))
+    (condition-case err
+        (progn
+          (ebasecamp-config-write-move-config
+           group-name (symbol-name config) (symbol-name target) project)
+          (ebasecamp-ui--after-write session (symbol-name target)
+                                     "配置已移动"
+                                     (format "%s → %s / %s"
+                                             config target project)))
+      (quit nil)
+      (error
+       (ebasecamp-ui--set-notice session 'error "移动配置失败"
+                                 (error-message-string err))
+       nil))))
+
+(defconst ebasecamp-ui--manifest-menu-items
+  '("新建配置" "删除配置" "新建项目" "改项目" "删除项目"
+    "新建组" "改组" "删除组")
+  "根级 `X' 的清单操作菜单项（顺序即提示顺序）。")
+
+(defconst ebasecamp-ui--scope-choices '("shared" "per-project")
+  "组 scope 的可选值（字符串形态供 `completing-read'；与
+`ebasecamp-model--scopes' 一致）。")
+
+(defun ebasecamp-ui--manifest-menu ()
+  "清单操作菜单（根级 `X'）：配置 / 项目 / 组的 CRUD 统一收在一个
+`completing-read' 里，逐项收集参数后调写盘层，成功后重载刷新。
+删除类操作都先 `y-or-n-p' 确认，文案写明「只删清单定义，容器需用 `D' 销毁」
+（AGENTS 禁止删除容器）。通用收尾：
+- 用户取消（`quit'）→ 静默返回 nil；
+- 写盘失败（`user-error' / `ebasecamp-config-write-error'）→ error notice，
+  文案取 `error-message-string'（事务回滚后的消息已含原因）。"
+  (interactive)
+  (let* ((session (ebasecamp-ui-session))
+         (group (etaf-value (ebasecamp-ui-session-selected-group session)))
+         (group-object (and group (ebasecamp-model-group group))))
+    (condition-case err
+        (let ((choice (ebasecamp-ui--prompt "清单操作： "
+                                            ebasecamp-ui--manifest-menu-items t))
+              (notice-group (and group (symbol-name group))))
+          (pcase choice
+            ("新建配置"
+             (let ((config (ebasecamp-ui--read-name "配置名： ")))
+               (ebasecamp-config-write-add-config
+                (ebasecamp-ui--require-group group)
+                config
+                (ebasecamp-ui--require-project "关联项目： "))))
+            ("删除配置"
+             (let ((config (ebasecamp-ui--choose-config
+                            (ebasecamp-ui--require-group-object group-object)
+                            "要删除的配置： ")))
+               (ebasecamp-ui--confirm
+                (format "从组 %s 删除配置 %s？只删清单定义，容器需用 D 销毁。"
+                        group config))
+               (ebasecamp-config-write-remove-config
+                (ebasecamp-ui--require-group group) config)))
+            ("新建项目"
+             (let ((name (ebasecamp-ui--read-name "新项目名： "))
+                   (title (ebasecamp-ui--read-name "项目标题： "))
+                   (root (ebasecamp-ui--read-name
+                          "项目根目录： "
+                          (directory-file-name default-directory))))
+               (setq notice-group nil)
+               (ebasecamp-config-write-add-project name title root)))
+            ("改项目"
+             (let* ((name (ebasecamp-ui--require-project "要改的项目： "))
+                    (project (ebasecamp-model-project name))
+                    (title (ebasecamp-ui--read-name
+                            "新标题： " (or (ebasecamp-project-title project) "")))
+                    (root (ebasecamp-ui--read-name
+                           "新根目录： "
+                           (or (ebasecamp-project-root project)
+                               (directory-file-name default-directory)))))
+               (setq notice-group nil)
+               (ebasecamp-config-write-update-project name title root)))
+            ("删除项目"
+             (let ((name (ebasecamp-ui--require-project "要删除的项目： ")))
+               (ebasecamp-ui--confirm
+                (format "删除项目 %s？只删清单文件，容器需用 D 销毁。" name))
+               (setq notice-group nil)
+               (ebasecamp-config-write-remove-project name)))
+            ("新建组"
+             (let ((name (ebasecamp-ui--read-name "新组名： "))
+                   (title (ebasecamp-ui--read-name "组标题： "))
+                   (scope (ebasecamp-ui--prompt "scope： "
+                                                ebasecamp-ui--scope-choices t)))
+               (ebasecamp-config-write-add-group name title scope)
+               (setq notice-group name)))
+            ("改组"
+             (let* ((target (or (and group (symbol-name group))
+                                (ebasecamp-ui--prompt
+                                 "要改的组： "
+                                 (ebasecamp-ui--group-name-strings) t)))
+                    (target-object (ebasecamp-model-group (intern target)))
+                    (title (ebasecamp-ui--read-name
+                            "新标题： " (or (ebasecamp-group-title target-object) "")))
+                    (scope (ebasecamp-ui--prompt
+                            (format "scope（当前 %s）： "
+                                    (ebasecamp-group-scope target-object))
+                            ebasecamp-ui--scope-choices t
+                            (symbol-name (ebasecamp-group-scope target-object)))))
+               (ebasecamp-config-write-update-group target title scope)
+               (setq notice-group target)))
+            ("删除组"
+             (let* ((target (or (and group (symbol-name group))
+                                (ebasecamp-ui--prompt
+                                 "要删除的组： "
+                                 (ebasecamp-ui--group-name-strings) t)))
+                    (target-object (ebasecamp-model-group (intern target))))
+               (ebasecamp-ui--confirm
+                (format
+                 "删除组 %s（%d 份配置、%d 个服务）？只删清单定义，容器需用 D 销毁。"
+                 target
+                 (length (ebasecamp-model-group-configs target-object))
+                 (length (ebasecamp-group-services target-object))))
+               (ebasecamp-config-write-remove-group target)
+               (setq notice-group nil))))
+          (ebasecamp-ui--after-write session notice-group "清单已更新" choice))
+      (quit nil)
+      (error
+       (ebasecamp-ui--set-notice session 'error "清单操作失败"
+                                 (error-message-string err))
+       nil))))
+
 ;;; 根级键位（单一事实源）
 
 ;; 根宿主的 `:keys' 与 `ebasecamp-ui-mode-map' 的兜底绑定都从这里派生/对齐，
@@ -1850,6 +2402,10 @@ printing key，绑定后 evil 的数字前缀在界面内失效 —— 与 `q' /
         (list "2" #'ebasecamp-ui--focus-detail "跳到右栏")
         (list "3" #'ebasecamp-ui--focus-footer "跳到底栏")
         (list "e" #'ebasecamp-ui-edit-manifest "编辑当前组清单")
+        (list "S" #'ebasecamp-ui--open-service-editor "编辑服务")
+        (list "E" #'ebasecamp-ui--open-config-editor "编辑配置")
+        (list "M" #'ebasecamp-ui--move-config "移动配置")
+        (list "X" #'ebasecamp-ui--manifest-menu "清单操作")
         (list "t" #'ebasecamp-ui--toggle-at-point "切换勾选")
         (list "I" #'ebasecamp-ui-import-compose "导入 compose")
         (list "o" #'ebasecamp-ui-export-compose "导出 compose")
@@ -1858,30 +2414,51 @@ printing key，绑定后 evil 的数字前缀在界面内失效 —— 与 `q' /
 ;;; 编辑入口（界面唯一的写入口）
 
 (defun ebasecamp-ui-edit-manifest ()
-  "打开清单 `groups.el' 并把 point 定位到当前选中组的定义（根级 `e'）。
+  "打开当前选中组**定义所在**的清单文件并定位到该组的定义（根级 `e'）。
 这是界面**唯一的写入口**：界面 buffer 是只读的（见 `ebasecamp-ui-mode'），
 写只能发生在 `emacs-lisp-mode' 的清单 buffer 里；保存后按 `g' 重载清单并
 刷新界面。本函数只打开文件，不读取也不打印任何密钥值。
 
-三种失败/降级路径：无选中组 → `user-error'；清单文件不存在 → `user-error'
-并提示 `M-x ebasecamp-create-sample-config'；文件里找不到
-`(ebasecamp-define-group <组名>' → 退到文件头并 `message' 说明，**不 signal**
-（清单可以手写，组也可能不在 groups.el 里，定位失败不该阻断编辑）。"
+文件由 `ebasecamp-config-write--manifest-file-for-group' 按组名跨文件定位——
+组可能在 `groups.el'，也可能在 `projects/*.el'（导入层就把组写进项目文件），
+不再固定打开 `groups.el'。三条降级路径都不阻断编辑：
+- 无选中组 → `user-error'；
+- 定位失败（清单里没有该组 / 同名组重复定义）→ 先 `message' 说明原因，再退到
+  `groups.el'（不存在则退到第一个项目文件）；连可编辑的清单文件都没有 →
+  `user-error' 提示 `ebasecamp-create-sample-config' / `X' 新建组；
+- 文件里搜不到 `(ebasecamp-define-group <组名>' → 退到文件头并 `message'，
+  **不 signal**（清单可以手写，定位失败不该阻断编辑）。"
   (interactive)
   (let ((group (etaf-value (ebasecamp-ui-session-selected-group
                             (ebasecamp-ui-session))))
-        (file (expand-file-name "groups.el" ebasecamp-config-directory)))
+        (file nil))
     (unless group
       (user-error "请先在左栏选中一个组"))
-    (unless (file-regular-p file)
-      (user-error "清单文件不存在：%s；先 M-x ebasecamp-create-sample-config" file))
+    (setq file
+          (condition-case err
+              (ebasecamp-config-write--manifest-file-for-group group)
+            (user-error
+             (message "%s" (error-message-string err))
+             nil)))
+    ;; 降级：定位失败也要能编辑——优先 groups.el（新组的自然落点），其次第一个
+    ;; 项目文件（组本来就写在项目文件里的清单形态）。
+    (unless file
+      (let ((groups (expand-file-name "groups.el" ebasecamp-config-directory)))
+        (setq file (if (file-regular-p groups)
+                       groups
+                     (car (ebasecamp-config--project-files
+                           ebasecamp-config-directory))))))
+    (unless (and file (file-regular-p file))
+      (user-error "清单里没有组 %s，也没有可编辑的清单文件：%s；先 M-x ebasecamp-create-sample-config 或按 X 新建组"
+                  group ebasecamp-config-directory))
     (find-file file)
     (goto-char (point-min))
     (unless (search-forward (format "(ebasecamp-define-group %s"
                                     (symbol-name group))
                             nil t)
       (goto-char (point-min))
-      (message "未在 groups.el 中找到组 %s 的定义" group))
+      (message "未在 %s 中找到组 %s 的定义"
+               (file-name-nondirectory file) group))
     (current-buffer)))
 
 (etaf-define-component ebasecamp-ui-app ()
@@ -1982,34 +2559,10 @@ printing key，绑定后 evil 的数字前缀在界面内失效 —— 与 `q' /
                :width 'stretch :flex-shrink 0
            (expr (ebasecamp-ui--footer-view))
            (expr (ebasecamp-ui--notice-view session))
-           (ebasecamp-ui-confirm-dialog)))))))
+           (ebasecamp-ui-confirm-dialog)
+           (ebasecamp-ui-service-dialog)))))))
 
 ;;; 导入 / 导出入口
-
-(defun ebasecamp-ui--error-text (err)
-  "从错误对象 ERR（`(SYMBOL . DATA)'）取主消息字符串。纯函数。"
-  (let ((data (cdr err)))
-    (cond
-     ((and data (stringp (car data))) (car data))
-     (t (error-message-string err)))))
-
-(defun ebasecamp-ui--error-detail (err)
-  "从错误对象 ERR 取可展示的细节（DATA 中主消息之后的项）；无则 nil。纯函数。"
-  (let ((rest (cddr err)))
-    (when rest
-      (mapconcat (lambda (item) (if (stringp item) item (format "%S" item)))
-                 rest "\n"))))
-
-(defun ebasecamp-ui--call-with-input (reader)
-  "在有 etaf 事件上下文时用 `etaf-call-with-input' 执行 READER，否则直接执行。
-`etaf-call-with-input' 只在 Host 事件回调（按钮 `:on-press'）里可用，否则
-signal `etaf-event-error'；因此 `M-x' 直接调用与 ERT 场景降级为裸调用。
-只捕获该错误类型：READER 自身的错误必须原样上抛，否则会被执行两次。"
-  (if (fboundp 'etaf-call-with-input)
-      (condition-case nil
-          (etaf-call-with-input reader)
-        (etaf-event-error (funcall reader)))
-    (funcall reader)))
 
 (defun ebasecamp-ui--read-compose-file ()
   "读一个 compose 文件路径；用户取消时返回 nil。

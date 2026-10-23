@@ -1,7 +1,7 @@
 ;;; ebasecamp-data.el --- ebasecamp 清单 ∪ 状态记录的纯装配 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.4.0
+;; Version: 0.5.1
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 

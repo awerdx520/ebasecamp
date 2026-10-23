@@ -1490,15 +1490,16 @@ open 走全新会话（不残留上一次的选中集合、提示与确认状态
   (etaf-value (ebasecamp-ui-session-selected-group (ebasecamp-ui-session))))
 
 (ert-deftest ebasecamp-ui-test-root-keys-complete ()
-  "`--root-keys' 的键集合恰为 q g n p e I o D t 1 2 3，每条带非空 LABEL 且能通过校验。
+  "`--root-keys' 的键集合恰为 q g n p e t I o D 1 2 3 S E M X，每条带非空 LABEL 且能通过校验。
 `SPC` 不在本表：它被 ebox 内建的激活键（`[32]`）占用，见
 `spc-activates-checkbox'。
 `e`（编辑清单）在 U5 加入，`t`（切换勾选）在 U4 加入，`1`/`2`/`3`（区域跳转）
-在 N1 加入 —— 最终集合由 U6 + N1 断言，本用例只守护「当前阶段已有的键一个不少、
-一个不多」。"
+在 N1 加入，`S`/`E`/`M`/`X`（写操作）在 W4 加入 —— 本用例守护「当前阶段已有的键
+一个不少、一个不多」。"
   (ebasecamp-ui-test--with-ui
     (let ((keys (ebasecamp-ui--root-keys)))
-      (should (equal '("1" "2" "3" "D" "I" "e" "g" "n" "o" "p" "q" "t")
+      (should (equal '("1" "2" "3" "D" "E" "I" "M" "S" "X"
+                       "e" "g" "n" "o" "p" "q" "t")
                      (sort (mapcar (lambda (entry)
                                      (key-description (etaf--keys-event (car entry))))
                                    keys)
@@ -1867,11 +1868,12 @@ ref 由 `组名/服务名' 派生（`intern'），因此重渲染/刷新不改�
 ;;; U5. 编辑入口（`e`）与唯一写入口
 ;;
 ;; 界面 buffer 只读（U1），写只能发生在清单文件里：`e' →
-;; `ebasecamp-ui-edit-manifest' 对当前选中组 `find-file <dir>/groups.el' 并把
-;; point 定位到 `(ebasecamp-define-group <组名>'。四条错误/边界路径：
-;; 无选中组（`user-error'）、清单文件不存在（`user-error' + 指向
-;; `ebasecamp-create-sample-config'）、文件里找不到该组（降级为 point-min +
-;; `message'，不 signal）、以及键位本身是否进了根 Host 的 `:keys'。
+;; `ebasecamp-ui-edit-manifest' 先按组名跨文件定位（组可能在 `groups.el'，也
+;; 可能在 `projects/*.el'），再 `find-file' 该文件并把 point 定位到
+;; `(ebasecamp-define-group <组名>'。错误/边界路径：无选中组（`user-error'）、
+;; 磁盘上定位不到该组（降级：`message' + 打开 `groups.el' 文件头，不 signal）、
+;; 连可编辑的清单文件都没有（`user-error' + 指向 `ebasecamp-create-sample-config'）、
+;; 以及键位本身是否进了根 Host 的 `:keys'。
 ;;
 ;; 用例必须落在**真实文件**上：定位断言依赖磁盘上 `(ebasecamp-define-group mysql'
 ;; 的实际文本形态（样例清单的组定义是单行头 + 缩进关键字），不能用内存注册表替代。
@@ -1921,6 +1923,59 @@ ref 由 `组名/服务名' 派生（`intern'），因此重渲染/刷新不改�
                     (should-error (ebasecamp-ui-edit-manifest)
                                   :type 'user-error))))
       (should (string-match-p "选中" message)))))
+
+(ert-deftest ebasecamp-ui-test-edit-manifest-locates-project-file ()
+  "组定义在 `projects/x.el' 时 `e' 打开该文件并定位到组定义；
+磁盘上定位不到该组时降级为打开 `groups.el' 文件头 + `message'（不 signal）。"
+  (ebasecamp-ui-test--with-ui
+    (let ((dir ebasecamp-config-directory))
+      (make-directory (expand-file-name "projects/" dir) t)
+      (with-temp-file (expand-file-name "projects/x.el" dir)
+        (insert ";;; -*- lexical-binding: t; -*-\n"
+                "(ebasecamp-define-group mysql\n"
+                "  :title \"mysql\"\n"
+                "  :scope per-project\n"
+                "  :services ((mysql :image \"mysql:8.4\"))\n"
+                "  :configs nil)\n"
+                "\n"
+                "(ebasecamp-define-project myapp\n"
+                "  :title \"myapp\"\n"
+                "  :root \"/tmp/ebc-myapp\")\n"))
+      (with-temp-file (expand-file-name "groups.el" dir)
+        (insert ";;; -*- lexical-binding: t; -*-\n"
+                "(ebasecamp-define-group other\n"
+                "  :title \"other\"\n"
+                "  :scope per-project\n"
+                "  :services ((web :image \"nginx:1.27\"))\n"
+                "  :configs nil)\n"))
+      (ebasecamp-config-load)
+      ;; ① 组在 projects/x.el：`e' 打开该文件并把 point 定位到组定义
+      (ebasecamp-ui--set-selected-group (ebasecamp-ui-session) 'mysql)
+      (let ((buffer (ebasecamp-ui-edit-manifest)))
+        (unwind-protect
+            (with-current-buffer buffer
+              (should (equal (expand-file-name "projects/x.el" dir)
+                             (buffer-file-name)))
+              (should (ebasecamp-ui-test--contains-p
+                       (buffer-substring-no-properties
+                        (line-beginning-position) (line-end-position))
+                       "(ebasecamp-define-group mysql")))
+          (kill-buffer buffer)))
+      ;; ② 磁盘上定位不到该组（只有 other）：降级为 groups.el 文件头 + message
+      (ebasecamp-ui--set-selected-group (ebasecamp-ui-session) 'phantom)
+      (let ((notes nil))
+        (cl-letf (((symbol-function 'message)
+                   (lambda (format-string &rest args)
+                     (push (apply #'format format-string args) notes)
+                     nil)))
+          (let ((buffer (ebasecamp-ui-edit-manifest)))
+            (unwind-protect
+                (with-current-buffer buffer
+                  (should (equal (expand-file-name "groups.el" dir)
+                                 (buffer-file-name)))
+                  (should (= (point-min) (point))))
+              (kill-buffer buffer))))
+        (should (string-match-p "phantom" (mapconcat #'identity notes " | ")))))))
 
 (ert-deftest ebasecamp-ui-test-e-key-is-bound ()
   "`e' 进了根 Host 的 `:keys'：绑定存在且不是 local 边界的 `ignore'。"
@@ -1981,20 +2036,22 @@ LABEL 是可发现性的唯一来源（`etaf-help' 跳过无 LABEL 的条目）�
           (should (equal keys (etaf--keys-validate keys))))))))
 
 (ert-deftest ebasecamp-ui-test-root-keys-final-set ()
-  "根级键的**最终集合**恰为 q g n p e t I o D 1 2 3（12 条），一个不多一个不少。
+  "根级键的**最终集合**恰为 q g n p e t I o D 1 2 3 S E M X（16 条），一个不多一个不少。
 用 `key-description' 把每条 KEY 归一后再 `sort' + `equal' 做**精确等值**比较
 （不用「包含」断言，否则多绑/少绑都发现不了）。`SPC` **不在**本表：`[32]` 属于
 ebox 的 `ebox--activation-keys'（节点级 char-property keymap，按键查找中先于
 etaf 键层），写进 `:keys' 也收不到事件 —— 它由 ebox 内建处理，等价于
 「激活当前控件」（= `RET'）；行级切换勾选因此用 `t'（见 `t-toggles-row-at-point'）。
-`1`/`2`/`3` 是 N1 加的区域跳转键（跳到左栏 / 右栏 / 底栏）。"
+`1`/`2`/`3` 是 N1 加的区域跳转键（跳到左栏 / 右栏 / 底栏）；`S`/`E`/`M`/`X`
+是 W4 加的写操作键（编辑服务 / 编辑配置 / 移动配置 / 清单操作）。"
   (ebasecamp-ui-test--with-ui
     (let* ((keys (ebasecamp-ui--root-keys))
            (descriptions (mapcar (lambda (entry)
                                    (key-description (etaf--keys-event (car entry))))
                                  keys)))
-      (should (= 12 (length keys)))
-      (should (equal '("1" "2" "3" "D" "I" "e" "g" "n" "o" "p" "q" "t")
+      (should (= 16 (length keys)))
+      (should (equal '("1" "2" "3" "D" "E" "I" "M" "S" "X"
+                       "e" "g" "n" "o" "p" "q" "t")
                      (sort (copy-sequence descriptions) #'string<)))
       ;; `SPC` 由 ebox 内建激活处理，不得出现在本表
       (should-not (member "SPC" descriptions))
@@ -2002,7 +2059,7 @@ etaf 键层），写进 `:keys' 也收不到事件 —— 它由 ebox 内建处�
 
 (ert-deftest ebasecamp-ui-test-help-data-includes-labels ()
   "`etaf-help-data' 能收集到根级与段级的全部 LABEL（`?` 帮助的端到端核对）。
-point 在顶栏区时键链只到根 Host，收集到 12 条根级 LABEL（含 N1 加的三个区域跳转
+point 在顶栏区时键链只到根 Host，收集到 16 条根级 LABEL（含 N1 加的三个区域跳转
 键）；point 落到某个配置段内时段 Host 的 5 条段级 LABEL 一并进入快照
 （段键与根键不重叠，不会互相 shadow）。"
   (ebasecamp-ui-test--with-ui
@@ -2015,7 +2072,8 @@ point 在顶栏区时键链只到根 Host，收集到 12 条根级 LABEL（含 N
           (dolist (label '("关闭界面" "重载清单并刷新" "下一个组" "上一个组"
                            "编辑当前组清单" "切换勾选"
                            "导入 compose" "导出 compose" "销毁环境"
-                           "跳到左栏" "跳到右栏" "跳到底栏"))
+                           "跳到左栏" "跳到右栏" "跳到底栏"
+                           "编辑服务" "编辑配置" "移动配置" "清单操作"))
             (should (member label labels))))
         ;; point 进入第一段 → 段级 LABEL 也出现在快照里
         (ebasecamp-ui-test--goto-section)
@@ -2882,6 +2940,203 @@ A 的组在组顺序里排第二（mysql 在前），因此「选第一个组」
                           (progn (ebasecamp-ui-open) nil)
                         (error err)))
           (should-not (ebasecamp-ui-test--selected-group)))))))
+
+;;; 19. 清单写操作（W4：服务编辑 dialog + `E` / `M` / `X`）
+;;
+;; W0.3 实测的三条硬约束决定了这一节的断言形态：
+;; 1. `etaf-dialog` 的 buffer 文本**永远不含** dialog 内容（root-layer 投影）→
+;;    断言只能落在**组件 ref / 回调 / 停靠点**上，不能断言 `buffer-string`；
+;; 2. `:ref` 只接受 symbol / function / nil（传 `etaf-ref` 对象会报错）→ 字段用
+;;    `:bind`，按钮用 symbol ref；
+;; 3. `slot :name 'footer` 必须是 dialog 的**直接子项**（嵌在 column 里会报
+;;    `Unresolved View item: footer`）。
+;;
+;; 四个写命令（`S` / `E` / `M` / `X`）一律**直接调用命令函数**而不是 `execute-kbd-macro`：
+;; 命令内部走 `etaf-call-with-input'，在事件回调上下文里它会真的去开 minibuffer，
+;; batch 下会挂住。键位本身的可达性由 `write-keys-bound' 单独断言。
+
+(defun ebasecamp-ui-test--write-manifest ()
+  "W4 用的清单：组 mysql（1 份配置 dev → myapp、2 个服务，字段齐全）+ 组 redis。
+两个组的配置都指向已定义项目，服务名 `write-svc' / `write-ro' 在界面文本里唯一
+（不会与镜像列的 `mysql:8.4' 串匹配）。"
+  (ebasecamp-define-group mysql
+    :title "MySQL"
+    :scope per-project
+    :services ((write-svc :image "mysql:8.4"
+                          :ports ((3307 . 3306))
+                          :environment (("MYSQL_ROOT_PASSWORD" . "${DB_PASSWORD}")
+                                        ("TZ" . "Asia/Shanghai"))
+                          :volumes ((:source "./data" :target "/var/lib/mysql"
+                                     :type bind))
+                          :command ("mysqld" "--max-connections=200")
+                          :restart "unless-stopped")
+               (write-ro :image "mysql:8.4"))
+    :configs ((dev :project myapp)))
+  (ebasecamp-define-group redis
+    :title "Redis"
+    :scope per-project
+    :services ((redis :image "redis:7"))
+    :configs ((cache :project other)))
+  (ebasecamp-define-project myapp :title "示例项目" :groups nil)
+  (ebasecamp-define-project other :title "另一项目" :groups nil))
+
+(defun ebasecamp-ui-test--goto-service (name)
+  "把 point 移到服务表里服务名 NAME 的单元格上（**非** checkbox 单元格）。
+镜像列会把 `mysql:8.4' 截断成 `mysql:8'，因此用服务名定位不受列宽影响。"
+  (goto-char (point-min))
+  (search-forward name)
+  (backward-char 2))
+
+(defun ebasecamp-ui-test--editor ()
+  "返回服务编辑 dialog 的 ref 注册表（组件 `:bindings' 写入）；未挂载时返回 nil。"
+  ebasecamp-ui--service-editor)
+
+(defun ebasecamp-ui-test--editor-value (key)
+  "返回服务编辑 dialog 注册表里 KEY 对应 ref 的当前值。"
+  (etaf-value (plist-get (ebasecamp-ui-test--editor) key)))
+
+(ert-deftest ebasecamp-ui-test-service-dialog-prefills ()
+  "`S' 打开服务编辑框：6 个字段 ref 等于该服务的现有字段（多行字段保留换行）。
+dialog 内容不落 buffer（W0.3 实测），因此断言只读 ref 值。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--write-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40))
+        (ebasecamp-ui-test--with-open-ui
+          (should-not (ebasecamp-ui-test--editor-value :open))
+          (ebasecamp-ui-test--goto-service "write-svc")
+          (ebasecamp-ui--open-service-editor)
+          (should (ebasecamp-ui-test--editor-value :open))
+          (should (equal "mysql:8.4"
+                         (ebasecamp-ui-test--editor-value :image)))
+          (should (equal "3307:3306"
+                         (ebasecamp-ui-test--editor-value :ports)))
+          (should (equal (concat "MYSQL_ROOT_PASSWORD=${DB_PASSWORD}\n"
+                                 "TZ=Asia/Shanghai")
+                         (ebasecamp-ui-test--editor-value :environment)))
+          (should (equal "./data:/var/lib/mysql"
+                         (ebasecamp-ui-test--editor-value :volumes)))
+          (should (equal "mysqld\n--max-connections=200"
+                         (ebasecamp-ui-test--editor-value :command)))
+          (should (equal "unless-stopped"
+                         (ebasecamp-ui-test--editor-value :restart)))
+          (should-not (ebasecamp-ui-test--editor-value :error))
+          ;; 保存/取消按钮的 symbol ref 已渲染成 Host（ref 只接受 symbol）
+          (let ((runtime (etaf-runtime-for-buffer
+                          (get-buffer ebasecamp-ui-buffer-name))))
+            (should (etaf-runtime-host-node
+                     runtime 'ebasecamp-ui-service-save))
+            (should (etaf-runtime-host-node
+                     runtime 'ebasecamp-ui-service-cancel))))))))
+
+(ert-deftest ebasecamp-ui-test-service-dialog-save-writes ()
+  "改一个字段后保存：写盘函数收到 (组名 服务名 字段alist)，其中**只**含改动的字段；
+成功后 dialog 关闭并重载清单。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--write-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40)
+            (calls nil)
+            (reloads 0))
+        (ebasecamp-ui-test--with-open-ui
+          (ebasecamp-ui-test--goto-service "write-svc")
+          (ebasecamp-ui--open-service-editor)
+          (cl-letf (((symbol-function
+                      'ebasecamp-config-write-update-service-fields)
+                     (lambda (group service fields)
+                       (push (list group service fields) calls)))
+                    ((symbol-function 'ebasecamp-reload)
+                     (lambda () (cl-incf reloads) nil)))
+            (etaf-set-value (plist-get (ebasecamp-ui-test--editor) :ports)
+                            "3308:3306")
+            (ebasecamp-ui--service-dialog-save)
+            (should (= 1 (length calls)))
+            (should (equal '("mysql" "write-svc" (:ports ((3308 . 3306))))
+                           (car calls)))
+            (should-not (ebasecamp-ui-test--editor-value :open))
+            (should (= 1 reloads))))))))
+
+(ert-deftest ebasecamp-ui-test-service-dialog-invalid-keeps-open ()
+  "端口填非法值后保存：dialog **保持打开**、error ref 非空、写盘函数未被调用。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--write-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40)
+            (calls 0))
+        (ebasecamp-ui-test--with-open-ui
+          (ebasecamp-ui-test--goto-service "write-svc")
+          (ebasecamp-ui--open-service-editor)
+          (cl-letf (((symbol-function
+                      'ebasecamp-config-write-update-service-fields)
+                     (lambda (&rest _) (cl-incf calls))))
+            (etaf-set-value (plist-get (ebasecamp-ui-test--editor) :ports)
+                            "abc")
+            (ebasecamp-ui--service-dialog-save)
+            (should (ebasecamp-ui-test--editor-value :open))
+            (let ((error-text (ebasecamp-ui-test--editor-value :error)))
+              (should (stringp error-text))
+              (should (string-match-p "第 1 行" error-text)))
+            (should (= 0 calls))
+            ;; 改回合法值再保存：error 被清掉且真正写盘
+            (etaf-set-value (plist-get (ebasecamp-ui-test--editor) :ports)
+                            "3307:3306")
+            (ebasecamp-ui--service-dialog-save)
+            (should-not (ebasecamp-ui-test--editor-value :error))))))))
+
+(ert-deftest ebasecamp-ui-test-x-menu-dispatch ()
+  "`X' 清单操作菜单：选「新建配置」后依次收集配置名与项目，派发到 `-add-config'。
+`completing-read' 按顺序返回菜单项 / 配置名 / 项目名（全部经
+`etaf-call-with-input' 收集，与既有 `I' / `o' 一致）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--write-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40)
+            (answers '("新建配置" "prod" "myapp"))
+            (calls nil))
+        (ebasecamp-ui-test--with-open-ui
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (&rest _) (pop answers)))
+                    ((symbol-function 'ebasecamp-config-write-add-config)
+                     (lambda (group config project)
+                       (push (list group config project) calls)))
+                    ((symbol-function 'ebasecamp-reload)
+                     (lambda () nil)))
+            (ebasecamp-ui--manifest-menu)
+            (should (equal '(("mysql" "prod" myapp)) calls))
+            (should-not answers)))))))
+
+(ert-deftest ebasecamp-ui-test-move-config-prompts ()
+  "`M' 移动配置：先选目标组再选目标项目，派发到 `-move-config' 的
+`(源组 配置 目标组 项目)'。源配置取选中组里唯一的配置（不额外提问）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--write-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40)
+            (answers '("redis" "myapp"))
+            (calls nil))
+        (ebasecamp-ui-test--with-open-ui
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (&rest _) (pop answers)))
+                    ((symbol-function 'ebasecamp-config-write-move-config)
+                     (lambda (from config to project)
+                       (push (list from config to project) calls)))
+                    ((symbol-function 'ebasecamp-reload)
+                     (lambda () nil)))
+            (ebasecamp-ui--move-config)
+            (should (equal '(("mysql" "dev" "redis" myapp)) calls))
+            (should-not answers)))))))
+
+(ert-deftest ebasecamp-ui-test-write-keys-bound ()
+  "四个写操作键 `S' / `E' / `M' / `X' 都已进入根 Host 的 `:keys'（不是 `ignore'）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--write-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40))
+        (ebasecamp-ui-test--with-open-ui
+          (dolist (key '(?S ?E ?M ?X))
+            (let ((binding (etaf--keys-binding (vector key))))
+              (should binding)
+              (should-not (eq binding #'ignore)))))))))
 
 (provide 'ebasecamp-ui-tests)
 ;;; ebasecamp-ui-tests.el ends here

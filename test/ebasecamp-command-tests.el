@@ -245,6 +245,8 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
                    (push group-filter writes)
                    (format "/tmp/%s-compose.yaml"
                            (mapconcat #'symbol-name group-filter "-"))))
+                ((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (_file) (list :ok t :exit 0 :stderr "")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
                  (ebasecamp-command-test--stub-sync 0 ""))
                 ((symbol-function 'ebasecamp-docker-run-async)
@@ -275,6 +277,8 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
       (cl-letf (((symbol-function 'ebasecamp-compose-write)
                  (lambda (_project group-filter)
                    (format "/tmp/%s.yaml" (mapconcat #'symbol-name group-filter "-"))))
+                ((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (_file) (list :ok t :exit 0 :stderr "")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
                  (ebasecamp-command-test--stub-sync 0 ""))
                 ((symbol-function 'ebasecamp-docker-run-async)
@@ -303,6 +307,8 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
           (callbacks nil))
       (cl-letf (((symbol-function 'ebasecamp-compose-write)
                  (lambda (_project _filter) "/tmp/fake.yaml"))
+                ((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (_file) (list :ok t :exit 0 :stderr "")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
                  (ebasecamp-command-test--stub-sync 0 ""))
                 ((symbol-function 'ebasecamp-docker-run-async)
@@ -326,6 +332,8 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
            (index 0))
       (cl-letf (((symbol-function 'ebasecamp-compose-write)
                  (lambda (_project _filter) "/tmp/fake.yaml"))
+                ((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (_file) (list :ok t :exit 0 :stderr "")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
                  (ebasecamp-command-test--stub-sync 0 ""))
                 ((symbol-function 'ebasecamp-docker-run-async)
@@ -372,6 +380,8 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
           (calls nil))
       (cl-letf (((symbol-function 'ebasecamp-compose-write)
                  (lambda (_project _filter) "/tmp/fake.yaml"))
+                ((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (_file) (error "down 不应做 compose 预校验")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
                  (ebasecamp-command-test--stub-sync 0 ""))
                 ((symbol-function 'ebasecamp-docker-run-async)
@@ -521,6 +531,8 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
                  (lambda (_project group-filter)
                    (format "/tmp/%s.yaml"
                            (mapconcat #'symbol-name group-filter "-"))))
+                ((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (_file) (list :ok t :exit 0 :stderr "")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
                  (ebasecamp-command-test--stub-sync 0 ""))
                 ((symbol-function 'ebasecamp-docker-run-async)
@@ -551,6 +563,8 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
            (result nil))
       (cl-letf (((symbol-function 'ebasecamp-compose-write)
                  (lambda (_project _filter) "/tmp/fake.yaml"))
+                ((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (_file) (list :ok t :exit 0 :stderr "")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
                  (ebasecamp-command-test--stub-sync 0 ""))
                 ((symbol-function 'ebasecamp-docker-run-async)
@@ -613,6 +627,8 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
            (result nil))
       (cl-letf (((symbol-function 'ebasecamp-compose-write)
                  (lambda (_project _filter) "/tmp/fake.yaml"))
+                ((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (_file) (list :ok t :exit 0 :stderr "")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
                  (ebasecamp-command-test--stub-sync 0 ""))
                 ((symbol-function 'ebasecamp-docker-run-async)
@@ -628,6 +644,140 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
         (should-not (plist-get result :auto-started-shared))
         (should (equal '(project) (plist-get result :order)))
         (should (eq t (plist-get result :ok)))))))
+
+;;; X3 生成物预校验
+
+(ert-deftest ebasecamp-command-test-run-aborts-on-invalid-compose ()
+  "run：生成物 compose 校验失败 → 不派发 docker 进程，结果带 :ok nil 与 stderr。"
+  (ebasecamp-command-test--clean
+    (let* ((project (ebasecamp-command-test--mixed))
+           (checked nil)
+           (calls 0)
+           (result nil))
+      (cl-letf (((symbol-function 'ebasecamp-compose-write)
+                 (lambda (_project group-filter)
+                   (let ((file (expand-file-name
+                                (concat (mapconcat #'symbol-name group-filter "-")
+                                        ".yaml")
+                                ebasecamp-cache-directory)))
+                     (with-temp-file file (insert "name: broken\n"))
+                     file)))
+                ((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (file)
+                   (push file checked)
+                   (list :ok nil :exit 1
+                         :stderr (concat "service \"web\" refers to undefined"
+                                         " config web_cfg: invalid compose project\n")
+                         :warnings nil)))
+                ((symbol-function 'ebasecamp-docker-run-sync)
+                 (ebasecamp-command-test--stub-sync 0 ""))
+                ((symbol-function 'ebasecamp-docker-run-async)
+                 (lambda (&rest _) (setq calls (1+ calls)) 'fake-process)))
+        (should-not (ebasecamp-command-run
+                     'start project nil
+                     :on-complete (lambda (value) (setq result value))))
+        ;; 一个 docker 进程都不派发
+        (should (= 0 calls))
+        (should-not (plist-get result :ok))
+        (should (eq 'start (plist-get result :action)))
+        (should (eq 'myapp (plist-get result :project)))
+        ;; 首个分支校验失败即停止后续校验
+        (should (= 1 (length checked)))
+        (let ((failed (cl-find-if (lambda (entry) (plist-get entry :failed))
+                                  (plist-get result :results))))
+          (should failed)
+          (should (equal 1 (plist-get failed :exit)))
+          (should (string-match-p "refers to undefined config"
+                                  (plist-get failed :stderr)))
+          (should (string-match-p "invalid compose project"
+                                  (plist-get failed :stderr))))
+        (should-not (ebasecamp-command-pending-p project))))))
+
+(ert-deftest ebasecamp-command-test-run-checks-shared-and-project ()
+  "run：shared 与 per-project 生成物各校验一次；任一失败则一个容器都不启动。"
+  (ebasecamp-command-test--clean
+    (let* ((project (ebasecamp-command-test--mixed))
+           (checked nil)
+           (calls nil)
+           (result nil))
+      ;; 场景一：两个生成物都通过 → 各校验一次、各启动一次
+      (cl-letf (((symbol-function 'ebasecamp-compose-write)
+                 (lambda (_project group-filter)
+                   (expand-file-name
+                    (concat (mapconcat #'symbol-name group-filter "-") ".yaml")
+                    ebasecamp-cache-directory)))
+                ((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (file)
+                   (push file checked)
+                   (list :ok t :exit 0 :stderr "" :warnings nil)))
+                ((symbol-function 'ebasecamp-docker-run-sync)
+                 (ebasecamp-command-test--stub-sync 0 ""))
+                ((symbol-function 'ebasecamp-docker-run-async)
+                 (lambda (args callback &rest _)
+                   (push args calls)
+                   (funcall callback (list :exit 0 :stdout "" :stderr ""))
+                   'fake-process)))
+        (ebasecamp-command-run 'start project nil
+                               :on-complete (lambda (value) (setq result value)))
+        (should (= 2 (length checked)))
+        (should (= 2 (length (delete-dups (copy-sequence checked)))))
+        (should (equal 2 (length calls)))
+        (should (eq t (plist-get result :ok))))
+      ;; 场景二：第二个生成物（shared）校验失败 → 两个都校验过，但一个都不启动
+      (setq checked nil calls nil result nil)
+      (cl-letf (((symbol-function 'ebasecamp-compose-write)
+                 (lambda (_project group-filter)
+                   (expand-file-name
+                    (concat (mapconcat #'symbol-name group-filter "-") ".yaml")
+                    ebasecamp-cache-directory)))
+                ((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (file)
+                   (push file checked)
+                   (if (string-match-p "cache" file)
+                       (list :ok nil :exit 1 :stderr "shared 生成物非法")
+                     (list :ok t :exit 0 :stderr ""))))
+                ((symbol-function 'ebasecamp-docker-run-sync)
+                 (ebasecamp-command-test--stub-sync 0 ""))
+                ((symbol-function 'ebasecamp-docker-run-async)
+                 (lambda (&rest _) (push t calls) 'fake-process)))
+        (ebasecamp-command-run 'start project nil
+                               :on-complete (lambda (value) (setq result value)))
+        (should (= 2 (length checked)))
+        (should (= 0 (length calls)))
+        (should-not (plist-get result :ok))
+        ;; 失败的是 shared 分支（分支顺序：project 先、shared 后）
+        (should (eq t (plist-get (nth 1 (plist-get result :results)) :failed)))
+        (should (equal "shared 生成物非法"
+                       (plist-get (nth 1 (plist-get result :results)) :stderr)))))))
+
+(ert-deftest ebasecamp-command-test-run-proceeds-when-compose-valid ()
+  "run：校验全部通过 → 正常派发，且所有校验都发生在启动之前。"
+  (ebasecamp-command-test--clean
+    (let* ((project (ebasecamp-command-test--mixed))
+           (events nil)
+           (result nil))
+      (cl-letf (((symbol-function 'ebasecamp-compose-write)
+                 (lambda (_project group-filter)
+                   (expand-file-name
+                    (concat (mapconcat #'symbol-name group-filter "-") ".yaml")
+                    ebasecamp-cache-directory)))
+                ((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (_file)
+                   (push 'check events)
+                   (list :ok t :exit 0 :stderr "")))
+                ((symbol-function 'ebasecamp-docker-run-sync)
+                 (ebasecamp-command-test--stub-sync 0 ""))
+                ((symbol-function 'ebasecamp-docker-run-async)
+                 (lambda (_args callback &rest _)
+                   (push 'run events)
+                   (funcall callback (list :exit 0 :stdout "" :stderr ""))
+                   'fake-process)))
+        (ebasecamp-command-run 'start project nil
+                               :on-complete (lambda (value) (setq result value)))
+        (setq events (nreverse events))
+        (should (equal '(check check run run) events))
+        (should (eq t (plist-get result :ok)))
+        (should-not (ebasecamp-command-pending-p project))))))
 
 ;;; 错误条件定义
 

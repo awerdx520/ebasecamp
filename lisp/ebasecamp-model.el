@@ -1,7 +1,7 @@
 ;;; ebasecamp-model.el --- ebasecamp 清单数据模型 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.4.0
+;; Version: 0.5.1
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -68,8 +68,10 @@ CONFIGS 为 ((CONFIG-NAME . PLIST) ...)，按定义顺序排列。"
   name title scope services configs)
 
 (cl-defstruct (ebasecamp-project (:constructor ebasecamp-project-create))
-  "项目定义。GROUPS 为归一化后的组引用 plist 列表。"
-  name title root groups shared-network export-file)
+  "项目定义。GROUPS 为归一化后的组引用 plist 列表。
+FILE-CONFIGS / FILE-SECRETS 为 compose 顶层 `configs:' / `secrets:' 段的原样
+结构（键全为字符串的 alist，可多层嵌套），未声明时为 nil。"
+  name title root groups shared-network export-file file-configs file-secrets)
 
 ;;; 允许的关键字
 
@@ -88,7 +90,8 @@ CONFIGS 为 ((CONFIG-NAME . PLIST) ...)，按定义顺序排列。"
   "服务定义允许的关键字。")
 
 (defconst ebasecamp-model--project-keywords
-  '(:title :root :shared-network :export-file :groups)
+  '(:title :root :shared-network :export-file :file-configs :file-secrets
+    :groups)
   "项目定义允许的关键字。")
 
 (defconst ebasecamp-model--group-ref-keywords
@@ -244,6 +247,48 @@ CONTEXT 用于错误消息。"
                    (= 0 (% (length value) 2))))
     (ebasecamp-model--fail "%s: healthcheck 必须是 plist 或 nil，得到 %S"
                            context value)))
+
+(defun ebasecamp-model--check-file-mapping (value context)
+  "检查 VALUE 为 nil 或「键全为字符串的 alist」，并递归校验所有嵌套层。
+CONTEXT 用于错误消息。
+
+值取自 compose 顶层 `configs:' / `secrets:' 段的原样结构，模型只做形态校验、
+不做语义校验。为什么必须递归查字符串键：渲染层 `ebasecamp-compose--mapping-p'
+只把「元素是 (STRING-KEY . VALUE)」的列表当映射，符号键会被当序列渲染成
+`- file' 之类的错误 YAML（X0 实测：符号键 + 点对会 signal，符号键 + 正规表
+会产出垃圾 YAML），因此这一层不给糊弄过去。"
+  (cond
+   ((null value) nil)
+   ((not (and (consp value) (proper-list-p value)))
+    (ebasecamp-model--fail "%s: 期望字符串键 alist 或 nil，得到 %S"
+                           context value))
+   (t
+    (dolist (pair value)
+      (unless (and (consp pair) (stringp (car pair)))
+        (ebasecamp-model--fail
+         "%s: 期望 (\"键\" . 值) 元素，键必须是字符串，得到 %S"
+         context pair))
+      (ebasecamp-model--check-file-mapping-nested
+       (cdr pair) (format "%s 的 \"%s\"" context (car pair)))))))
+
+(defun ebasecamp-model--check-file-mapping-nested (value context)
+  "递归校验 VALUE 中每一层 alist 的键都是字符串；标量（字符串/数字/t）放行。
+CONTEXT 用于错误消息。映射层与序列层的判别与渲染层一致：列表首元素是 cons
+即当映射处理。"
+  (cond
+   ((or (null value) (not (consp value))) nil)
+   ((not (proper-list-p value))
+    (ebasecamp-model--fail "%s: 期望 alist / 列表 / 标量，得到点对列表 %S"
+                           context value))
+   ((consp (car value))                 ; 映射层
+    (dolist (pair value)
+      (unless (and (consp pair) (stringp (car pair)))
+        (ebasecamp-model--fail "%s: 键必须是字符串，得到 %S" context pair))
+      (ebasecamp-model--check-file-mapping-nested
+       (cdr pair) (format "%s 的 \"%s\"" context (car pair)))))
+   (t                                   ; 序列层
+    (dolist (item value)
+      (ebasecamp-model--check-file-mapping-nested item context)))))
 
 (defun ebasecamp-model--check-service-values (plist context)
   "校验服务属性 PLIST 中全部可选字段的取值。
@@ -440,6 +485,8 @@ CONTEXT 用于错误消息。"
     (let ((title (plist-get plist :title))
           (root (plist-get plist :root))
           (export-file (plist-get plist :export-file))
+          (file-configs (plist-get plist :file-configs))
+          (file-secrets (plist-get plist :file-secrets))
           (groups (plist-get plist :groups)))
       (when (and title (not (stringp title)))
         (ebasecamp-model--fail "%s: :title 必须是字符串，得到 %S"
@@ -449,6 +496,10 @@ CONTEXT 用于错误消息。"
       (when (and export-file (not (stringp export-file)))
         (ebasecamp-model--fail "%s: :export-file 必须是字符串，得到 %S"
                                context export-file))
+      (ebasecamp-model--check-file-mapping
+       file-configs (concat context ":file-configs"))
+      (ebasecamp-model--check-file-mapping
+       file-secrets (concat context ":file-secrets"))
       (unless (or (null groups) (proper-list-p groups))
         (ebasecamp-model--fail "%s: :groups 必须是列表，得到 %S"
                                context groups))
@@ -462,7 +513,9 @@ CONTEXT 用于错误消息。"
        :shared-network (if (plist-member plist :shared-network)
                            (and (plist-get plist :shared-network) t)
                          t)
-       :export-file export-file))))
+       :export-file export-file
+       :file-configs file-configs
+       :file-secrets file-secrets))))
 
 ;;; 注册
 
@@ -505,8 +558,11 @@ shared 或 per-project，缺省 per-project。:configs 每项形如
 
 (defmacro ebasecamp-define-project (name &rest args)
   "定义项目 NAME，属性见 ARGS。
-ARGS 允许的关键字为 :title、:root、:shared-network、:export-file、:groups。
+ARGS 允许的关键字为 :title、:root、:shared-network、:export-file、
+:file-configs、:file-secrets、:groups。
 :groups 的每一项形如 (GROUP :scope SCOPE :services ((SERVICE 属性...)...))。
+:file-configs / :file-secrets 为 compose 顶层 `configs:' / `secrets:' 段的原样
+结构（键全为字符串的 alist，可多层嵌套），未声明时为 nil。
 展开后注册到项目注册表并返回项目名。"
   (declare (indent 1))
   (unless (symbolp name)

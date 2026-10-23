@@ -1,7 +1,7 @@
 ;;; ebasecamp-command.el --- ebasecamp 生命周期命令与端口冲突检测 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.4.0
+;; Version: 0.5.1
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -61,6 +61,11 @@
 
 (defconst ebasecamp-command--actions '(start stop restart down)
   "允许的动作：启动、停止、重启、拆除。")
+
+(defconst ebasecamp-command--validated-actions '(start restart)
+  "需要先做生成物 compose 预校验的动作。
+只有这两个动作会经 docker 解析生成物并启动容器；`stop' / `down' 作用于已
+存在的容器，生成物暂时不合法时更应先允许停掉服务，因此不校验。")
 
 (defvar ebasecamp-command--pending (make-hash-table :test #'equal)
   "正在执行的生命周期命令，键为项目名字符串，值为 t。
@@ -393,11 +398,68 @@ PROJECT 可为项目对象、symbol 或字符串。"
   (let ((exit (plist-get result :exit)))
     (and (numberp exit) (zerop exit))))
 
+(defun ebasecamp-command--preflight (object branches)
+  "为 BRANCHES 逐个写生成物并用 `ebasecamp-docker-check-compose' 校验。
+OBJECT 为项目对象（渲染生成物所需）。返回 plist：
+- `:branches' —— 校验通过的分支副本，每项追加 `:written'（实际写出的生成物
+  路径），供派发层直接复用、避免重复写盘；
+- `:failure' —— nil 表示全部通过；否则 `(:index I :result RESULT)'，RESULT
+  为 `(:scope S :exit N :stderr STR)'（stderr 原文保留，供上层展示首行）。
+只写生成物与校验，**不派发任何 docker 进程**，因此可以「先校验全部分支、
+全部通过才统一启动」，不会出现已启动容器无法回滚的部分启动。首个失败即停止
+后续校验（后面的分支连写盘都省掉）。"
+  (let ((validated nil)
+        (index 0)
+        (failure nil)
+        (total (length branches)))
+    (while (and (< index total) (null failure))
+      (let* ((branch (nth index branches))
+             (file (ebasecamp-compose-write object (plist-get branch :groups)))
+             (check (ebasecamp-docker-check-compose file)))
+        (if (plist-get check :ok)
+            (setq validated
+                  (append validated (list (append branch (list :written file)))))
+          (setq failure
+                (list :index index
+                      :result (list :scope (plist-get branch :scope)
+                                    :exit (plist-get check :exit)
+                                    :stderr (or (plist-get check :stderr) ""))))))
+      (setq index (1+ index)))
+    (list :branches validated :failure failure)))
+
+(defun ebasecamp-command--preflight-report (action object branches preflight auto)
+  "构造预校验失败时交给 ON-COMPLETE 的结果 plist（此时未派发任何批次）。
+BRANCHES 为原分支列表，PREFLIGHT 为 `ebasecamp-command--preflight' 的返回值；
+校验失败的分支带 `:failed t'（含 `:exit' 与 `:stderr'），其余分支标
+`:skipped t'（一律未执行）。AUTO 表示 shared 批次是否为跨 scope 依赖自动补齐。
+字段与成功路径一致，便于 `ebasecamp-ui--report-result' 统一渲染。"
+  (let* ((failure (plist-get preflight :failure))
+         (failed-index (plist-get failure :index))
+         (failed (plist-get failure :result))
+         (results nil)
+         (index 0))
+    (dolist (branch branches)
+      (setq results
+            (append results
+                    (list (if (eql index failed-index)
+                              (append failed (list :failed t))
+                            (list :scope (plist-get branch :scope)
+                                  :exit nil :stderr "" :skipped t)))))
+      (setq index (1+ index)))
+    (list :action action
+          :project (ebasecamp-project-name object)
+          :ok nil
+          :results results
+          :auto-started-shared (and auto t)
+          :order nil)))
+
 (defun ebasecamp-command--dispatch (action object name branches
                                           sequential auto-shared on-complete)
   "派发批次 BRANCHES（分支 plist 列表），返回已启动的进程列表。
-SEQUENTIAL 非 nil 时按顺序派发，某批次失败后中止后续批次（结果记为
-`:skipped'）；AUTO-SHARED 非 nil 表示 shared 批次是为跨 scope 依赖自动补齐的。
+分支若带 `:written'（预校验已写盘）则直接复用该路径，不再重复
+`ebasecamp-compose-write'。SEQUENTIAL 非 nil 时按顺序派发，某批次失败后中止
+后续批次（结果记为 `:skipped'）；AUTO-SHARED 非 nil 表示 shared 批次是为跨
+scope 依赖自动补齐的。
 ON-COMPLETE 在所有批次结束后调用，参数 plist：
 `(:action :project :ok :results :auto-started-shared :order)'，
 `:results' 元素为 `(:scope :exit :stderr [:failed t|:skipped t])'，
@@ -444,8 +506,9 @@ ON-COMPLETE 在所有批次结束后调用，参数 plist：
               (sequential (launch (1+ index))))))
          (launch (index)
            (let* ((branch (nth index branches))
-                  (file (ebasecamp-compose-write
-                         object (plist-get branch :groups)))
+                  (file (or (plist-get branch :written)
+                            (ebasecamp-compose-write
+                             object (plist-get branch :groups))))
                   (args (ebasecamp-command-compose-args
                          action file (plist-get branch :name)
                          (unless (eq action 'down)
@@ -488,6 +551,14 @@ PROJECT 为项目对象、symbol 或字符串；KEYS 为选中服务（nil 表�
    `(:action ACTION :project NAME :ok BOOL :results ((:scope S :exit N
    :stderr STR [:failed t|:skipped t]) ...) :auto-started-shared BOOL
    :order (SCOPE ...))'，任一分支失败 `:ok' 为 nil，stderr 原样保留。
+生成物预校验（X3，`ebasecamp-command--preflight'）：start / restart 在
+校验通过前**不建网络、不派发任何 docker 进程** —— 逐分支写生成物并调用
+`ebasecamp-docker-check-compose'，全部通过才统一启动（start 是串行派发，
+已启动的容器无法回滚，故不能边校验边启动）。任一生成物不合法时立即返回
+`(:ok nil …)' 结果，失败分支带 `:failed t' 与 `:exit' / `:stderr'（把
+`invalid compose project' 之类的错误提前成可读提示，UI 展示首行），其余分支
+标 `:skipped t'；返回 nil（没有进程被启动）。stop / down 不做预校验：它们
+作用于已存在的容器，生成物暂时不合法时也应允许停掉服务。
 返回已启动进程对象列表（无分支或同步完成时可能为 nil）。"
   (let* ((object (ebasecamp-command--project project))
          (name (ebasecamp-command--name object)))
@@ -506,21 +577,30 @@ PROJECT 为项目对象、symbol 或字符串；KEYS 为选中服务（nil 表�
         (unless project-branch
           (signal 'ebasecamp-command-error
                   (list (format "项目 %s 没有 per-project 组的服务可 down" name)))))
-      (let ((auto (and requires (eq action 'start) t)))
+      (let* ((auto (and requires (eq action 'start) t))
+             (branches (if auto
+                           (list (ebasecamp-command--shared-branch
+                                  object shared-branch requires)
+                                 project-branch)
+                         (delq nil (list project-branch shared-branch))))
+             (preflight nil))
         (when auto
           (ebasecamp-command--check-requires object requires))
-        (ebasecamp-command-ensure-network)
-        (if auto
-            (ebasecamp-command--dispatch
-             action object name
-             (list (ebasecamp-command--shared-branch
-                    object shared-branch requires)
-                   project-branch)
-             t t on-complete)
+        (when (memq action ebasecamp-command--validated-actions)
+          (setq preflight (ebasecamp-command--preflight object branches)))
+        (if (and preflight (plist-get preflight :failure))
+            ;; 生成物不合法：不建网络、不启动任何容器，直接交回可读错误
+            (progn
+              (when (functionp on-complete)
+                (funcall on-complete
+                         (ebasecamp-command--preflight-report
+                          action object branches preflight auto)))
+              nil)
+          (ebasecamp-command-ensure-network)
           (ebasecamp-command--dispatch
            action object name
-           (delq nil (list project-branch shared-branch))
-           nil nil on-complete))))))
+           (if preflight (plist-get preflight :branches) branches)
+           auto auto on-complete))))))
 
 ;;; 端口冲突检测（T3.3）
 

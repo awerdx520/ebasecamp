@@ -559,5 +559,35 @@ compose 读取由 `ebasecamp-docker--run-sync-function' 伪造为 fixture JSON�
       (dolist (dir (list config-dir root-dir compose-dir))
         (ignore-errors (delete-directory dir t))))))
 
+;;; 12. 顶层 configs（X2）
+
+(ert-deftest ebasecamp-export-test-top-configs-passes-config-q ()
+  "导出含顶层 `configs:' 的项目后，真实 `docker compose config -q' 通过。
+服务的 `configs:' 引用必须有顶层声明，否则 compose 报
+`refers to undefined config'（这是 v0.5.1 要修的第二个阻断缺陷）。"
+  (ebasecamp-export-test--skip-unless-docker)
+  (ebasecamp-export-test--with-root
+    (ebasecamp-model-reset)
+    (with-temp-file (expand-file-name "web.conf" root-dir)
+      (insert "worker_processes 1;\n"))
+    (ebasecamp-model--register-group
+     'app
+     (list :scope 'per-project
+           :services '((api :image "myapp/api:dev"))))
+    (ebasecamp-model--register-project
+     'site
+     (list :title "Site"
+           :root root-dir
+           :file-configs '(("web_cfg" . (("file" . "./web.conf"))))
+           :groups '((app))))
+    (let* ((project (ebasecamp-model-project 'site))
+           (path (ebasecamp-export-project project :force t))
+           (result (ebasecamp-docker-check-compose path)))
+      (should (file-exists-p path))
+      (should (string-match-p "configs:\n  web_cfg:\n    file: \\./web\\.conf"
+                              (ebasecamp-export-test--read path)))
+      (should (plist-get result :ok))
+      (should (eq 0 (plist-get result :exit))))))
+
 (provide 'ebasecamp-export-tests)
 ;;; ebasecamp-export-tests.el ends here

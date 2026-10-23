@@ -1,7 +1,7 @@
 ;;; ebasecamp-compose.el --- ebasecamp compose 生成 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.4.0
+;; Version: 0.5.1
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -485,6 +485,14 @@ USER-NETWORKS 为服务引用的其余网络名，按空映射声明（由 compo
                      volumes
                      "\n")))
 
+(defun ebasecamp-compose--file-declarations-section (title alist)
+  "把项目顶层 ALIST 渲染为 TITLE 段（`configs' / `secrets'）。
+ALIST 为 compose 原样结构（字符串键 alist，可嵌套），nil 时返回 nil。
+键必须是字符串（模型层已校验）：`--yaml-map' 的 `--mapping-p' 只认字符串键，
+符号键会被当序列渲染成错误 YAML。"
+  (when alist
+    (concat title ":\n" (ebasecamp-compose--yaml-map alist 2))))
+
 ;;; 公共接口
 
 (defun ebasecamp-compose-project-name (project group)
@@ -503,7 +511,10 @@ GROUP-FILTER 为 nil 时渲染项目引用的全部组；为 symbol、字符串�
 GROUP-FILTER 非 nil（按 scope 渲染）时，服务 depends-on 中指向**本次未渲染
 服务**的名字被剔除 —— 这些依赖属于另一个 compose 项目（shared 组在
 `ebc-shared'、per-project 组在 `ebc-<project>'），保留会让 `docker compose up'
-报 depends on undefined service。GROUP-FILTER 为 nil（预览/导出）时行为不变。"
+报 depends on undefined service。GROUP-FILTER 为 nil（预览/导出）时行为不变。
+
+顶层 `configs:' / `secrets:' 段取自项目的 `:file-configs' / `:file-secrets'，
+只在 per-project 生成物里输出（refs 全为 shared 时省略）。"
   (ebasecamp-compose--check-project project)
   (let* ((refs (ebasecamp-compose--group-refs project group-filter))
          (name (ebasecamp-compose--compose-name project refs))
@@ -564,6 +575,17 @@ GROUP-FILTER 非 nil（按 scope 渲染）时，服务 depends-on 中指向**本
         (setq sections (append sections
                                (list (ebasecamp-compose--volumes-section
                                       volumes)))))
+      ;; 顶层 configs / secrets 只进 per-project 生成物：shared 生成物
+      ;; （`ebc-shared'）由部署环境自行提供这些对象，塞进去会让同一份声明
+      ;; 出现在两个 compose 项目里（记入 tech-debt）。
+      (unless (ebasecamp-compose--all-shared-p refs)
+        (dolist (section
+                 (list (ebasecamp-compose--file-declarations-section
+                        "configs" (ebasecamp-project-file-configs project))
+                       (ebasecamp-compose--file-declarations-section
+                        "secrets" (ebasecamp-project-file-secrets project))))
+          (when section
+            (setq sections (append sections (list section))))))
       (concat (mapconcat #'identity sections "\n") "\n"))))
 
 (defun ebasecamp-compose-cache-file (project &optional group-filter)

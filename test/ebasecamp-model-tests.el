@@ -144,6 +144,75 @@
                      (mapcar #'ebasecamp-project-name
                              (ebasecamp-model-projects)))))))
 
+;;; 7b. 项目顶层 configs / secrets（X2）
+
+(ert-deftest ebasecamp-model-test-project-defaults ()
+  "未提供 :file-configs / :file-secrets 时两个槽都是 nil。"
+  (ebasecamp-model-test--clean
+    (ebasecamp-define-project plain)
+    (let ((project (ebasecamp-model-project 'plain)))
+      (should (null (ebasecamp-project-file-configs project)))
+      (should (null (ebasecamp-project-file-secrets project))))))
+
+(ert-deftest ebasecamp-model-test-project-file-configs ()
+  "项目 :file-configs 接受 nil 或「键全为字符串的 alist」（含多层嵌套）。
+键不是字符串（顶层或嵌套）以及非 alist 的取值一律报 `ebasecamp-model-error`：
+渲染层的 `--mapping-p' 只认字符串键，符号键会被当序列渲染成错误 YAML。"
+  (ebasecamp-model-test--clean
+    ;; 单层：配置名 → (("file" . "./web.conf"))
+    (ebasecamp-define-project simple
+      :file-configs (("web_cfg" . (("file" . "./web.conf")))))
+    (should (equal '(("web_cfg" . (("file" . "./web.conf"))))
+                   (ebasecamp-project-file-configs
+                    (ebasecamp-model-project 'simple))))
+    ;; 嵌套两层
+    (ebasecamp-define-project nested
+      :file-configs (("a" . (("b" . (("file" . "./x")))))))
+    (should (equal '(("a" . (("b" . (("file" . "./x"))))))
+                   (ebasecamp-project-file-configs
+                    (ebasecamp-model-project 'nested))))
+    ;; 顶层符号键
+    (should-error
+     (eval '(ebasecamp-define-project bad
+              :file-configs ((file . "./x"))) t)
+     :type 'ebasecamp-model-error)
+    ;; 嵌套符号键
+    (should-error
+     (eval '(ebasecamp-define-project bad
+              :file-configs (("a" . ((file . "./x"))))) t)
+     :type 'ebasecamp-model-error)
+    ;; 非 alist 取值
+    (should-error
+     (eval '(ebasecamp-define-project bad :file-configs "web.conf") t)
+     :type 'ebasecamp-model-error)
+    (should-error
+     (eval '(ebasecamp-define-project bad :file-configs 42) t)
+     :type 'ebasecamp-model-error)))
+
+(ert-deftest ebasecamp-model-test-project-file-secrets ()
+  "项目 :file-secrets 与 :file-configs 同一规则：字符串键 alist 或 nil。"
+  (ebasecamp-model-test--clean
+    (ebasecamp-define-project simple
+      :file-secrets (("db_pass" . (("file" . "./db_pass.txt")))))
+    (should (equal '(("db_pass" . (("file" . "./db_pass.txt"))))
+                   (ebasecamp-project-file-secrets
+                    (ebasecamp-model-project 'simple))))
+    (ebasecamp-define-project anchored
+      :file-secrets (("db_pass" . (("external" . t)))
+                     ("api_key" . (("file" . "${EBASECAMP_KEY_FILE}")))))
+    (should (equal '(("db_pass" . (("external" . t)))
+                     ("api_key" . (("file" . "${EBASECAMP_KEY_FILE}"))))
+                   (ebasecamp-project-file-secrets
+                    (ebasecamp-model-project 'anchored))))
+    (should-error
+     (eval '(ebasecamp-define-project bad
+              :file-secrets ((db_pass . "./x"))) t)
+     :type 'ebasecamp-model-error)
+    (should-error
+     (eval '(ebasecamp-define-project bad
+              :file-secrets (("db_pass" . ((file . "./x"))))) t)
+     :type 'ebasecamp-model-error)))
+
 ;;; 8. 无覆盖时的解析结果
 
 (ert-deftest ebasecamp-model-test-resolve-services-without-overrides ()

@@ -33,6 +33,7 @@
 (require 'ebasecamp-config)
 (require 'ebasecamp-import)
 (require 'ebasecamp-export)
+(require 'ebasecamp-config-write)
 
 ;;; 测试脚手架
 
@@ -449,6 +450,14 @@ D3 缺陷：旧实现返回 ((:source PATH :type env) …)，该 plist 列表被
 compose 读取由 `ebasecamp-docker--run-sync-function' 伪造为实测 fixture，
 因此不依赖 docker。"
   (declare (indent 1) (debug t))
+  `(ebasecamp-import-test--with-manifest-json ,compose-name
+     (ebasecamp-import-test--config-json)
+     ,@body))
+
+(defmacro ebasecamp-import-test--with-manifest-json (compose-name json &rest body)
+  "同 `ebasecamp-import-test--with-manifest'，但伪造的 `config --format json'
+输出用 JSON 字符串，便于构造含顶层 configs / secrets 的用例。"
+  (declare (indent 2) (debug t))
   `(let* ((config-dir (make-temp-file "ebc-import-config-" t))
           (compose-dir (make-temp-file "ebc-import-compose-" t))
           (compose-file (expand-file-name ,compose-name compose-dir))
@@ -456,7 +465,7 @@ compose 读取由 `ebasecamp-docker--run-sync-function' 伪造为实测 fixture�
           (ebasecamp-docker--run-sync-function
            (lambda (_args _timeout)
              (list :exit 0
-                   :stdout (ebasecamp-import-test--config-json)
+                   :stdout ,json
                    :stderr ""))))
      (unwind-protect
          (progn
@@ -761,6 +770,92 @@ compose 读取由 `ebasecamp-docker--run-sync-function' 伪造为实测 fixture�
                            export-text)))))
       (ignore-errors (delete-directory config-dir t))
       (ignore-errors (delete-directory compose-dir t)))))
+
+;;; 13. 顶层 configs / secrets（X2）
+
+(defconst ebasecamp-import-test--top-configs-json
+  (concat "{\"name\":\"probe-app\","
+          "\"services\":{\"api\":{\"image\":\"myapp/api:dev\"}},"
+          "\"configs\":{\"web_cfg\":{\"file\":\"./web.conf\"}}}")
+  "含顶层 `configs:' 的 compose config JSON（`file:' 形态，X0.2 实测可表达）。")
+
+(defconst ebasecamp-import-test--top-secrets-json
+  (concat "{\"name\":\"probe-app\","
+          "\"services\":{\"api\":{\"image\":\"myapp/api:dev\"}},"
+          "\"secrets\":{\"db_pass\":{\"file\":\"./db_pass.txt\"},"
+          "\"ext_key\":{\"external\":true}}}")
+  "含顶层 `secrets:' 的 compose config JSON（`file:' + `external:' 两种形态）。")
+
+(ert-deftest ebasecamp-import-test-keeps-top-configs ()
+  "顶层 `configs:' 原样保留进项目结构的 :file-configs（键为字符串）。
+compose 的服务级 `configs:' 引用若无顶层声明会让 `docker compose config -q'
+报 `refers to undefined config'，因此导入不得静默丢弃顶层段。"
+  (let ((project (ebasecamp-import-parse-json
+                  ebasecamp-import-test--top-configs-json)))
+    (should (equal '(("web_cfg" . (("file" . "./web.conf"))))
+                   (ebasecamp-project-file-configs project)))))
+
+(ert-deftest ebasecamp-import-test-keeps-top-secrets ()
+  "顶层 `secrets:' 原样保留进项目结构的 :file-secrets。
+`external: true' 解析为 t（渲染时输出 `true'），`file:' 保持相对路径引用。"
+  (let ((project (ebasecamp-import-parse-json
+                  ebasecamp-import-test--top-secrets-json)))
+    (should (equal '(("db_pass" . (("file" . "./db_pass.txt")))
+                     ("ext_key" . (("external" . t))))
+                   (ebasecamp-project-file-secrets project)))))
+
+(ert-deftest ebasecamp-import-test-unknown-top-keys-warn ()
+  "未知顶层键不阻断导入，但经 `ebasecamp-import-warnings' 报告；
+每次导入都重置上一次的 warnings。"
+  (let* ((json (concat "{\"name\":\"probe-app\","
+                       "\"services\":{\"api\":{\"image\":\"myapp/api:dev\"}},"
+                       "\"x-unknown\":{\"a\":\"b\"}}"))
+         (project (ebasecamp-import-parse-json json))
+         (warnings (ebasecamp-import-warnings)))
+    (should project)
+    (should (cl-some (lambda (message)
+                       (string-match-p "x-unknown" message))
+                     warnings))
+    ;; 已知顶层键不产生 warning，且上一次的结果被重置
+    (ebasecamp-import-parse-json ebasecamp-import-test--top-configs-json)
+    (should (null (ebasecamp-import-warnings)))))
+
+(ert-deftest ebasecamp-import-test-apply-writes-file-configs ()
+  "落盘文本含 :file-configs，且文件可被 `ebasecamp-config-load' 零错误加载。"
+  (ebasecamp-import-test--with-manifest-json
+      "compose.yaml" ebasecamp-import-test--top-configs-json
+    (let* ((path (ebasecamp-import-apply compose-file "probe-app"))
+           (content (ebasecamp-import-test--read path))
+           (status (ebasecamp-config-load config-dir))
+           (project (ebasecamp-model-project 'probe-app)))
+      (should (string-match-p ":file-configs" content))
+      (should (string-match-p (regexp-quote "web_cfg") content))
+      (should (null (plist-get status :errors)))
+      (should (equal '(("web_cfg" . (("file" . "./web.conf"))))
+                     (ebasecamp-project-file-configs project))))))
+
+(ert-deftest ebasecamp-import-test-update-project-keeps-file-configs ()
+  "改 :title / :root 后 :file-configs / :file-secrets 不丢（写盘键白名单同步）。"
+  (ebasecamp-import-test--with-manifest-json
+      "compose.yaml"
+      (concat "{\"name\":\"probe-app\","
+              "\"services\":{\"api\":{\"image\":\"myapp/api:dev\"}},"
+              "\"configs\":{\"web_cfg\":{\"file\":\"./web.conf\"}},"
+              "\"secrets\":{\"db_pass\":{\"file\":\"./db_pass.txt\"}}}")
+    (let* ((path (ebasecamp-import-apply compose-file "probe-app"))
+           (result (ebasecamp-config-write-update-project
+                    'probe-app "改名后的应用" "/srv/probe")))
+      (should (null (plist-get result :errors)))
+      (let ((content (ebasecamp-import-test--read path)))
+        (should (string-match-p ":file-configs" content))
+        (should (string-match-p ":file-secrets" content))
+        (should (string-match-p "改名后的应用" content)))
+      (let ((project (ebasecamp-model-project 'probe-app)))
+        (should (equal "改名后的应用" (ebasecamp-project-title project)))
+        (should (equal '(("web_cfg" . (("file" . "./web.conf"))))
+                       (ebasecamp-project-file-configs project)))
+        (should (equal '(("db_pass" . (("file" . "./db_pass.txt"))))
+                       (ebasecamp-project-file-secrets project)))))))
 
 (provide 'ebasecamp-import-tests)
 ;;; ebasecamp-import-tests.el ends here

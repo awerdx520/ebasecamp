@@ -1,7 +1,7 @@
 ;;; ebasecamp-import.el --- ebasecamp 导入映射（compose → 清单） -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.4.0
+;; Version: 0.5.1
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -75,6 +75,7 @@
 (require 'ebasecamp-model)
 (require 'ebasecamp-config)
 (require 'ebasecamp-docker)
+(require 'ebasecamp-manifest)
 
 (define-error 'ebasecamp-import-error "ebasecamp 导入失败")
 
@@ -385,6 +386,37 @@ compose 的 env_file 合法形态为字符串 / 字符串列表 / {path, require
                (list (format "服务 %s 无法映射到清单：%s"
                              name (error-message-string err))))))))
 
+;;; 顶层 configs / secrets 与导入警告
+
+(defconst ebasecamp-import--top-level-keys
+  '("name" "services" "networks" "volumes" "configs" "secrets" "version"
+    "include")
+  "compose config JSON 顶层键中已建模（或被有意忽略）的那些。
+其余顶层键（例如 `x-unknown'）不建模，但导入时逐条记进
+`ebasecamp-import--last-warnings'，不静默丢弃。")
+
+(defvar ebasecamp-import--last-warnings nil
+  "最近一次导入产生的警告文本列表（最新在前）。
+每次 `ebasecamp-import-parse-json' 开始时重置；用
+`ebasecamp-import-warnings' 读取，不要直接引用本变量。")
+
+(defun ebasecamp-import-warnings ()
+  "返回最近一次导入的警告文本列表（无警告时 nil）。
+典型来源：compose 里出现了未建模的顶层键（如 `x-*' 扩展字段）。"
+  (copy-sequence ebasecamp-import--last-warnings))
+
+(defun ebasecamp-import--warn (format-string &rest args)
+  "把一条警告记进 `ebasecamp-import--last-warnings'。"
+  (push (apply #'format format-string args)
+        ebasecamp-import--last-warnings))
+
+(defun ebasecamp-import--top-level-declarations (object key)
+  "取 OBJECT 顶层 KEY（configs / secrets）段的原样结构。
+JSON 对象已被 `--json->sexp' 转成字符串键 alist（嵌套层同样），因此返回值可直接
+进项目 `:file-configs' / `:file-secrets' 槽；缺失或形态不对时返回 nil。"
+  (let ((value (ebasecamp-import--field object key)))
+    (and (consp value) (proper-list-p value) value)))
+
 ;;; 项目名推断
 
 (defun ebasecamp-import--name-from-file (file)
@@ -430,12 +462,22 @@ compose 的 env_file 合法形态为字符串 / 字符串列表 / {path, require
   "把 compose config 的 JSON 字符串映射为 `ebasecamp-project' 结构（纯函数）。
 FILE 可选，仅用于项目名回退（缺省时回退为 `imported'）。
 映射规则见本文件 Commentary 与计划「导入映射规则」节。
-JSON 非法、缺 services、服务字段无法映射时 signal `ebasecamp-import-error'。"
+JSON 非法、缺 services、服务字段无法映射时 signal `ebasecamp-import-error'。
+
+顶层 `configs' / `secrets' 段原样写进项目的 `:file-configs' / `:file-secrets'
+槽（compose 的 `refers to undefined config' 就是顶层段被丢导致的）；其余未建模
+的顶层键不阻断导入，逐条记进 `ebasecamp-import-warnings'。"
+  (setq ebasecamp-import--last-warnings nil)
   (let* ((object (ebasecamp-import--parse-json-object json))
          (services (and (listp object) (ebasecamp-import--field object "services"))))
     (unless (and (listp services) services)
       (signal 'ebasecamp-import-error
               (list "compose 配置中没有可导入的 services 定义")))
+    (when (listp object)
+      (dolist (pair object)
+        (unless (member (car pair) ebasecamp-import--top-level-keys)
+          (ebasecamp-import--warn "顶层键 %s 暂不支持，已忽略"
+                                  (car pair)))))
     (let* ((service-plists
             (mapcar (lambda (pair)
                       (cons (intern (car pair))
@@ -457,7 +499,9 @@ JSON 非法、缺 services、服务字段无法映射时 signal `ebasecamp-impor
                            :scope 'per-project
                            :service-overrides service-plists))
        :shared-network t
-       :export-file nil))))
+       :export-file nil
+       :file-configs (ebasecamp-import--top-level-declarations object "configs")
+       :file-secrets (ebasecamp-import--top-level-declarations object "secrets")))))
 
 (defun ebasecamp-import-parse (file)
   "读取 compose 文件 FILE 并映射为 `ebasecamp-project' 结构。
@@ -498,25 +542,8 @@ JSON 非法、缺 services、服务字段无法映射时 signal `ebasecamp-impor
 
 ;;; 清单落盘
 
-(defconst ebasecamp-import--service-output-keys
-  '(:image :command :entrypoint :environment :labels :ports :volumes
-    :depends-on :networks :healthcheck :working-dir :user :restart :extra)
-  "落盘时服务字段的固定输出顺序。
-契约示例 image → command → environment → ports → volumes → depends-on →
-networks → healthcheck → restart → extra 的相对顺序在此保持不变；契约示例未
-列出的 entrypoint / labels / working-dir / user 插在语义相邻处。")
-
 (defconst ebasecamp-import--manifest-form-count 2
   "导入生成的清单文件应含的顶层 form 数：一个组定义 + 一个项目定义。")
-
-(defun ebasecamp-import--literal (value)
-  "把 VALUE 写成 Elisp 字面量字符串。
-`prin1-to-string' 只转义引号、反斜杠与控制字符，`${VAR}' 引用因此原样保留；
-绑定 `print-escape-newlines' 为 t，避免多行字符串破坏文件版式。"
-  (let ((print-length nil)
-        (print-level nil)
-        (print-escape-newlines t))
-    (prin1-to-string value)))
 
 (defun ebasecamp-import--normalize-name (name)
   "把 NAME（symbol 或字符串）校验为合法项目名并返回 symbol。
@@ -537,57 +564,35 @@ networks → healthcheck → restart → extra 的相对顺序在此保持不变
 
 (defun ebasecamp-import--service-form (name plist)
   "把服务 NAME（symbol）与属性 PLIST 渲染为完整的 `(NAME :KEY VALUE ...)'。
-首行不含缩进，续行缩进 4 空格；nil 值的键与空的 `:extra' 一律省略。"
-  (let ((lines nil))
-    (dolist (key ebasecamp-import--service-output-keys)
-      (let ((value (plist-get plist key)))
-        (when value
-          (push (format "    %s %s" key (ebasecamp-import--literal value))
-                lines))))
-    (if lines
-        (concat "(" (symbol-name name) "\n"
-                (mapconcat #'identity (nreverse lines) "\n")
-                ")")
-      (concat "(" (symbol-name name) ")"))))
+首行不含缩进，续行缩进 4 空格；nil 值的键与空的 `:extra' 一律省略。
+实现委托 `ebasecamp-manifest-service-form'（清单写盘内核），导入与界面写操作
+共用同一生成器，避免两处格式漂移；输出与历史实现逐字节一致。"
+  (ebasecamp-manifest-service-form name plist))
 
 (defun ebasecamp-import--group-form (name services)
   "渲染 `ebasecamp-define-group' 形式的多行字符串。
 NAME 为组名 symbol（同时是项目名），SERVICES 为 ((SERVICE . PLIST) ...)
 alist。服务定义写在组的 `:services'，项目归属写在组内 `:configs'：
 配置名取项目名、`:project' 同值，覆盖留空（服务定义已在组侧，无需重复）。
-加载期由 `ebasecamp-model-link-configs' 把它物化成项目的组引用。"
-  (let ((blocks (mapcar (lambda (pair)
-                          (ebasecamp-import--service-form
-                           (car pair) (cdr pair)))
-                        services))
-        (group (symbol-name name)))
-    (concat
-     "(ebasecamp-define-group " group "\n"
-     "  :title " (ebasecamp-import--literal group) "\n"
-     "  :scope per-project\n"
-     (if blocks
-         (concat "  :services\n  ("
-                 (mapconcat #'identity blocks "\n   ")
-                 ")\n")
-       "  :services nil\n")
-     ;; 配置名 = 项目名：物化后的组引用可追溯到导入来源，也满足
-     ;; 「同项目同组至多 1 个引用」的校验
-     "  :configs ((" group " :project " group ")))\n")))
+加载期由 `ebasecamp-model-link-configs' 把它物化成项目的组引用。
+实现委托 `ebasecamp-manifest-group-form'；输出与历史实现逐字节一致。"
+  (ebasecamp-manifest-group-form name services))
 
-(defun ebasecamp-import--project-form (name root)
+(defun ebasecamp-import--project-form (name root &optional file-configs file-secrets)
   "渲染 `ebasecamp-define-project' 形式的多行字符串。
-NAME 为项目名 symbol，ROOT 为项目根目录字符串。
+NAME 为项目名 symbol，ROOT 为项目根目录字符串，FILE-CONFIGS / FILE-SECRETS
+为 compose 顶层 `configs' / `secrets' 段的原样结构（非 nil 时才写）。
 不写 `:groups'：项目对组的引用由组内 `:configs' 在加载期物化而来，两处都写
-会构成「同项目同组双引用」而报加载错误。"
-  (concat
-   "(ebasecamp-define-project " (symbol-name name) "\n"
-   "  :title " (ebasecamp-import--literal (symbol-name name)) "\n"
-   "  :root " (ebasecamp-import--literal root) ")\n"))
+会构成「同项目同组双引用」而报加载错误。
+实现委托 `ebasecamp-manifest-project-form'；无顶层段时输出与历史实现逐字节一致。"
+  (ebasecamp-manifest-project-form name root file-configs file-secrets))
 
-(defun ebasecamp-import--manifest-content (name source root services)
+(defun ebasecamp-import--manifest-content (name source root services
+                                                &optional file-configs file-secrets)
   "生成清单文件全文。
 NAME 为项目名 symbol（同时是组名），SOURCE 为 compose 文件绝对路径，ROOT 为
-项目根目录，SERVICES 为导入的服务 alist。文件以单个换行结尾。
+项目根目录，SERVICES 为导入的服务 alist，FILE-CONFIGS / FILE-SECRETS 为 compose
+顶层段原样结构。文件以单个换行结尾。
 版式对齐 `ebasecamp-create-sample-config' 的模板：首行文件局部变量、第二行
 文件说明、空行后两行注释交代来源与安全约定。"
   (concat
@@ -599,14 +604,18 @@ NAME 为项目名 symbol（同时是组名），SOURCE 为 compose 文件绝对�
    "\n"
    (ebasecamp-import--group-form name services)
    "\n"
-   (ebasecamp-import--project-form name root)))
+   (ebasecamp-import--project-form name root file-configs file-secrets)))
 
 (defun ebasecamp-import--read-forms (file)
   "读出 FILE 的全部顶层 form 并返回列表。
 读取未完成（括号不平衡、语法错）时 signal `ebasecamp-import-error'；文件尾部
 只有注释或空白时视为正常结束（完整性由调用方用 form 数量判断）。
-注释必须用 `forward-comment' 显式跳过：临时 buffer 里的 `read' 不认 `;' 注释，
-会把整段注释当符号一路吃到文件末尾。"
+`;' 行注释由 `read' 自身跳过（实测 Emacs 31.1，旧 docstring 里「read 不认
+`;' 注释」的论断不成立）；`forward-comment' 保留只为与扫描器
+`ebasecamp-manifest--skip-trivia' 口径一致、并跳过 form 之间与文件尾部的空白。
+`#| |#' 块注释则 `read' 与 `forward-comment' 都不认（会
+`invalid-read-syntax'）：需要块注释语义时用 `ebasecamp-manifest--scan-forms'，
+本函数只读导入生成的清单文件。"
   (with-temp-buffer
     (insert-file-contents file)
     (set-syntax-table emacs-lisp-mode-syntax-table)
@@ -667,53 +676,55 @@ FORCE 为 nil 且目标已存在时 signal `ebasecamp-import-error'（不动原�
     (when (and backup (not force))
       (signal 'ebasecamp-import-error
               (list (format "%s 已存在；覆盖需显式指定 force" target))))
-    (let ((services (ebasecamp-import-service-plists
-                     (ebasecamp-import-parse source)))
+    (let ((project (ebasecamp-import-parse source))
           (project-root (or root
                             (directory-file-name
                              (file-name-directory source)))))
-      (make-directory (file-name-directory target) t)
-      (with-temp-file target
-        (insert (ebasecamp-import--manifest-content
-                 project-name source project-root services)))
-      ;; 自校验 1：文件可解析且 form 数量符合预期
-      (let ((forms (ebasecamp-import--read-forms target)))
-        (unless (= ebasecamp-import--manifest-form-count (length forms))
-          (ebasecamp-import--restore-file target backup)
-          (signal 'ebasecamp-import-error
-                  (list (format
-                         "%s 自校验失败：期望 %d 个顶层 form，实际 %d 个"
-                         target ebasecamp-import--manifest-form-count
-                         (length forms))))))
-      ;; 自校验 2：清单层能加载、新项目已注册，且组内 :configs 已物化为
-      ;; 带 :service-overrides 键的组引用（v0.2 格式的落地判据）
-      (let* ((status (ebasecamp-config-load directory))
-             (errors (plist-get status :errors))
-             (project (ebasecamp-model-project project-name))
-             (ref (and project
-                       (cl-find project-name
-                                (ebasecamp-project-groups project)
-                                :key (lambda (reference)
-                                       (plist-get reference :group))
-                                :test #'eq)))
-             (failure nil))
-        (cond
-         (errors
-          (setq failure
-                (mapconcat (lambda (item) (plist-get item :message))
-                           errors "；")))
-         ((null project)
-          (setq failure "写入后新项目未出现在清单注册表中"))
-         ((null ref)
-          (setq failure (format "组内 :configs 未物化出指向组 %s 的引用"
-                                project-name)))
-         ((null (plist-member ref :service-overrides))
-          (setq failure "物化出的组引用缺少 :service-overrides 键")))
-        (when failure
-          (ebasecamp-import--restore-file target backup)
-          (signal 'ebasecamp-import-error
-                  (list (format "%s 自校验失败：%s" target failure)))))
-      target)))
+      (let ((services (ebasecamp-import-service-plists project)))
+        (make-directory (file-name-directory target) t)
+        (with-temp-file target
+          (insert (ebasecamp-import--manifest-content
+                   project-name source project-root services
+                   (ebasecamp-project-file-configs project)
+                   (ebasecamp-project-file-secrets project))))
+        ;; 自校验 1：文件可解析且 form 数量符合预期
+        (let ((forms (ebasecamp-import--read-forms target)))
+          (unless (= ebasecamp-import--manifest-form-count (length forms))
+            (ebasecamp-import--restore-file target backup)
+            (signal 'ebasecamp-import-error
+                    (list (format
+                           "%s 自校验失败：期望 %d 个顶层 form，实际 %d 个"
+                           target ebasecamp-import--manifest-form-count
+                           (length forms))))))
+        ;; 自校验 2：清单层能加载、新项目已注册，且组内 :configs 已物化为
+        ;; 带 :service-overrides 键的组引用（v0.2 格式的落地判据）
+        (let* ((status (ebasecamp-config-load directory))
+               (errors (plist-get status :errors))
+               (project (ebasecamp-model-project project-name))
+               (ref (and project
+                         (cl-find project-name
+                                  (ebasecamp-project-groups project)
+                                  :key (lambda (reference)
+                                         (plist-get reference :group))
+                                  :test #'eq)))
+               (failure nil))
+          (cond
+           (errors
+            (setq failure
+                  (mapconcat (lambda (item) (plist-get item :message))
+                             errors "；")))
+           ((null project)
+            (setq failure "写入后新项目未出现在清单注册表中"))
+           ((null ref)
+            (setq failure (format "组内 :configs 未物化出指向组 %s 的引用"
+                                  project-name)))
+           ((null (plist-member ref :service-overrides))
+            (setq failure "物化出的组引用缺少 :service-overrides 键")))
+          (when failure
+            (ebasecamp-import--restore-file target backup)
+            (signal 'ebasecamp-import-error
+                    (list (format "%s 自校验失败：%s" target failure)))))
+        target))))
 
 ;;;###autoload
 (defun ebasecamp-import-file (file &optional name)
@@ -734,9 +745,16 @@ NAME 为默认项目名，省略时由 `ebasecamp-import-suggest-name' 推断；
     (when (and (file-exists-p target)
                (not (y-or-n-p (format "%s 已存在，覆盖？" target))))
       (user-error "已取消导入"))
-    (let ((path (ebasecamp-import-apply file project-name :force t)))
+    (let ((path (ebasecamp-import-apply file project-name :force t))
+          (warnings (ebasecamp-import-warnings)))
+      (when warnings
+        (message "导入完成，有 %d 条提示：%s"
+                 (length warnings)
+                 (mapconcat #'identity warnings "；")))
       (message "已导入到 %s，运行 M-x ebasecamp 查看" path)
       path)))
 
 (provide 'ebasecamp-import)
+;;; ebasecamp-import.el ends here
+
 ;;; ebasecamp-import.el ends here

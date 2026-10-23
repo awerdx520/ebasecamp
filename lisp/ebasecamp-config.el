@@ -1,7 +1,7 @@
 ;;; ebasecamp-config.el --- ebasecamp 清单加载 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.4.0
+;; Version: 0.5.1
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -232,6 +232,18 @@ GROUPS 与 PROJECTS 是本次加载后的注册表内容；ERRORS 是错误 plis
           :projects (ebasecamp-model-projects)
           :errors errors
           :bootstrap-needed bootstrap-needed)))
+
+;;; 错误消息投影
+
+(defun ebasecamp-config-error-messages (&optional result)
+  "返回清单加载结果 RESULT 的错误消息列表。
+RESULT 为 `ebasecamp-config-load' 的返回值 plist；省略或为 nil 时现跑一次
+`ebasecamp-config-load'。只取每项的 `:message'（不含 `:file' 与
+`:condition'），供「写盘前后错误集差分」使用：差分只比较消息文本，因此同一条
+既有错误即使所在文件路径或行号漂移也不会被误判成「新增错误」而触发回滚
+（清单写盘事务的回滚判据，见 `ebasecamp-manifest--write-transaction'）。"
+  (let ((errors (plist-get (or result (ebasecamp-config-load)) :errors)))
+    (mapcar (lambda (error) (plist-get error :message)) errors)))
 
 (provide 'ebasecamp-config)
 ;;; ebasecamp-config.el ends here

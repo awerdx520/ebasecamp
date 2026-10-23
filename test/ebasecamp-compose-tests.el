@@ -566,4 +566,57 @@ mysql 属 shared 组而 api、migrate 属 per-project 组，两批落在不同 c
       (should (= 0 (ebasecamp-compose-test--line-count "    ports:" yaml)))
       (should (= 0 (ebasecamp-compose-test--line-count "    volumes:" yaml))))))
 
+;;; 顶层 configs / secrets（X2）
+
+(ert-deftest ebasecamp-compose-test-renders-top-configs ()
+  "项目带 :file-configs 时，per-project 渲染输出顶层 `configs:' 段。
+段内用 `--yaml-map' 渲染（配置名 → 二层结构），缩进与 docker 惯例一致。"
+  (ebasecamp-compose-test--clean
+    (ebasecamp-define-group web :services ((web :image "nginx:1.27")))
+    (ebasecamp-define-project site
+      :groups ((web))
+      :file-configs (("web_cfg" . (("file" . "./web.conf")))))
+    (let ((yaml (ebasecamp-compose-render (ebasecamp-model-project 'site))))
+      (should (= 1 (ebasecamp-compose-test--line-count "configs:" yaml)))
+      (should (string-match-p "configs:\n  web_cfg:\n    file: \\./web\\.conf\n"
+                              yaml))
+      ;; 顶层段在 services 之后
+      (should (< (string-match-p "^services:" yaml)
+                 (string-match-p "^configs:" yaml))))))
+
+(ert-deftest ebasecamp-compose-test-renders-top-secrets ()
+  "项目带 :file-secrets 时输出顶层 `secrets:' 段；`external: true' 渲染为 true。"
+  (ebasecamp-compose-test--clean
+    (ebasecamp-define-group web :services ((web :image "nginx:1.27")))
+    (ebasecamp-define-project site
+      :groups ((web))
+      :file-secrets (("db_pass" . (("file" . "./db_pass.txt")))
+                     ("ext_key" . (("external" . t)))))
+    (let ((yaml (ebasecamp-compose-render (ebasecamp-model-project 'site))))
+      (should (= 1 (ebasecamp-compose-test--line-count "secrets:" yaml)))
+      (should (string-match-p
+               "secrets:\n  db_pass:\n    file: \\./db_pass\\.txt\n"
+               yaml))
+      (should (string-match-p "  ext_key:\n    external: true" yaml)))))
+
+(ert-deftest ebasecamp-compose-test-shared-omits-top-configs ()
+  "shared 生成物（refs 全为 shared）不输出顶层 configs / secrets；
+同一项目按 per-project 渲染时输出。"
+  (ebasecamp-compose-test--clean
+    (ebasecamp-define-group base
+      :scope shared
+      :services ((mysql :image "mysql:8.4")))
+    (ebasecamp-define-group app :services ((api :image "app:1")))
+    (ebasecamp-define-project shop
+      :groups ((base) (app))
+      :file-configs (("web_cfg" . (("file" . "./web.conf"))))
+      :file-secrets (("db_pass" . (("file" . "./db_pass.txt")))))
+    (let ((project (ebasecamp-model-project 'shop)))
+      (let ((shared (ebasecamp-compose-render project '(base))))
+        (should (= 0 (ebasecamp-compose-test--line-count "configs:" shared)))
+        (should (= 0 (ebasecamp-compose-test--line-count "secrets:" shared))))
+      (let ((per-project (ebasecamp-compose-render project '(app))))
+        (should (= 1 (ebasecamp-compose-test--line-count "configs:" per-project)))
+        (should (= 1 (ebasecamp-compose-test--line-count "secrets:" per-project)))))))
+
 ;;; ebasecamp-compose-tests.el ends here
