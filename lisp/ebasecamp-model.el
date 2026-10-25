@@ -1,7 +1,7 @@
 ;;; ebasecamp-model.el --- ebasecamp 清单数据模型 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.5.1
+;; Version: 0.5.2
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -707,6 +707,21 @@ CONFIG 形如 (CONFIG-NAME . PLIST)。返回
            (plist-get (cdr config) :services)
            (format "配置 %s/%s" group-name (car config))))))
 
+(defun ebasecamp-model--replace-group-reference (project group-name reference)
+  "把 PROJECT 的 groups 槽中首个 :group 为 GROUP-NAME 的引用替换为 REFERENCE。
+原位替换：只对该列表元素所在的 cell 做 setcar，保持元素位置不变；
+REFERENCE 的 plist 内容不被修改（基线是浅拷贝，不得污染旧引用对象）。
+命中并替换时返回 t，未命中返回 nil。"
+  (let ((cells (ebasecamp-project-groups project))
+        (replaced nil))
+    (while (and cells (null replaced))
+      (if (eq group-name (plist-get (car cells) :group))
+          (progn
+            (setcar cells reference)
+            (setq replaced t))
+        (setq cells (cdr cells))))
+    replaced))
+
 (defun ebasecamp-model--unknown-override (services overrides)
   "返回 OVERRIDES 中未在 SERVICES 里定义的首个服务名，全部存在时返回 nil。"
   (let (unknown)
@@ -727,12 +742,18 @@ nil（模型层不感知文件），由调用方补填定义文件。本函数�
 物化规则：每份配置产出一个组引用
 \(:group GROUP :scope GROUP-SCOPE :service-overrides ALIST)，ALIST 由
 `ebasecamp-model--normalize-service-overrides' 归一化（D6：不写 :services）。
-项目侧旧 :groups 引用保持在前，物化结果按「组定义顺序 → 配置定义顺序」
-追加在后。
+项目侧旧 :groups 引用保持在前（被组侧配置接管的除外，见下），物化结果按
+「组定义顺序 → 配置定义顺序」追加在后。
+
+旧写法兼容（A-I）：项目的旧 `:groups' 与组侧 `:configs' 指向**同一项目
+同一组**时，由组侧配置**原位接管**该引用（列表位置不变，:group / :scope /
+:service-overrides 取配置值），不记错误；仅当**两份以上组侧配置**指向同一
+项目同一组时才记 :duplicate-group（容器标签无配置维度，服务名会撞）。
 
 校验（任一命中即记错误并跳过该配置，不中断其余项）：
 - 配置引用的项目未定义；
-- 同项目同组已有引用（来自旧 :groups 或另一份配置）；
+- 同项目同组已有**另一份配置**物化出的引用（旧 :groups 的引用可被接管，
+  不算冲突）；
 - shared 组配置份数超过 1（整组跳过，无法判定哪份生效）；
 - 覆盖了组内不存在的服务；
 - 覆盖项本身非法（`ebasecamp-model-error'，B2 已校验，此处兜底）。
@@ -741,14 +762,18 @@ nil（模型层不感知文件），由调用方补填定义文件。本函数�
 重算并重新追加，因此连续调用不会产生重复引用。不调用本函数时，项目
 groups 槽保持定义时的原样（v0.1 行为不变）。"
   (let ((sources (make-hash-table :test #'equal))
+        (legacy (make-hash-table :test #'equal))
         (errors nil))
-    ;; 1. 项目 groups 槽回到物化前基线，并登记旧引用的来源
+    ;; 1. 项目 groups 槽回到物化前基线，并登记旧引用的来源：sources 供错误
+    ;;    消息使用（其值只用于消息，不作判据），legacy 标记该引用可被组侧
+    ;;    配置原位接管。
     (dolist (project (ebasecamp-model-projects))
       (let ((project-name (ebasecamp-project-name project))
             (baseline (ebasecamp-model--legacy-groups-of project)))
         (dolist (reference baseline)
           (puthash (cons project-name (plist-get reference :group))
-                   "旧 :groups" sources))
+                   "旧 :groups" sources)
+          (puthash (cons project-name (plist-get reference :group)) t legacy))
         (setf (ebasecamp-project-groups project) baseline)))
     ;; 2. 逐组逐份配置校验并物化
     (dolist (group (ebasecamp-model-groups))
@@ -780,11 +805,14 @@ groups 槽保持定义时的原样（v0.1 行为不变）。"
                        "配置 %s/%s 引用了未定义的项目 %s"
                        group-name config-name project-name)
                       errors))
-               ;; E2：同项目同组已有引用（旧 :groups 或先前物化的配置）
-               ((cl-find group-name (ebasecamp-project-groups project)
-                         :key (lambda (reference)
-                                (plist-get reference :group))
-                         :test #'eq)
+               ;; E2：同项目同组已有引用（旧 :groups 或先前物化的配置）。
+               ;; A-I：该引用若来自旧 :groups（legacy 有标记），不报错，交给
+               ;; 下方物化分支原位接管；否则保持原判定记错误。
+               ((and (cl-find group-name (ebasecamp-project-groups project)
+                              :key (lambda (reference)
+                                     (plist-get reference :group))
+                              :test #'eq)
+                     (not (gethash (cons project-name group-name) legacy)))
                 (push (ebasecamp-model--link-error
                        :duplicate-group (cons group-name project-name)
                        "项目 %s 重复引用组 %s（来源：%s）"
@@ -822,9 +850,17 @@ groups 槽保持定义时的原样（v0.1 行为不变）。"
                                  "配置 %s/%s 覆盖了不存在的服务 %s"
                                  group-name config-name unknown)
                                 errors)
-                        (setf (ebasecamp-project-groups project)
-                              (append (ebasecamp-project-groups project)
-                                      (list reference)))
+                        (if (gethash (cons project-name group-name) legacy)
+                            ;; A-I：旧 :groups 的引用由组侧配置原位接管
+                            ;; （位置不变），接管后立即清除 legacy 标记，
+                            ;; 否则第二份配置会再次接管并静默丢掉第一份。
+                            (progn
+                              (ebasecamp-model--replace-group-reference
+                               project group-name reference)
+                              (remhash (cons project-name group-name) legacy))
+                          (setf (ebasecamp-project-groups project)
+                                (append (ebasecamp-project-groups project)
+                                        (list reference))))
                         (puthash (cons project-name group-name)
                                  (format "配置 %s" config-name)
                                  sources))))))))))))))

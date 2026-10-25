@@ -3097,7 +3097,7 @@ dialog 内容不落 buffer（W0.3 实测），因此断言只读 ref 值。"
           (cl-letf (((symbol-function 'completing-read)
                      (lambda (&rest _) (pop answers)))
                     ((symbol-function 'ebasecamp-config-write-add-config)
-                     (lambda (group config project)
+                     (lambda (group config project &optional _migrate)
                        (push (list group config project) calls)))
                     ((symbol-function 'ebasecamp-reload)
                      (lambda () nil)))
@@ -3137,6 +3137,128 @@ dialog 内容不落 buffer（W0.3 实测），因此断言只读 ref 值。"
             (let ((binding (etaf--keys-binding (vector key))))
               (should binding)
               (should-not (eq binding #'ignore)))))))))
+
+;;; 批次 4（A-II）：旧 :groups 迁移的用户确认（写盘层绝不静默）
+
+;; UI 是唯一的触发点：两个入口（`X' → 新建配置、`E' → 改配置关联项目）在调用
+;; 写盘前用 `ebasecamp-config-write--legacy-reference-file' 检测旧引用，命中才
+;; `y-or-n-p'；答 yes 传 `migrate-legacy' = t，答 no 传 nil（仍成功，走 A-I 兼容
+;; 路径，下次再提示）。
+;;
+;; 测试用 `cl-letf' 打桩三处：
+;; - `ebasecamp-config-write--legacy-reference-file'：UI 测试的清单是内存定义
+;;   （`ebasecamp-define-group'/`-project'），磁盘上没有 `projects/*.el'，真实现
+;;   必然返回 nil；打桩让它命中，从而验证 UI 的确认与传参逻辑本身；
+;; - `y-or-n-p'：记录是否被问、返回 t / nil；
+;; - 写盘入口：捕获实参（含第 4 参 migrate-legacy）。
+
+(ert-deftest ebasecamp-ui-test-x-new-config-asks-before-migrating-legacy ()
+  "「新建配置」命中旧引用 → 问一次 `y-or-n-p'；答 yes 时写盘第 4 参为非 nil。
+确认文案照抄计划（项目名 / 组名 / 「旧写法 :groups」/「接管」）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--write-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40)
+            (answers '("新建配置" "prod" "myapp"))
+            (asked nil)
+            (lookups nil)
+            (calls nil))
+        (ebasecamp-ui-test--with-open-ui
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (&rest _) (pop answers)))
+                    ((symbol-function 'y-or-n-p)
+                     (lambda (prompt) (push prompt asked) t))
+                    ((symbol-function
+                      'ebasecamp-config-write--legacy-reference-file)
+                     (lambda (project group)
+                       (push (list project group) lookups)
+                       (list "/tmp/legacy/demo.el" :start 1 :end 2)))
+                    ((symbol-function 'ebasecamp-config-write-add-config)
+                     (lambda (group config project &optional migrate)
+                       (push (list group config project migrate) calls)))
+                    ((symbol-function 'ebasecamp-reload)
+                     (lambda () nil)))
+            (ebasecamp-ui--manifest-menu)
+            ;; 查询按 `(项目 组)' 顺序，且只问一次
+            (should (equal '((myapp "mysql")) lookups))
+            (should (= 1 (length asked)))
+            (should (string-match-p "项目 myapp" (car asked)))
+            (should (string-match-p "组 mysql" (car asked)))
+            (should (string-match-p "旧写法 :groups" (car asked)))
+            (should (string-match-p "接管" (car asked)))
+            (should (string-match-p "是否同时删掉" (car asked)))
+            ;; 写盘第 4 参为非 nil
+            (should (= 1 (length calls)))
+            (should (equal '("mysql" "prod" myapp) (butlast (car calls))))
+            (should (nth 3 (car calls)))
+            (should-not answers)))))))
+
+(ert-deftest ebasecamp-ui-test-x-new-config-declines-migration ()
+  "答 no → 写盘第 4 参为 nil，流程仍成功（无 error notice）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--write-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40)
+            (answers '("新建配置" "prod" "myapp"))
+            (asked 0)
+            (calls nil))
+        (ebasecamp-ui-test--with-open-ui
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (&rest _) (pop answers)))
+                    ((symbol-function 'y-or-n-p)
+                     (lambda (_prompt) (cl-incf asked) nil))
+                    ((symbol-function
+                      'ebasecamp-config-write--legacy-reference-file)
+                     (lambda (&rest _) (list "/tmp/legacy/demo.el" :start 1)))
+                    ((symbol-function 'ebasecamp-config-write-add-config)
+                     (lambda (group config project &optional migrate)
+                       (push (list group config project migrate) calls)))
+                    ((symbol-function 'ebasecamp-reload)
+                     (lambda () nil)))
+            (ebasecamp-ui--manifest-menu)
+            (should (= 1 asked))
+            (should (= 1 (length calls)))
+            (should-not (nth 3 (car calls)))
+            ;; 流程成功：notice 不是 error
+            (let ((notice (ebasecamp-ui-test--notice)))
+              (should-not (eq 'error (plist-get notice :kind))))
+            (should-not answers)))))))
+
+(ert-deftest ebasecamp-ui-test-e-editor-asks-before-migrating-legacy ()
+  "`E'（`--open-config-editor'）命中旧引用 → 问一次 `y-or-n-p'，答 yes 时
+`-update-config-project' 的第 4 参为非 nil。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--write-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40)
+            (answers '("myapp"))
+            (asked nil)
+            (lookups nil)
+            (calls nil))
+        (ebasecamp-ui-test--with-open-ui
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (&rest _) (pop answers)))
+                    ((symbol-function 'y-or-n-p)
+                     (lambda (prompt) (push prompt asked) t))
+                    ((symbol-function
+                      'ebasecamp-config-write--legacy-reference-file)
+                     (lambda (project group)
+                       (push (list project group) lookups)
+                       (list "/tmp/legacy/demo.el" :start 1 :end 2)))
+                    ((symbol-function
+                      'ebasecamp-config-write-update-config-project)
+                     (lambda (group config project &optional migrate)
+                       (push (list group config project migrate) calls)))
+                    ((symbol-function 'ebasecamp-reload)
+                     (lambda () nil)))
+            (ebasecamp-ui--open-config-editor)
+            (should (equal '((myapp "mysql")) lookups))
+            (should (= 1 (length asked)))
+            (should (string-match-p "项目 myapp" (car asked)))
+            (should (= 1 (length calls)))
+            (should (equal '("mysql" dev myapp) (butlast (car calls))))
+            (should (nth 3 (car calls)))
+            (should-not answers)))))))
 
 (provide 'ebasecamp-ui-tests)
 ;;; ebasecamp-ui-tests.el ends here

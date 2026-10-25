@@ -687,22 +687,6 @@ FORM 以 `eval' 求值，用法与既有用例一致。"
                      (ebasecamp-project-groups
                       (ebasecamp-model-project 'myapp)))))))
 
-(ert-deftest ebasecamp-model-test-materialize-errors-on-duplicate-group-reference ()
-  "E2（冲突形态）：旧 :groups 与配置指向同组时记错误，不追加重复引用。"
-  (ebasecamp-model-test--clean
-    (ebasecamp-define-group mysql
-      :services ((mysql :image "mysql:8.4"))
-      :configs ((dev :project myapp)))
-    (ebasecamp-define-project myapp :groups ((mysql)))
-
-    (let ((errors (ebasecamp-model-link-configs)))
-      (should (= 1 (length errors)))
-      (should (equal "项目 myapp 重复引用组 mysql（来源：旧 :groups）"
-                     (plist-get (car errors) :message)))
-      (should (equal '((:group mysql :scope nil :service-overrides nil))
-                     (ebasecamp-project-groups
-                      (ebasecamp-model-project 'myapp)))))))
-
 (ert-deftest ebasecamp-model-test-materialize-errors-on-duplicate-configs-same-project ()
   "E2（配置间形态）：两份配置指向同一项目同一组时，第二份记错误。"
   (ebasecamp-model-test--clean
@@ -785,5 +769,77 @@ FORM 以 `eval' 求值，用法与既有用例一致。"
       (should (equal before
                      (ebasecamp-project-groups
                       (ebasecamp-model-project 'myapp)))))))
+
+;;; 21. 加载期去重（A-I：旧 :groups 被组侧配置原位接管）
+
+(ert-deftest ebasecamp-model-test-legacy-reference-taken-over-by-config ()
+  "A-I：旧 :groups 与组侧 1 份配置指向同项目同组 → 零错误且原位接管。
+追加一条无配置的旧引用（redis）用于验证接管后元素位置不变。"
+  (ebasecamp-model-test--clean
+    (ebasecamp-define-group db
+      :services ((db :image "postgres:16" :ports ((5432 . 5432))))
+      :configs ((cfg :project demo :services ((db :ports ((5432 . 5433)))))))
+    (ebasecamp-define-group redis
+      :services ((redis :image "redis:7")))
+    (ebasecamp-define-project demo :groups ((db) (redis)))
+
+    (should-not (ebasecamp-model-link-configs))
+    (let ((groups (ebasecamp-project-groups (ebasecamp-model-project 'demo))))
+      (should (= 2 (length groups)))
+      ;; 原位：db 仍在首位，redis 仍在次位（未被追加到末尾打乱顺序）
+      (let ((ref (car groups)))
+        (should (eq 'db (plist-get ref :group)))
+        (should (equal '((db :ports ((5432 . 5433))))
+                       (plist-get ref :service-overrides))))
+      (should (eq 'redis (plist-get (cadr groups) :group)))
+      (should-not (plist-get (cadr groups) :service-overrides)))))
+
+(ert-deftest ebasecamp-model-test-two-configs-same-project-report-first-config ()
+  "A-I：无旧写法、两份配置指向同项目同组 → 报错并点名第一份配置。"
+  (ebasecamp-model-test--clean
+    (ebasecamp-define-group db
+      :services ((db :image "postgres:16"))
+      :configs ((config-a :project demo)
+                (config-b :project demo)))
+    (ebasecamp-define-project demo)
+
+    (let ((errors (ebasecamp-model-link-configs)))
+      (should (= 1 (length errors)))
+      (should (eq :duplicate-group
+                  (cadr (plist-get (car errors) :condition))))
+      (should (string-match-p "来源：配置 config-a"
+                              (plist-get (car errors) :message))))))
+
+(ert-deftest ebasecamp-model-test-taken-over-then-second-config-conflicts ()
+  "A-I：旧写法被接管后再来第 2 份配置 → 报错并点名第一份配置。
+用于验证 `legacy` 标记在接管后已被清除（否则第二份配置会再次接管、
+静默丢掉第一份）。"
+  (ebasecamp-model-test--clean
+    (ebasecamp-define-group db
+      :services ((db :image "postgres:16"))
+      :configs ((config-a :project demo)
+                (config-b :project demo)))
+    (ebasecamp-define-project demo :groups ((db)))
+
+    (let ((errors (ebasecamp-model-link-configs)))
+      (should (= 1 (length errors)))
+      (should (string-match-p "来源：配置 config-a"
+                              (plist-get (car errors) :message)))
+      ;; 不得再报「来源：旧 :groups」——接管后 legacy 标记已清除
+      (should-not (string-match-p "旧 :groups"
+                                  (plist-get (car errors) :message))))))
+
+(ert-deftest ebasecamp-model-test-legacy-reference-without-config-stays-legacy ()
+  "A-I 回归保护：旧 :groups 无组侧配置 → 引用保持 legacy 形态（零错误）。"
+  (ebasecamp-model-test--clean
+    (ebasecamp-define-group db
+      :services ((db :image "postgres:16")))
+    (ebasecamp-define-project demo :groups ((db)))
+
+    (should-not (ebasecamp-model-link-configs))
+    (let ((groups (ebasecamp-project-groups (ebasecamp-model-project 'demo))))
+      (should (= 1 (length groups)))
+      (should (eq 'db (plist-get (car groups) :group)))
+      (should-not (plist-get (car groups) :service-overrides)))))
 
 ;;; ebasecamp-model-tests.el ends here

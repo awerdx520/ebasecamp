@@ -1119,5 +1119,229 @@ MARKER 是 form 开头的唯一片段（例如 `(db'）；找不到时 `ert-fail
       (should (file-exists-p file))
       (should (equal hash (ebasecamp-config-write-test--hash file))))))
 
+;;; 批次 4（A-II）：旧 :groups 写盘迁移（须用户确认，绝不静默）
+
+;; 背景：A-I 让「旧 :groups + 组侧配置」共存不报错；A-II 在用户确认后把旧引用
+;; 真正从项目文件里删掉。两条编排路径**必须分别实现**：
+;; - 同文件（组与项目在同一个 `projects/*.el'）→ 一次事务内两处降序替换
+;;   （组侧 `:configs' 追加 + 项目侧 `:groups' 删元素），复用
+;;   `--move-config-within-file' 的 `--replace-forms' 模式；
+;; - 跨文件（组在 groups.el、项目在 projects/*.el）→ 两次事务 + 备份补偿
+;;   （第二段失败用第一段备份恢复组文件原文并 signal 原错误），复用
+;;   `--move-config-across-files' 的补偿模式。
+;; 写盘层 `migrate-legacy' 默认 nil：脚本 / 测试调用零行为变更（项目文件逐字节
+;; 不变，由用例④守护）。
+
+(defconst ebasecamp-config-write-test--legacy-same-file
+  (concat
+   ";;; -*- lexical-binding: t; -*-\n"
+   ";;; projects/x.el --- 组与项目同文件，项目仍用旧写法 :groups\n"
+   "\n"
+   "(ebasecamp-define-group db\n"
+   "  :title \"db\"\n"
+   "  :scope per-project\n"
+   "  :services ((postgres :image \"postgres:16\"))\n"
+   "  :configs nil)\n"
+   "\n"
+   "(ebasecamp-define-group cache\n"
+   "  :title \"cache\"\n"
+   "  :scope per-project\n"
+   "  :services ((redis :image \"redis:7\"))\n"
+   "  :configs nil)\n"
+   "\n"
+   "(ebasecamp-define-project demo\n"
+   "  :title \"demo\"\n"
+   "  :root \"/tmp/ebc-demo\"\n"
+   "  :groups ((db) (cache)))\n")
+  "同文件迁移用的清单：`projects/x.el' 含两个组 + 一个用旧写法引用它们的项目。")
+
+(defconst ebasecamp-config-write-test--legacy-groups-file
+  (concat
+   ";;; -*- lexical-binding: t; -*-\n"
+   ";;; groups.el --- 跨文件迁移：组定义\n"
+   "\n"
+   "(ebasecamp-define-group db\n"
+   "  :title \"db\"\n"
+   "  :scope per-project\n"
+   "  :services ((postgres :image \"postgres:16\"))\n"
+   "  :configs nil)\n")
+  "跨文件迁移的组文件：组 db 没有配置，项目侧仍用旧写法引用它。")
+
+(defconst ebasecamp-config-write-test--legacy-project-file
+  (concat
+   ";;; -*- lexical-binding: t; -*-\n"
+   ";;; projects/demo.el --- 跨文件迁移：项目定义（旧写法引用组）\n"
+   "\n"
+   "(ebasecamp-define-project demo\n"
+   "  :title \"demo\"\n"
+   "  :root \"/tmp/ebc-demo\"\n"
+   "  :groups ((db)))\n")
+  "跨文件迁移的项目文件：`:groups' 只有组 db 这条旧引用。")
+
+(defun ebasecamp-config-write-test--write-legacy-across-files ()
+  "写跨文件迁移清单：组 db 在 groups.el、项目 demo 在 projects/demo.el。"
+  (ebasecamp-config-write-test--write-flat
+   (ebasecamp-config-write-test--groups-file)
+   ebasecamp-config-write-test--legacy-groups-file)
+  (ebasecamp-config-write-test--write-project-text
+   "demo" ebasecamp-config-write-test--legacy-project-file))
+
+(defun ebasecamp-config-write-test--legacy-file-path ()
+  "返回同文件迁移清单的文件路径（`projects/x.el'）。"
+  (expand-file-name "projects/x.el"
+                    ebasecamp-config-write-test--directory))
+
+(ert-deftest ebasecamp-config-write-test-migrate-legacy-within-file ()
+  "同文件迁移：一次事务里组侧 `:configs' 追加 + 项目侧删该旧引用元素。
+其余元素原位保留，组定义本身不被删除，重载零错误。"
+  (ebasecamp-config-write-test--with-directory
+    (ebasecamp-config-write-test--write-project-text
+     "x" ebasecamp-config-write-test--legacy-same-file)
+    (should (null (plist-get (ebasecamp-config-load) :errors)))
+    (let* ((file (ebasecamp-config-write-test--legacy-file-path))
+           (result (ebasecamp-config-write-add-config "db" "cfg" 'demo t))
+           (text (ebasecamp-config-write-test--read file)))
+      (should (null (plist-get result :errors)))
+      ;; 组侧：配置已追加
+      (should (equal '(cfg)
+                     (ebasecamp-config-write-test--configs-of 'db)))
+      (should (eq 'demo (ebasecamp-model-config-project
+                         (ebasecamp-model-config 'db 'cfg))))
+      ;; 项目侧：db 这条被删，cache 原位保留（不是整套重写）
+      (should (string-match-p ":groups ((cache))" text))
+      (should-not (string-match-p "(db)" text))
+      ;; 同文件里的两个组定义都还在
+      (should (string-match-p "(ebasecamp-define-group db" text))
+      (should (string-match-p "(ebasecamp-define-group cache" text))
+      ;; 重载零错误
+      (should (null (plist-get (ebasecamp-config-load) :errors)))
+      (should-not (ebasecamp-config-write-test--leftovers)))))
+
+(ert-deftest ebasecamp-config-write-test-migrate-legacy-across-files ()
+  "跨文件迁移：组文件事务追加配置，项目文件事务删除旧引用，两段都生效。"
+  (ebasecamp-config-write-test--with-directory
+    (ebasecamp-config-write-test--write-legacy-across-files)
+    (should (null (plist-get (ebasecamp-config-load) :errors)))
+    (let* ((groups-file (ebasecamp-config-write-test--groups-file))
+           (project-file (expand-file-name
+                          "projects/demo.el"
+                          ebasecamp-config-write-test--directory))
+           (result (ebasecamp-config-write-add-config 'db 'cfg 'demo t))
+           (groups-text (ebasecamp-config-write-test--read groups-file))
+           (project-text (ebasecamp-config-write-test--read project-file)))
+      (should (null (plist-get result :errors)))
+      ;; 第一段：组文件拿到配置
+      (should (equal '(cfg)
+                     (ebasecamp-config-write-test--configs-of 'db)))
+      (should (string-match-p "(cfg :project demo)" groups-text))
+      ;; 第二段：项目文件的旧引用被删（唯一元素 → 整条键移除）
+      (should-not (string-match-p ":groups" project-text))
+      (should (string-match-p "(ebasecamp-define-project demo" project-text))
+      ;; 重载零错误，两次事务都不遗留备份
+      (should (null (plist-get (ebasecamp-config-load) :errors)))
+      (should-not (ebasecamp-config-write-test--leftovers))
+      (should-not (directory-files
+                   (expand-file-name "projects/"
+                                     ebasecamp-config-write-test--directory)
+                   nil "\\`\\.ebasecamp-")))))
+
+(ert-deftest ebasecamp-config-write-test-migrate-legacy-rolls-back-first-transaction ()
+  "跨文件第二段失败 → 用第一段备份恢复组文件原文，并把原错误 signal 出去。
+两段都**逐字节**回到迁移前状态（跨文件没有原子性，只能靠备份补偿）。"
+  (ebasecamp-config-write-test--with-directory
+    (ebasecamp-config-write-test--write-legacy-across-files)
+    (should (null (plist-get (ebasecamp-config-load) :errors)))
+    (let* ((groups-file (ebasecamp-config-write-test--groups-file))
+           (project-file (expand-file-name
+                          "projects/demo.el"
+                          ebasecamp-config-write-test--directory))
+           (groups-before (ebasecamp-config-write-test--read groups-file))
+           (project-before (ebasecamp-config-write-test--read project-file))
+           (original (symbol-function 'ebasecamp-manifest--write-transaction))
+           (calls 0))
+      ;; 打桩：第二次事务（项目文件那段）直接失败
+      (cl-letf (((symbol-function 'ebasecamp-manifest--write-transaction)
+                 (lambda (file write-fn &rest keys)
+                   (cl-incf calls)
+                   (when (= calls 2)
+                     (error "模拟第二段写盘失败"))
+                   (apply original file write-fn keys))))
+        (should-error (ebasecamp-config-write-add-config 'db 'cfg 'demo t)
+                      :type 'error))
+      (should (= 2 calls))
+      ;; 第一段已被补偿回滚：组文件逐字节恢复原文
+      (should (equal groups-before
+                     (ebasecamp-config-write-test--read groups-file)))
+      ;; 第二段自身没写盘：项目文件也逐字节不变
+      (should (equal project-before
+                     (ebasecamp-config-write-test--read project-file)))
+      (should-not (ebasecamp-config-write-test--leftovers))
+      (should-not (directory-files
+                   (expand-file-name "projects/"
+                                     ebasecamp-config-write-test--directory)
+                   nil "\\`\\.ebasecamp-"))
+      ;; 磁盘状态与迁移前一致：组无配置、项目仍有旧引用
+      (ebasecamp-config-load)
+      (should-not (ebasecamp-config-write-test--configs-of 'db))
+      (should (string-match-p ":groups ((db))"
+                              (ebasecamp-config-write-test--read
+                               project-file))))))
+
+(ert-deftest ebasecamp-config-write-test-migrate-legacy-default-nil-keeps-project-file ()
+  "默认 `migrate-legacy' = nil：只写组文件，项目文件**逐字节不变**（绝不静默改写）。"
+  (ebasecamp-config-write-test--with-directory
+    (ebasecamp-config-write-test--write-legacy-across-files)
+    (should (null (plist-get (ebasecamp-config-load) :errors)))
+    (let* ((groups-file (ebasecamp-config-write-test--groups-file))
+           (project-file (expand-file-name
+                          "projects/demo.el"
+                          ebasecamp-config-write-test--directory))
+           (project-before (ebasecamp-config-write-test--read project-file))
+           (result (ebasecamp-config-write-add-config 'db 'cfg 'demo)))
+      (should (null (plist-get result :errors)))
+      (should (equal '(cfg)
+                     (ebasecamp-config-write-test--configs-of 'db)))
+      (should (string-match-p "(cfg :project demo)"
+                              (ebasecamp-config-write-test--read groups-file)))
+      ;; 项目文件一个字节都没动
+      (should (equal project-before
+                     (ebasecamp-config-write-test--read project-file)))
+      (should-not (ebasecamp-config-write-test--leftovers)))))
+
+(ert-deftest ebasecamp-config-write-test-migrate-legacy-removes-empty-groups-key ()
+  "`:groups' 只剩该组一条时**整条键被移除**（不留 `:groups nil'），重载零错误。"
+  (ebasecamp-config-write-test--with-directory
+    (ebasecamp-config-write-test--write-project-text
+     "x"
+     (concat ";;; -*- lexical-binding: t; -*-\n"
+             ";;; projects/x.el --- 旧写法只有一条引用\n"
+             "\n"
+             "(ebasecamp-define-group db\n"
+             "  :title \"db\"\n"
+             "  :scope per-project\n"
+             "  :services ((postgres :image \"postgres:16\"))\n"
+             "  :configs nil)\n"
+             "\n"
+             "(ebasecamp-define-project demo\n"
+             "  :title \"demo\"\n"
+             "  :root \"/tmp/ebc-demo\"\n"
+             "  :groups ((db)))\n"))
+    (should (null (plist-get (ebasecamp-config-load) :errors)))
+    (let* ((file (ebasecamp-config-write-test--legacy-file-path))
+           (result (ebasecamp-config-write-add-config 'db 'cfg 'demo t))
+           (text (ebasecamp-config-write-test--read file)))
+      (should (null (plist-get result :errors)))
+      ;; 整个 `:groups' 键（含关键字与值）消失——不是 `:groups nil'
+      (should-not (string-match-p ":groups" text))
+      (should-not (string-match-p "nil)" text))
+      ;; 项目 form 的其余键与结尾逐字节保留
+      (should (string-match-p "(ebasecamp-define-project demo" text))
+      (should (string-match-p ":root \"/tmp/ebc-demo\")" text))
+      ;; 重载零错误：项目不再引用该组，配置接管为唯一有效引用
+      (should (null (plist-get (ebasecamp-config-load) :errors)))
+      (should (equal '(cfg)
+                     (ebasecamp-config-write-test--configs-of 'db)))
+      (should-not (ebasecamp-config-write-test--leftovers)))))
+
 (provide 'ebasecamp-config-write-tests)
 ;;; ebasecamp-config-write-tests.el ends here

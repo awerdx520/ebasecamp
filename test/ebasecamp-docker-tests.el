@@ -221,6 +221,25 @@
       (should (cl-every (lambda (line) (string-match-p "level=warning" line))
                         (plist-get result :warnings))))))
 
+(ert-deftest ebasecamp-docker-test-check-compose-project-directory ()
+  "传 root 时命令行在 `-f FILE' 之后注入 `--project-directory' 且绝对化；
+不传 root 时命令行与历史逐字节一致（预校验与派发必须同基准）。"
+  (let (captured)
+    (let ((ebasecamp-docker--run-sync-function
+           (lambda (args _timeout)
+             (push args captured)
+             (list :exit 0 :stdout "" :stderr ""))))
+      (ebasecamp-docker-check-compose "/tmp/dir/compose.yaml" "rel")
+      (ebasecamp-docker-check-compose "/tmp/dir/compose.yaml"))
+    (setq captured (nreverse captured))
+    (should (equal (list "compose" "-f" (expand-file-name "/tmp/dir/compose.yaml")
+                         "--project-directory" (expand-file-name "rel")
+                         "config" "-q")
+                   (nth 0 captured)))
+    (should (equal (list "compose" "-f" (expand-file-name "/tmp/dir/compose.yaml")
+                         "config" "-q")
+                   (nth 1 captured)))))
+
 ;;; 14–16. run-sync / run-async
 
 (ert-deftest ebasecamp-docker-test-run-sync-captures-streams ()

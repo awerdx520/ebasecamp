@@ -231,6 +231,67 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
                  'nope "/tmp/f.yaml" "ebc-myapp" nil)
                 :type 'ebasecamp-command-error))
 
+;;; v0.5.2 批次 2（B-I）：`--project-directory' 注入
+;;
+;; `--project-directory' 是 docker compose 的**根级** flag，必须紧跟在
+;; `-f FILE' 之后、子命令之前（探针补证 6）；以下四条按动作逐一断言**位置**
+;; （整条序列 equal），并同时守护「不传 root 时与历史逐字节一致」。
+
+(ert-deftest ebasecamp-command-test-compose-args-root-start ()
+  "start：root 非 nil 时 flag 位于 `-f FILE' 之后、`-p' 之前；nil 时序列不变。"
+  (should (equal '("compose" "-f" "/tmp/f.yaml" "--project-directory" "/proj/app"
+                   "-p" "ebc-myapp" "up" "-d" "mysql" "redis")
+                 (ebasecamp-command-compose-args
+                  'start "/tmp/f.yaml" "ebc-myapp" '("mysql" "redis") "/proj/app")))
+  (should (equal '("compose" "-f" "/tmp/f.yaml" "-p" "ebc-myapp"
+                   "up" "-d" "mysql" "redis")
+                 (ebasecamp-command-compose-args
+                  'start "/tmp/f.yaml" "ebc-myapp" '("mysql" "redis")))))
+
+(ert-deftest ebasecamp-command-test-compose-args-root-stop ()
+  "stop：root 非 nil 时 flag 位于 `-f FILE' 之后、`-p' 之前；nil 时序列不变。"
+  (should (equal '("compose" "-f" "/tmp/f.yaml" "--project-directory" "/proj/app"
+                   "-p" "ebc-myapp" "stop" "mysql")
+                 (ebasecamp-command-compose-args
+                  'stop "/tmp/f.yaml" "ebc-myapp" '("mysql") "/proj/app")))
+  (should (equal '("compose" "-f" "/tmp/f.yaml" "-p" "ebc-myapp" "stop" "mysql")
+                 (ebasecamp-command-compose-args
+                  'stop "/tmp/f.yaml" "ebc-myapp" '("mysql")))))
+
+(ert-deftest ebasecamp-command-test-compose-args-root-restart ()
+  "restart：root 非 nil 时 flag 位于 `-f FILE' 之后、`-p' 之前；nil 时序列不变。"
+  (should (equal '("compose" "-f" "/tmp/f.yaml" "--project-directory" "/proj/app"
+                   "-p" "ebc-myapp" "restart" "mysql")
+                 (ebasecamp-command-compose-args
+                  'restart "/tmp/f.yaml" "ebc-myapp" '("mysql") "/proj/app")))
+  (should (equal '("compose" "-f" "/tmp/f.yaml" "-p" "ebc-myapp" "restart" "mysql")
+                 (ebasecamp-command-compose-args
+                  'restart "/tmp/f.yaml" "ebc-myapp" '("mysql")))))
+
+(ert-deftest ebasecamp-command-test-compose-args-root-down ()
+  "down：root 非 nil 时 flag 位于 `-f FILE' 之后、`-p' 之前；nil 时序列不变。"
+  (should (equal '("compose" "-f" "/tmp/f.yaml" "--project-directory" "/proj/app"
+                   "-p" "ebc-myapp" "down")
+                 (ebasecamp-command-compose-args
+                  'down "/tmp/f.yaml" "ebc-myapp" nil "/proj/app")))
+  (should (equal '("compose" "-f" "/tmp/f.yaml" "-p" "ebc-myapp" "down")
+                 (ebasecamp-command-compose-args
+                  'down "/tmp/f.yaml" "ebc-myapp" nil))))
+
+(ert-deftest ebasecamp-command-test-compose-args-root-expanded ()
+  "root 会被 `expand-file-name' 绝对化（相对路径不原样进命令行）。"
+  (let ((args (ebasecamp-command-compose-args
+               'start "/tmp/f.yaml" "ebc-myapp" '("mysql") "rel")))
+    (should (equal (expand-file-name "rel") (nth 4 args)))
+    (should-not (equal "rel" (nth 4 args)))
+    (should (equal "compose" (nth 0 args)))
+    (should (equal "-f" (nth 1 args)))
+    (should (equal "/tmp/f.yaml" (nth 2 args)))
+    (should (equal "--project-directory" (nth 3 args)))
+    (should (equal "-p" (nth 5 args)))
+    (should (equal "ebc-myapp" (nth 6 args)))
+    (should (equal "up" (nth 7 args)))))
+
 ;;; T3.1 执行层
 
 (ert-deftest ebasecamp-command-test-run-dispatches-both-scopes ()
@@ -246,7 +307,7 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
                    (format "/tmp/%s-compose.yaml"
                            (mapconcat #'symbol-name group-filter "-"))))
                 ((symbol-function 'ebasecamp-docker-check-compose)
-                 (lambda (_file) (list :ok t :exit 0 :stderr "")))
+                 (lambda (_file &rest _) (list :ok t :exit 0 :stderr "")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
                  (ebasecamp-command-test--stub-sync 0 ""))
                 ((symbol-function 'ebasecamp-docker-run-async)
@@ -278,7 +339,7 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
                  (lambda (_project group-filter)
                    (format "/tmp/%s.yaml" (mapconcat #'symbol-name group-filter "-"))))
                 ((symbol-function 'ebasecamp-docker-check-compose)
-                 (lambda (_file) (list :ok t :exit 0 :stderr "")))
+                 (lambda (_file &rest _) (list :ok t :exit 0 :stderr "")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
                  (ebasecamp-command-test--stub-sync 0 ""))
                 ((symbol-function 'ebasecamp-docker-run-async)
@@ -308,7 +369,7 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
       (cl-letf (((symbol-function 'ebasecamp-compose-write)
                  (lambda (_project _filter) "/tmp/fake.yaml"))
                 ((symbol-function 'ebasecamp-docker-check-compose)
-                 (lambda (_file) (list :ok t :exit 0 :stderr "")))
+                 (lambda (_file &rest _) (list :ok t :exit 0 :stderr "")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
                  (ebasecamp-command-test--stub-sync 0 ""))
                 ((symbol-function 'ebasecamp-docker-run-async)
@@ -333,7 +394,7 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
       (cl-letf (((symbol-function 'ebasecamp-compose-write)
                  (lambda (_project _filter) "/tmp/fake.yaml"))
                 ((symbol-function 'ebasecamp-docker-check-compose)
-                 (lambda (_file) (list :ok t :exit 0 :stderr "")))
+                 (lambda (_file &rest _) (list :ok t :exit 0 :stderr "")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
                  (ebasecamp-command-test--stub-sync 0 ""))
                 ((symbol-function 'ebasecamp-docker-run-async)
@@ -381,7 +442,7 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
       (cl-letf (((symbol-function 'ebasecamp-compose-write)
                  (lambda (_project _filter) "/tmp/fake.yaml"))
                 ((symbol-function 'ebasecamp-docker-check-compose)
-                 (lambda (_file) (error "down 不应做 compose 预校验")))
+                 (lambda (_file &rest _) (error "down 不应做 compose 预校验")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
                  (ebasecamp-command-test--stub-sync 0 ""))
                 ((symbol-function 'ebasecamp-docker-run-async)
@@ -532,7 +593,7 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
                    (format "/tmp/%s.yaml"
                            (mapconcat #'symbol-name group-filter "-"))))
                 ((symbol-function 'ebasecamp-docker-check-compose)
-                 (lambda (_file) (list :ok t :exit 0 :stderr "")))
+                 (lambda (_file &rest _) (list :ok t :exit 0 :stderr "")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
                  (ebasecamp-command-test--stub-sync 0 ""))
                 ((symbol-function 'ebasecamp-docker-run-async)
@@ -564,7 +625,7 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
       (cl-letf (((symbol-function 'ebasecamp-compose-write)
                  (lambda (_project _filter) "/tmp/fake.yaml"))
                 ((symbol-function 'ebasecamp-docker-check-compose)
-                 (lambda (_file) (list :ok t :exit 0 :stderr "")))
+                 (lambda (_file &rest _) (list :ok t :exit 0 :stderr "")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
                  (ebasecamp-command-test--stub-sync 0 ""))
                 ((symbol-function 'ebasecamp-docker-run-async)
@@ -628,7 +689,7 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
       (cl-letf (((symbol-function 'ebasecamp-compose-write)
                  (lambda (_project _filter) "/tmp/fake.yaml"))
                 ((symbol-function 'ebasecamp-docker-check-compose)
-                 (lambda (_file) (list :ok t :exit 0 :stderr "")))
+                 (lambda (_file &rest _) (list :ok t :exit 0 :stderr "")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
                  (ebasecamp-command-test--stub-sync 0 ""))
                 ((symbol-function 'ebasecamp-docker-run-async)
@@ -663,7 +724,7 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
                      (with-temp-file file (insert "name: broken\n"))
                      file)))
                 ((symbol-function 'ebasecamp-docker-check-compose)
-                 (lambda (file)
+                 (lambda (file &rest _)
                    (push file checked)
                    (list :ok nil :exit 1
                          :stderr (concat "service \"web\" refers to undefined"
@@ -707,7 +768,7 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
                     (concat (mapconcat #'symbol-name group-filter "-") ".yaml")
                     ebasecamp-cache-directory)))
                 ((symbol-function 'ebasecamp-docker-check-compose)
-                 (lambda (file)
+                 (lambda (file &rest _)
                    (push file checked)
                    (list :ok t :exit 0 :stderr "" :warnings nil)))
                 ((symbol-function 'ebasecamp-docker-run-sync)
@@ -731,7 +792,7 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
                     (concat (mapconcat #'symbol-name group-filter "-") ".yaml")
                     ebasecamp-cache-directory)))
                 ((symbol-function 'ebasecamp-docker-check-compose)
-                 (lambda (file)
+                 (lambda (file &rest _)
                    (push file checked)
                    (if (string-match-p "cache" file)
                        (list :ok nil :exit 1 :stderr "shared 生成物非法")
@@ -762,7 +823,7 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
                     (concat (mapconcat #'symbol-name group-filter "-") ".yaml")
                     ebasecamp-cache-directory)))
                 ((symbol-function 'ebasecamp-docker-check-compose)
-                 (lambda (_file)
+                 (lambda (_file &rest _)
                    (push 'check events)
                    (list :ok t :exit 0 :stderr "")))
                 ((symbol-function 'ebasecamp-docker-run-sync)
@@ -778,6 +839,176 @@ shared 组的 redis —— per-project 生成物里没有 redis 定义。"
         (should (equal '(check check run run) events))
         (should (eq t (plist-get result :ok)))
         (should-not (ebasecamp-command-pending-p project))))))
+
+;;; 批次 3（B-II）预校验：顶层 configs / secrets 的 file 存在性
+
+(defun ebasecamp-command-test--file-config-project (root &optional file-configs)
+  "构造带顶层 `:file-configs' 的项目，ROOT 为 `:root'（可为 nil）。
+FILE-CONFIGS 缺省为一条相对路径声明 `app_cfg' → \"./conf/app.conf\"。
+`ebasecamp-define-project' 是宏（ARGS 整体被 quote、表达式不求值），而这里的
+ROOT 是运行时值，因此直接调内部注册函数传入**求值后**的 plist。返回项目对象。"
+  (ebasecamp-define-group db
+    :scope per-project
+    :services
+    ((mysql :image "mysql:8.4" :ports ((3306 . 3306)))))
+  (ebasecamp-model--register-project
+   'myapp
+   (list :root root
+         :file-configs (or file-configs
+                           '(("app_cfg" ("file" . "./conf/app.conf"))))
+         :groups '((db))))
+  (ebasecamp-model-project 'myapp))
+
+(defmacro ebasecamp-command-test--with-root (&rest body)
+  "在新建的临时目录（带尾斜杠，不自动创建子路径）下执行 BODY，结束递归删除。
+BODY 内变量 `root' 绑定该目录。"
+  (declare (indent 0) (debug t))
+  `(let ((root (file-name-as-directory (make-temp-file "ebc-b2-" t))))
+     (unwind-protect
+         (progn ,@body)
+       (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ebasecamp-command-test-run-aborts-on-missing-top-level-file ()
+  "run：顶层 config 的 file 相对路径不存在 → 预校验失败、零派发、零写盘。"
+  (ebasecamp-command-test--clean
+    (ebasecamp-command-test--with-root
+      (let* ((project (ebasecamp-command-test--file-config-project
+                       (expand-file-name "absent" root)))
+             (writes 0)
+             (checks 0)
+             (calls 0)
+             (result nil))
+        (cl-letf (((symbol-function 'ebasecamp-compose-write)
+                   (lambda (&rest _)
+                     (setq writes (1+ writes))
+                     (expand-file-name "never.yaml" ebasecamp-cache-directory)))
+                  ((symbol-function 'ebasecamp-docker-check-compose)
+                   (lambda (&rest _)
+                     (setq checks (1+ checks))
+                     (list :ok t :exit 0 :stderr "")))
+                  ((symbol-function 'ebasecamp-docker-run-sync)
+                   (ebasecamp-command-test--stub-sync 0 ""))
+                  ((symbol-function 'ebasecamp-docker-run-async)
+                   (lambda (&rest _)
+                     (setq calls (1+ calls))
+                     'fake-process)))
+          (should-not
+           (ebasecamp-command-run 'start project nil
+                                  :on-complete (lambda (value) (setq result value))))
+          ;; 零派发：连生成物都不写、也不调 check-compose（检查在两者之前）
+          (should (= 0 calls))
+          (should (= 0 writes))
+          (should (= 0 checks))
+          (should-not (plist-get result :ok))
+          (should (eq 'start (plist-get result :action)))
+          (let ((failed (car (plist-get result :results))))
+            (should (eq t (plist-get failed :failed)))
+            (should-not (plist-get failed :exit))
+            (should (string-match-p "顶层 config"
+                                    (plist-get failed :stderr)))
+            (should (string-match-p "app_cfg" (plist-get failed :stderr)))
+            (should (string-match-p "conf/app\\.conf"
+                                    (plist-get failed :stderr)))
+            (should (string-match-p "不存在（基准："
+                                    (plist-get failed :stderr)))
+            (should (string-match-p
+                     (regexp-quote (expand-file-name "absent" root))
+                     (plist-get failed :stderr))))
+          (should-not (ebasecamp-command-pending-p project)))))))
+
+(ert-deftest ebasecamp-command-test-run-proceeds-when-top-level-file-exists ()
+  "run：顶层 config 的 file 存在 → 预校验放行并正常派发，无 warning。"
+  (ebasecamp-command-test--clean
+    (ebasecamp-command-test--with-root
+      (make-directory (expand-file-name "conf" root) t)
+      (with-temp-file (expand-file-name "conf/app.conf" root)
+        (insert "x\n"))
+      (let* ((project (ebasecamp-command-test--file-config-project root))
+             (checks 0)
+             (calls 0)
+             (result nil))
+        (cl-letf (((symbol-function 'ebasecamp-compose-write)
+                   (lambda (&rest _)
+                     (expand-file-name "generated.yaml"
+                                       ebasecamp-cache-directory)))
+                  ((symbol-function 'ebasecamp-docker-check-compose)
+                   (lambda (&rest _)
+                     (setq checks (1+ checks))
+                     (list :ok t :exit 0 :stderr "")))
+                  ((symbol-function 'ebasecamp-docker-run-sync)
+                   (ebasecamp-command-test--stub-sync 0 ""))
+                  ((symbol-function 'ebasecamp-docker-run-async)
+                   (lambda (_args callback &rest _)
+                     (setq calls (1+ calls))
+                     (funcall callback (list :exit 0 :stdout "" :stderr ""))
+                     'fake-process)))
+          (ebasecamp-command-run 'start project nil
+                                 :on-complete (lambda (value) (setq result value)))
+          (should (= 1 checks))
+          (should (= 1 calls))
+          (should (eq t (plist-get result :ok)))
+          (should-not (plist-get result :preflight-warnings)))))))
+
+(ert-deftest ebasecamp-command-test-run-warns-when-root-missing ()
+  "run：`:root' 为 nil 且有相对路径声明 → warning 不失败，结果带 :preflight-warnings。"
+  (ebasecamp-command-test--clean
+    (let* ((project (ebasecamp-command-test--file-config-project nil))
+           (calls 0)
+           (result nil))
+      (cl-letf (((symbol-function 'ebasecamp-compose-write)
+                 (lambda (&rest _)
+                   (expand-file-name "generated.yaml"
+                                     ebasecamp-cache-directory)))
+                ((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (&rest _) (list :ok t :exit 0 :stderr "")))
+                ((symbol-function 'ebasecamp-docker-run-sync)
+                 (ebasecamp-command-test--stub-sync 0 ""))
+                ((symbol-function 'ebasecamp-docker-run-async)
+                 (lambda (_args callback &rest _)
+                   (setq calls (1+ calls))
+                   (funcall callback (list :exit 0 :stdout "" :stderr ""))
+                   'fake-process)))
+        (ebasecamp-command-run 'start project nil
+                               :on-complete (lambda (value) (setq result value)))
+        (should (= 1 calls))
+        (should (eq t (plist-get result :ok)))
+        (let ((warnings (plist-get result :preflight-warnings)))
+          (should (consp warnings))
+          (should (= 1 (length warnings)))
+          (should (string-match-p "无 :root" (car warnings)))
+          (should (string-match-p "app_cfg" (car warnings)))
+          (should (string-match-p "conf/app\\.conf" (car warnings))))
+        ;; 失败路径专用的 :results 不受 warning 影响
+        (should-not (cl-find-if (lambda (entry) (plist-get entry :failed))
+                                (plist-get result :results)))))))
+
+(ert-deftest ebasecamp-command-test-run-skips-declarations-without-file ()
+  "run：`external: true' / 只有 `name' 的声明 → 跳过，不报错、无 warning。"
+  (ebasecamp-command-test--clean
+    (let* ((project (ebasecamp-command-test--file-config-project
+                     nil
+                     '(("cfg1" ("external" . t))
+                       ("cfg2" ("name" . "x")))))
+           (calls 0)
+           (result nil))
+      (cl-letf (((symbol-function 'ebasecamp-compose-write)
+                 (lambda (&rest _)
+                   (expand-file-name "generated.yaml"
+                                     ebasecamp-cache-directory)))
+                ((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (&rest _) (list :ok t :exit 0 :stderr "")))
+                ((symbol-function 'ebasecamp-docker-run-sync)
+                 (ebasecamp-command-test--stub-sync 0 ""))
+                ((symbol-function 'ebasecamp-docker-run-async)
+                 (lambda (_args callback &rest _)
+                   (setq calls (1+ calls))
+                   (funcall callback (list :exit 0 :stdout "" :stderr ""))
+                   'fake-process)))
+        (ebasecamp-command-run 'start project nil
+                               :on-complete (lambda (value) (setq result value)))
+        (should (= 1 calls))
+        (should (eq t (plist-get result :ok)))
+        (should-not (plist-get result :preflight-warnings))))))
 
 ;;; 错误条件定义
 

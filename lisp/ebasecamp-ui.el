@@ -1,7 +1,7 @@
 ;;; ebasecamp-ui.el --- ebasecamp 只读主界面（etaf / etaf-ui） -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.5.1
+;; Version: 0.5.2
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -1240,16 +1240,22 @@ GROUP-NAME 为组名（段内 key 的组部分）。列 `:key' 用关键字，�
 
 (defun ebasecamp-ui--report-result (session label result)
   "把批次结果 RESULT 写成 SESSION 的 notice，LABEL 为动作中文名。返回 nil。
-成功 → 绿色完成提示（`:auto-started-shared' 为真时额外说明）；
+成功 → 绿色完成提示（`:auto-started-shared' 为真时额外说明；
+`:preflight-warnings' 非空时在 detail 末尾追加「（N 条预校验警告）」——
+预校验警告不改变成功与否，只是一条「有东西没能校验」的提示）；
 失败 → 从 `:results' 取失败分支的 stderr：含 permission denied 时给 docker
 组提示，否则把 stderr 首行作为 message、原文作为 detail；无 stderr（例如
 批次被跳过）时说明「未完成」。"
   (if (plist-get result :ok)
-      (ebasecamp-ui--set-notice
-       session 'success (format "%s完成" label)
-       (if (plist-get result :auto-started-shared)
-           "所有批次已执行完成；已自动启动 shared 服务"
-         "所有批次已执行完成"))
+      (let ((warnings (plist-get result :preflight-warnings)))
+        (ebasecamp-ui--set-notice
+         session 'success (format "%s完成" label)
+         (concat (if (plist-get result :auto-started-shared)
+                     "所有批次已执行完成；已自动启动 shared 服务"
+                   "所有批次已执行完成")
+                 (if warnings
+                     (format "（%d 条预校验警告）" (length warnings))
+                   ""))))
     (let* ((failed (ebasecamp-ui--failed-branch (plist-get result :results)))
            (stderr (or (and failed (plist-get failed :stderr)) ""))
            (first (ebasecamp-ui--first-line stderr)))
@@ -2040,6 +2046,32 @@ COLLECTION 为 nil 时允许自由输入（新增实体名用）。事件上下�
     (user-error "请先在左栏选中一个组"))
   group-object)
 
+(defun ebasecamp-ui--legacy-reference-p (group project)
+  "判断项目 PROJECT 的旧写法 `:groups' 是否仍引用组 GROUP。
+GROUP 为组名字符串（选中组的 `symbol-name'），PROJECT 可为符号或字符串。
+只读定位（`ebasecamp-config-write--legacy-reference-file'），不写盘。"
+  (and (ebasecamp-config-write--legacy-reference-file project group) t))
+
+(defun ebasecamp-ui--confirm-legacy-migration (group project action)
+  "检测旧 `:groups' 引用并请用户确认，返回写盘层 `migrate-legacy' 的实参。
+GROUP 为组名字符串，PROJECT 为项目名，ACTION 是嵌进文案的短语
+（「新建配置后」/「改配置后」）。命中旧引用时问一句：
+
+  项目 example 的旧写法 :groups 仍引用组 redis；新建配置后该旧引用将被组侧
+  配置接管。是否同时删掉这条旧引用？
+
+答 yes 返回 t、答 no 返回 nil；未命中直接返回 nil（不打扰用户）。
+`y-or-n-p' 经 `--call-with-input' 包装（事件上下文里走 Ebox 输入边界，`M-x' /
+ERT 场景降级为裸调用）。**绝不在没有确认的情况下返回 t**：写盘层的
+`migrate-legacy' 默认 nil，只有这里答 yes 才会改写项目文件。"
+  (when (ebasecamp-ui--legacy-reference-p group project)
+    (ebasecamp-ui--call-with-input
+     (lambda ()
+       (y-or-n-p
+        (format (concat "项目 %s 的旧写法 :groups 仍引用组 %s；%s该旧引用"
+                        "将被组侧配置接管。是否同时删掉这条旧引用？")
+                project group action))))))
+
 (defun ebasecamp-ui--choose-config (group-object prompt)
   "返回 GROUP-OBJECT 里要操作的配置名（symbol）。
 只有 1 份配置时直接返回（不提问，`M' / `E' 因此在单配置组上只问必要参数）；
@@ -2094,7 +2126,10 @@ GROUP 为组名字符串：写后该组仍存在才恢复选中，否则清空�
     (condition-case err
         (progn
           (ebasecamp-config-write-update-config-project
-           group-name config project)
+           group-name config project
+           ;; A-II：命中旧 `:groups' 引用时经用户确认才迁移（默认 nil）
+           (ebasecamp-ui--confirm-legacy-migration
+            group-name project "改配置后"))
           (ebasecamp-ui--after-write session group-name
                                      "配置已更新"
                                      (format "%s → %s" config project)))
@@ -2165,11 +2200,14 @@ GROUP 为组名字符串：写后该组仍存在才恢复选中，否则清空�
               (notice-group (and group (symbol-name group))))
           (pcase choice
             ("新建配置"
-             (let ((config (ebasecamp-ui--read-name "配置名： ")))
+             (let* ((config (ebasecamp-ui--read-name "配置名： "))
+                    (group-name (ebasecamp-ui--require-group group))
+                    (project (ebasecamp-ui--require-project "关联项目： ")))
                (ebasecamp-config-write-add-config
-                (ebasecamp-ui--require-group group)
-                config
-                (ebasecamp-ui--require-project "关联项目： "))))
+                group-name config project
+                ;; A-II：命中旧 `:groups' 引用时经用户确认才迁移（默认 nil）
+                (ebasecamp-ui--confirm-legacy-migration
+                 group-name project "新建配置后"))))
             ("删除配置"
              (let ((config (ebasecamp-ui--choose-config
                             (ebasecamp-ui--require-group-object group-object)

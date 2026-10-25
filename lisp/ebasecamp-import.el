@@ -1,7 +1,7 @@
 ;;; ebasecamp-import.el --- ebasecamp 导入映射（compose → 清单） -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.5.1
+;; Version: 0.5.2
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 

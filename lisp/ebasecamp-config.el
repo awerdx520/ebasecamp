@@ -1,7 +1,7 @@
 ;;; ebasecamp-config.el --- ebasecamp 清单加载 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.5.1
+;; Version: 0.5.2
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -28,9 +28,10 @@
 ;;   物化期在后）。
 ;;
 ;; 错误项结构：(:file PATH :condition CONDITION-DATA :message STRING)。
-;; :file 为定义所在文件的绝对路径，无法定位时为 nil；物化阶段的错误由本层
-;; 统一补填为 groups.el 的绝对路径（配置只能定义在 groups.el）。:message 是
-;; 人类可读描述，便于界面直接展示。
+;; :file 为定义所在文件的绝对路径，无法定位时为 nil。物化阶段的错误由本层
+;; 统一补填为 <dir>/groups.el 的绝对路径：配置随组定义走（groups.el 与
+;; projects/*.el 皆可，导入产物常见后者），模型层不感知具体文件，因此物化期
+;; 错误一律归属 groups.el。:message 是人类可读描述，便于界面直接展示。
 ;;
 ;; 本文件不读取、不插值、不落盘任何密钥值。
 
@@ -181,9 +182,10 @@ message 中仍包含项目名与组名。错误按项目与组引用的顺序排
 (defun ebasecamp-config--link-configs (directory)
   "物化组内配置，并把错误项的 :file 补填为 <DIRECTORY>/groups.el。
 `ebasecamp-model-link-configs' 只在 :condition 里携带
-\(CODE . (组名 . 项目名)) 上下文（模型层不感知文件），而配置定义只能写在
-groups.el，因此这里统一把 :file 指向该文件的绝对路径，不留 nil。返回补填后
-的错误列表；模型层的部分成功语义保持不变（成功物化的配置仍生效）。"
+\(CODE . (组名 . 项目名)) 上下文（模型层不感知文件）；配置随组定义走
+（`groups.el' 与 `projects/*.el' 皆可，导入产物常见后者），物化期错误不感知
+具体文件，因此这里统一把 :file 指向 groups.el 的绝对路径，不留 nil。
+返回补填后的错误列表；模型层的部分成功语义保持不变（成功物化的配置仍生效）。"
   (let ((groups-file (expand-file-name "groups.el" directory)))
     (mapcar (lambda (error)
               (plist-put error :file groups-file))
@@ -205,7 +207,9 @@ GROUPS 与 PROJECTS 是本次加载后的注册表内容；ERRORS 是错误 plis
    出错时记录错误、丢弃该文件已产生的定义并按重放回滚；
 3. 校验项目对组的引用（未定义组、同组重复引用）；
 4. 物化组内 :configs 到项目 groups 槽（`ebasecamp-model-link-configs'），
-   错误的 :file 补填为 groups.el。
+   错误的 :file 补填为 groups.el：物化期错误不感知配置定义在哪个文件
+   （配置随组定义走，`groups.el' 与 `projects/*.el' 皆可），
+   故统一归属该文件。
 
 错误顺序为「文件加载 → 项目引用校验 → 物化」，即定义期在前、物化期在后。
 物化阶段的部分成功语义：出错的配置只记错误，其余配置照常物化并生效。"

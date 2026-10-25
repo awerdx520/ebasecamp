@@ -1,7 +1,7 @@
 ;;; ebasecamp-command.el --- ebasecamp 生命周期命令与端口冲突检测 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.5.1
+;; Version: 0.5.2
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -327,7 +327,8 @@ KEYS 元素为 \"group/service\" 字符串或 (:group G :service S) plist；nil 
                    (list (format "服务名必须是 symbol 或字符串，得到 %S"
                                  service))))))
 
-(defun ebasecamp-command-compose-args (action file project-name services)
+(defun ebasecamp-command-compose-args (action file project-name services
+                                              &optional root)
   "构造 docker compose 的参数列表（不含可执行文件名）。纯函数。
 ACTION 为 start / stop / restart / down：
 - start   → (\"compose\" \"-f\" FILE \"-p\" NAME \"up\" \"-d\" SVC...)
@@ -336,12 +337,22 @@ ACTION 为 start / stop / restart / down：
 - down    → (\"compose\" \"-f\" FILE \"-p\" NAME \"down\")，**不带 -v**，
   且 SERVICES 必须为空（down 的语义是整个 compose 项目）。
 SERVICES 元素为 symbol 或字符串。ACTION 非法或 down 收到服务名时 signal
-`ebasecamp-command-error'。"
+`ebasecamp-command-error'。
+ROOT 非 nil 时在 `-f FILE' 之后、`-p' 之前插入 `--project-directory' 与
+`(expand-file-name ROOT)'，即 `compose -f FILE --project-directory DIR -p NAME
+<子命令>'——该 flag 是 docker compose 的**根级** flag，必须位于子命令之前，
+否则 docker 报 `unknown flag'。生成物写在 cache 目录下，清单里的相对路径
+（含顶层 configs/secrets 的 `file:'、相对 volume source、`env_file'）需按项目
+root 解析。ROOT 为 nil 时**不注入任何占位**，返回序列与历史逐字节一致（退回
+以生成物所在目录为基准）。"
   (unless (memq action ebasecamp-command--actions)
     (signal 'ebasecamp-command-error
             (list (format "未知动作 %S（允许 %s）"
                           action ebasecamp-command--actions))))
-  (let ((head (list "compose" "-f" file "-p" project-name)))
+  (let ((head (append (list "compose" "-f" file)
+                      (when root
+                        (list "--project-directory" (expand-file-name root)))
+                      (list "-p" project-name))))
     (cond
      ((eq action 'down)
       (when services
@@ -398,24 +409,124 @@ PROJECT 可为项目对象、symbol 或字符串。"
   (let ((exit (plist-get result :exit)))
     (and (numberp exit) (zerop exit))))
 
+;;; 顶层 configs / secrets 的 `file:' 存在性（v0.5.2 B-II）
+
+;; 为什么这一层必须由 Elisp 侧做：`docker compose config -q' **不校验**顶层
+;; `configs:' / `secrets:' 的 `file:' 是否存在（只校验 `env_file:'，v0.5.2 探针
+;; T2 / 补证 3），缺失要到 `compose create' 才以
+;; `bind source path does not exist' 暴露。基准与 `--project-directory' 一致：
+;; 相对路径按项目的 `:root' 展开（探针 T3 / T4）。
+
+(defun ebasecamp-command--file-declarations (object)
+  "收集 OBJECT 顶层 configs / secrets 中声明了 `file:' 的条目。
+返回 (KIND NAME FILE) 三元组列表：KIND 为 \"config\" 或 \"secret\"（用于拼
+消息），NAME 为声明名，FILE 为 `file:' 的原样字符串（未展开）。
+只取**本项目**的声明 —— shared 分支的生成物本就不输出顶层段，无从检查。
+没有 `file:' 的条目（`external: true' 或只有 `name:'）直接跳过。"
+  (let ((declarations nil))
+    (dolist (spec (list (cons "config" (ebasecamp-project-file-configs object))
+                        (cons "secret" (ebasecamp-project-file-secrets object))))
+      (dolist (entry (cdr spec))
+        (when (consp entry)
+          (let ((file (and (consp (cdr entry))
+                           (cdr (assoc "file" (cdr entry))))))
+            (when (and (stringp file) (not (string-empty-p file)))
+              (setq declarations
+                    (append declarations
+                            (list (list (car spec) (car entry) file)))))))))
+    declarations))
+
+(defun ebasecamp-command--missing-file-declarations (object root)
+  "检查 OBJECT 的顶层 configs / secrets 声明的 file 是否存在，返回 (MISSING . WARNINGS)。
+ROOT 为判定基准（即派发给 docker 的 `--project-directory'，可能为 nil）。
+MISSING 为 `(:kind :name :file :base)' plist 列表（`:base' 是该条目的实际
+判定基准：绝对路径即自身，相对路径为 `<root>/<file>' 展开后的路径）。
+WARNINGS 为字符串列表：ROOT 为 nil 而声明是相对路径时无法判定，此时**不**把
+它算作缺失，只记一条 warning（缺 `:root' 是模型允许的状态，不该硬失败）。
+绝对路径不依赖 ROOT，始终可判定。"
+  (let ((missing nil)
+        (warnings nil))
+    (dolist (declaration (ebasecamp-command--file-declarations object))
+      (let ((kind (nth 0 declaration))
+            (name (nth 1 declaration))
+            (file (nth 2 declaration)))
+        (cond
+         ((file-name-absolute-p file)
+          (unless (file-exists-p file)
+            (push (list :kind kind :name name :file file :base file) missing)))
+         ((null root)
+          (push (format "项目 %s 无 :root，无法校验顶层 %s `%s' 的 file `%s'"
+                        (ebasecamp-project-name object) kind name file)
+                warnings))
+         (t
+          (let ((path (expand-file-name file root)))
+            (unless (file-exists-p path)
+              (push (list :kind kind :name name :file file :base path)
+                    missing)))))))
+    (cons (nreverse missing) (nreverse warnings))))
+
+(defun ebasecamp-command--missing-file-message (missing)
+  "把缺失条目 MISSING（`(:kind :name :file :base)' plist）拼成可读消息。"
+  (format "顶层 %s `%s' 的 file `%s' 不存在（基准：%s）"
+          (plist-get missing :kind)
+          (plist-get missing :name)
+          (plist-get missing :file)
+          (plist-get missing :base)))
+
+(defun ebasecamp-command--project-branch-index (branches)
+  "返回 BRANCHES 里第一个 scope 为 project 的分支下标；无则返回 0。
+顶层 configs / secrets 是**项目级**声明，其失败必须落在 per-project 分支上，
+否则 UI 会把错误归到 shared 批次（auto 补齐 shared 时 shared 排在前面）。"
+  (or (cl-position-if (lambda (branch) (eq 'project (plist-get branch :scope)))
+                      branches)
+      0))
+
 (defun ebasecamp-command--preflight (object branches)
   "为 BRANCHES 逐个写生成物并用 `ebasecamp-docker-check-compose' 校验。
-OBJECT 为项目对象（渲染生成物所需）。返回 plist：
+OBJECT 为项目对象（渲染生成物所需，同时提供派发基准用的 `:root'）。返回 plist：
 - `:branches' —— 校验通过的分支副本，每项追加 `:written'（实际写出的生成物
   路径），供派发层直接复用、避免重复写盘；
 - `:failure' —— nil 表示全部通过；否则 `(:index I :result RESULT)'，RESULT
-  为 `(:scope S :exit N :stderr STR)'（stderr 原文保留，供上层展示首行）。
+  为 `(:scope S :exit N :stderr STR)'（stderr 原文保留，供上层展示首行）；
+- `:preflight-warnings' —— 字符串列表（本项目顶层 configs / secrets 存在性
+  无法判定时的警告，见 `ebasecamp-command--missing-file-declarations'）。
+  刻意不叫 `:warnings' —— 那是 `ebasecamp-docker-check-compose' 从 compose
+  stderr 抽出的 `level=warning' 行，语义不同。
+校验时把 OBJECT 的 `:root'（`ebasecamp-project-root'）作为
+`--project-directory' 传给 `ebasecamp-docker-check-compose'，与
+`ebasecamp-command--dispatch' 派发时的基准**保持一致**——两者不同基准会重现
+「校验通过、启动炸」。shared 分支同样用**触发本次操作的这份** OBJECT 的
+root（不从 shared 配置的 `:project' 反推）。
+顶层 configs / secrets 的 `file:' 存在性检查（v0.5.2 B-II）在**逐分支写盘与
+`check-compose' 之前**做：`docker compose config -q' 不覆盖这一层，缺失只在
+`create' 阶段炸。缺文件时立即返回与 `check-compose' 失败**同构**的失败载荷
+（`:failed t' + `:exit' nil + `:stderr' 可读消息），因此一个生成物都不写、
+一个 docker 进程都不派发。
 只写生成物与校验，**不派发任何 docker 进程**，因此可以「先校验全部分支、
 全部通过才统一启动」，不会出现已启动容器无法回滚的部分启动。首个失败即停止
 后续校验（后面的分支连写盘都省掉）。"
-  (let ((validated nil)
-        (index 0)
-        (failure nil)
-        (total (length branches)))
+  (let* ((root (ebasecamp-project-root object))
+         (declarations (ebasecamp-command--missing-file-declarations object root))
+         (missing (car declarations))
+         (warnings (cdr declarations))
+         (validated nil)
+         (index 0)
+         (position 0)
+         (failure nil)
+         (total (length branches)))
+    (when missing
+      (setq position (ebasecamp-command--project-branch-index branches))
+      (setq failure
+            (list :index position
+                  :result
+                  (list :scope (plist-get (nth position branches) :scope)
+                        :exit nil
+                        :stderr (mapconcat #'ebasecamp-command--missing-file-message
+                                           missing "\n")))))
     (while (and (< index total) (null failure))
       (let* ((branch (nth index branches))
              (file (ebasecamp-compose-write object (plist-get branch :groups)))
-             (check (ebasecamp-docker-check-compose file)))
+             (check (ebasecamp-docker-check-compose file root)))
         (if (plist-get check :ok)
             (setq validated
                   (append validated (list (append branch (list :written file)))))
@@ -425,7 +536,7 @@ OBJECT 为项目对象（渲染生成物所需）。返回 plist：
                                     :exit (plist-get check :exit)
                                     :stderr (or (plist-get check :stderr) ""))))))
       (setq index (1+ index)))
-    (list :branches validated :failure failure)))
+    (list :branches validated :failure failure :preflight-warnings warnings)))
 
 (defun ebasecamp-command--preflight-report (action object branches preflight auto)
   "构造预校验失败时交给 ON-COMPLETE 的结果 plist（此时未派发任何批次）。
@@ -454,16 +565,26 @@ BRANCHES 为原分支列表，PREFLIGHT 为 `ebasecamp-command--preflight' 的�
           :order nil)))
 
 (defun ebasecamp-command--dispatch (action object name branches
-                                          sequential auto-shared on-complete)
+                                          sequential auto-shared on-complete
+                                          &optional preflight-warnings)
   "派发批次 BRANCHES（分支 plist 列表），返回已启动的进程列表。
 分支若带 `:written'（预校验已写盘）则直接复用该路径，不再重复
-`ebasecamp-compose-write'。SEQUENTIAL 非 nil 时按顺序派发，某批次失败后中止
+`ebasecamp-compose-write'。构造命令行时把 OBJECT 的 `:root'
+（`ebasecamp-project-root'）作为 `--project-directory' 传给
+`ebasecamp-command-compose-args'，与 `ebasecamp-command--preflight' 的校验
+基准一致（shared 分支同样用**触发本次操作的** OBJECT 的 root，不从 shared
+配置的 `:project' 反推）。SEQUENTIAL 非 nil 时按顺序派发，某批次失败后中止
 后续批次（结果记为 `:skipped'）；AUTO-SHARED 非 nil 表示 shared 批次是为跨
 scope 依赖自动补齐的。
+PREFLIGHT-WARNINGS 为 `ebasecamp-command--preflight' 收集的预校验警告（字符串
+列表，可为 nil）：它**不影响派发**，只是原样进 ON-COMPLETE 的结果 plist，
+供界面在成功提示里注明「有 N 条警告」。
 ON-COMPLETE 在所有批次结束后调用，参数 plist：
-`(:action :project :ok :results :auto-started-shared :order)'，
+`(:action :project :ok :results :auto-started-shared :order
+:preflight-warnings)'，
 `:results' 元素为 `(:scope :exit :stderr [:failed t|:skipped t])'，
-`:order' 为实际派发的 scope 顺序。"
+`:order' 为实际派发的 scope 顺序，`:preflight-warnings' 为预校验警告
+（无警告时为 nil）。"
   (let* ((total (length branches))
          (results (make-vector total nil))
          (remaining total)
@@ -484,7 +605,10 @@ ON-COMPLETE 在所有批次结束后调用，参数 plist：
                                             (append results nil))
                               :results (append results nil)
                               :auto-started-shared (and auto-shared t)
-                              :order (nreverse executed))))))
+                              :order (nreverse executed)
+                              :preflight-warnings
+                              (and preflight-warnings
+                                   (copy-sequence preflight-warnings)))))))
          (skip (from)
            (let ((index from))
              (while (< index total)
@@ -512,7 +636,8 @@ ON-COMPLETE 在所有批次结束后调用，参数 plist：
                   (args (ebasecamp-command-compose-args
                          action file (plist-get branch :name)
                          (unless (eq action 'down)
-                           (plist-get branch :services)))))
+                           (plist-get branch :services))
+                         (ebasecamp-project-root object))))
              (setq executed (cons (plist-get branch :scope) executed))
              (push (ebasecamp-docker-run-async
                     args
@@ -550,7 +675,8 @@ PROJECT 为项目对象、symbol 或字符串；KEYS 为选中服务（nil 表�
 6. 全部批次结束后清除 pending 并调用 ON-COMPLETE，参数为 plist：
    `(:action ACTION :project NAME :ok BOOL :results ((:scope S :exit N
    :stderr STR [:failed t|:skipped t]) ...) :auto-started-shared BOOL
-   :order (SCOPE ...))'，任一分支失败 `:ok' 为 nil，stderr 原样保留。
+   :order (SCOPE ...) :preflight-warnings (STR ...))'，
+   任一分支失败 `:ok' 为 nil，stderr 原样保留。
 生成物预校验（X3，`ebasecamp-command--preflight'）：start / restart 在
 校验通过前**不建网络、不派发任何 docker 进程** —— 逐分支写生成物并调用
 `ebasecamp-docker-check-compose'，全部通过才统一启动（start 是串行派发，
@@ -559,6 +685,11 @@ PROJECT 为项目对象、symbol 或字符串；KEYS 为选中服务（nil 表�
 `invalid compose project' 之类的错误提前成可读提示，UI 展示首行），其余分支
 标 `:skipped t'；返回 nil（没有进程被启动）。stop / down 不做预校验：它们
 作用于已存在的容器，生成物暂时不合法时也应允许停掉服务。
+预校验顺带收集的「无法判定」警告（本项目的 `:root' 为 nil 而顶层 `configs:' /
+`secrets:' 的 `file:' 是相对路径，见
+`ebasecamp-command--missing-file-declarations'）**不影响派发**，原样作为
+`:preflight-warnings'（字符串列表，无警告时为 nil）透传到 ON-COMPLETE 的
+结果 plist，供界面在成功提示里注明「有 N 条警告」。
 返回已启动进程对象列表（无分支或同步完成时可能为 nil）。"
   (let* ((object (ebasecamp-command--project project))
          (name (ebasecamp-command--name object)))
@@ -600,7 +731,8 @@ PROJECT 为项目对象、symbol 或字符串；KEYS 为选中服务（nil 表�
           (ebasecamp-command--dispatch
            action object name
            (if preflight (plist-get preflight :branches) branches)
-           auto auto on-complete))))))
+           auto auto on-complete
+           (and preflight (plist-get preflight :preflight-warnings))))))))
 
 ;;; 端口冲突检测（T3.3）
 

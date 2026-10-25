@@ -1,7 +1,7 @@
 ;;; ebasecamp-config-write.el --- ebasecamp 清单写操作（字段映射 / 实体操作） -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.5.1
+;; Version: 0.5.2
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -438,7 +438,7 @@ CONTEXT 用于错误消息。"
   (or (ebasecamp-manifest--locate-form 'group group-name forms)
       (user-error "清单 %s 里没有组 %s" file group-name)))
 
-(defun ebasecamp-config-write--edit-manifest (file editor)
+(defun ebasecamp-config-write--edit-manifest (file editor &optional keep-backup)
   "对清单 FILE 执行一次写盘事务，返回写后的加载结果。
 FILE 是**组定义实际所在**的清单文件——调用方先用
 `--manifest-file-for-group' 定位（组可能在 `groups.el'，也可能在
@@ -451,13 +451,20 @@ EDITOR 必须在内存里一次完成全部编辑（多处编辑用
 `ebasecamp-manifest--replace-forms'，按位置降序替换保证原子性），且不得自己
 写盘：备份、原子写、外部修改检测与「新增错误才回滚」统一由
 `ebasecamp-manifest--write-transaction' 负责。EDITOR 里 signal 的
-`user-error'（例如 D2 冲突）在任何写盘动作之前抛出，因此不会留下半截写入。"
+`user-error'（例如 D2 冲突）在任何写盘动作之前抛出，因此不会留下半截写入。
+
+KEEP-BACKUP 非 nil 时把 `:keep-backup' 透传给
+`ebasecamp-manifest--write-transaction'，返回值随之变成
+`\(:result LOAD-RESULT :backup BACKUP-PATH)'——跨文件编排需要第一段的事务前
+备份做补偿（见 `--migrate-across-files'）。默认 nil 时返回值与历史一致
+（既有调用点零改动）。"
   (ebasecamp-manifest--write-transaction
    file
    (lambda (text)
      (funcall editor text
               (ebasecamp-manifest--scan-text-forms text file)
-              file))))
+              file))
+   :keep-backup keep-backup))
 
 (defun ebasecamp-config-write--render-group (text form plist)
   "把组 FORM（扫描记录）按 PLIST 重渲染，返回可替换该区段的新文本。
@@ -555,17 +562,24 @@ CONFIGS 是从原文读出的 ((配置名 :project P ...) ...)；IGNORE 为自�
       (setq rest (cddr rest)))
     unchanged))
 
-(defun ebasecamp-config-write--group-head-end (text form)
-  "返回 TEXT 中组 FORM 头部 `(ebasecamp-define-group NAME' 之后的位置（1-based）。
-调用方据此从组内第一个关键字开始顺序读元素。"
+(defun ebasecamp-config-write--head-end (text form)
+  "返回 TEXT 中顶层 form FORM 头部 `(SYMBOL NAME' 之后的位置（1-based）。
+组 form `(ebasecamp-define-group NAME ...)' 与项目 form
+`(ebasecamp-define-project NAME ...)' 是同一形态（car 符号 + 实体名 + 关键字），
+因此「跳过 car 与名字」这一步两者共用；调用方据此从第一个关键字开始顺序读元素。"
   (with-temp-buffer
     (insert text)
     (set-syntax-table emacs-lisp-mode-syntax-table)
     (goto-char (plist-get form :start))
     (forward-char 1)                ; 跳过 `('
-    (read (current-buffer))         ; ebasecamp-define-group
-    (read (current-buffer))         ; 组名
+    (read (current-buffer))         ; ebasecamp-define-group / -project
+    (read (current-buffer))         ; 实体名
     (point)))
+
+(defun ebasecamp-config-write--group-head-end (text form)
+  "返回 TEXT 中组 FORM 头部 `(ebasecamp-define-group NAME' 之后的位置（1-based）。
+调用方据此从组内第一个关键字开始顺序读元素；实现委托 `--head-end'（同一形态）。"
+  (ebasecamp-config-write--head-end text form))
 
 (defun ebasecamp-config-write--service-region (text form service-name)
   "在组 FORM 的文本里定位服务 SERVICE-NAME 的子 form，返回 (:start :end)。
@@ -636,68 +650,397 @@ FIELDS 的每个键都与原值相同时**不写盘**（文件内容与 mtime �
                 (ebasecamp-config-write--merge-service-fields (cdr spec) fields))
                (ebasecamp-config-write--column-at text region))))))))))
 
+;;; 实体操作：旧写法 :groups 的定位与迁移（A-II）
+;;
+;; 背景：A-I 让「项目侧旧 `:groups' + 组侧 `:configs'」指向同项目同组时不再报错
+;; （组侧配置原位接管）。A-II 在**用户确认**后把旧引用从项目文件里真正删掉；
+;; 写盘层的 `migrate-legacy' 参数默认 nil，脚本 / 测试调用零行为变更。
+;;
+;; 定位不复用 `ebasecamp-manifest--locate-form'（那是「单个 form」的单命中语义，
+;; 给不出 `:groups' **元素**的区间），也不复用 `--legacy-group-references'（只回
+;; 项目名列表、没有位置）。这里做的是两级区域扫描：先在 project form 内定位
+;; `:groups' 关键字与它的取值列表，再在列表内部定位引用该组的那一个元素。
+
+(defun ebasecamp-config-write--project-form-in (forms project)
+  "从扫描结果 FORMS 里取项目 PROJECT 的 form 记录；没有返回 nil。
+只在一个文件的 FORMS 内匹配（同文件内项目名唯一——重名项目是加载错误）。"
+  (cl-find-if (lambda (form)
+                (and (eq 'project (plist-get form :kind))
+                     (eq project (plist-get form :name))))
+              forms))
+
+(defun ebasecamp-config-write--groups-element-region (text form group)
+  "在 TEXT 的 project FORM 内定位 `:groups' 里引用组 GROUP 的元素。
+返回 plist：`:start' / `:end'（该**元素**的 1-based 区间，切片用 `(1- pos)'）、
+`:key-start' / `:key-end' / `:value-end'（`:groups' 键与值的区间，供「删整键」
+用）、`:sole'（该元素是否为 `:groups' 里唯一元素）。
+FORM 里没有 `:groups'、`:groups' 不是列表、或列表里没有该组时返回 nil。
+
+做法与 `--service-region' 同一模式（两级区域扫描，不写自定义扫描器）：先跳过
+`(ebasecamp-define-project NAME' 头部，在 form 内部顺序读关键字与取值，取
+`:groups' 的取值元素；再在它的括号内部顺序读每个引用元素，按 `car-safe' 匹配
+组名。只匹配**第一个**命中——`:groups' 里重复写同一组本身是加载错误，这里不
+做裁决。"
+  (let* ((elements (ebasecamp-manifest--scan-forms-in-region
+                    text
+                    (ebasecamp-config-write--head-end text form)
+                    (1- (plist-get form :end))))
+         (key nil)
+         (value nil)
+         (rest elements))
+    (while (and rest (null value))
+      (when (eq :groups (plist-get (car rest) :value))
+        (setq key (car rest)
+              value (cadr rest)))
+      (setq rest (cdr rest)))
+    (when (and key value (consp (plist-get value :value)))
+      (let* ((children (ebasecamp-manifest--scan-forms-in-region
+                        text
+                        (1+ (plist-get value :start))
+                        (1- (plist-get value :end))))
+             (element (cl-find-if
+                       (lambda (child)
+                         (eq group (car-safe (plist-get child :value))))
+                       children)))
+        (when element
+          (list :start (plist-get element :start)
+                :end (plist-get element :end)
+                :key-start (plist-get key :start)
+                :key-end (plist-get key :end)
+                :value-end (plist-get value :end)
+                :sole (= 1 (length children))))))))
+
+(defun ebasecamp-config-write--element-removal-bounds (text start end)
+  "返回删除 TEXT 中 `[START, END)'（0-based）元素时的实际区间 `(FROM . TO)'。
+连同相邻空白一起删，避免留下双空格或空行：优先吃**后面**的一个空格；其后是
+换行时连换行与下一行的缩进一起吃掉（多行 `:groups' 排版）；最后才吃**前面**的
+一个空格。"
+  (cond
+   ((and (< end (length text)) (eq ?\s (aref text end)))
+    (cons start (1+ end)))
+   ((and (< end (length text)) (eq ?\n (aref text end)))
+    (let ((index (1+ end)))
+      (while (and (< index (length text))
+                  (memq (aref text index) '(?\s ?\t)))
+        (setq index (1+ index)))
+      (cons start index)))
+   ((and (> start 0) (eq ?\s (aref text (1- start))))
+    (cons (1- start) end))
+   (t (cons start end))))
+
+(defun ebasecamp-config-write--key-removal-bounds (text start end)
+  "返回删除 TEXT 中 `:groups' 键 `[START, END)'（0-based）时的实际区间。
+连同该键所在行的缩进与行首换行一起删，避免留下空行；键与值同一行且前面还有
+其它内容（手写的单行 form）时只吃掉前面的空白。"
+  (let ((from start))
+    (while (and (> from 0) (memq (aref text (1- from)) '(?\s ?\t)))
+      (setq from (1- from)))
+    (when (and (> from 0) (eq ?\n (aref text (1- from))))
+      (setq from (1- from)))
+    (cons from end)))
+
+(defun ebasecamp-config-write--removal-form (text region)
+  "把 `--groups-element-region' 的结果换算成一处「删除」编辑 `(FORM . \"\")'。
+REGION 的位置是 **1-based**（切片口径同扫描器，内部统一 `1-` 换算成 0-based）。
+REGION 的 `:sole' 为真时删整个 `:groups' 键（**不**留 `:groups nil'——项目渲染
+用 `plist-member' 判定，键还在就会渲染出空值），否则只删该元素。
+FORM 是只带 `:start' / `:end' 的假扫描记录，可直接交给
+`ebasecamp-manifest--replace-forms'（与其它替换一起按位置降序应用）。"
+  (let ((bounds (if (plist-get region :sole)
+                    (ebasecamp-config-write--key-removal-bounds
+                     text (1- (plist-get region :key-start))
+                     (1- (plist-get region :value-end)))
+                  (ebasecamp-config-write--element-removal-bounds
+                   text
+                   (1- (plist-get region :start))
+                   (1- (plist-get region :end))))))
+    (cons (list :start (1+ (car bounds)) :end (1+ (cdr bounds))) "")))
+
+(defun ebasecamp-config-write--legacy-reference-file (project-name group-name)
+  "返回项目 PROJECT-NAME 的旧写法 `:groups' 仍引用组 GROUP-NAME 的定位信息。
+返回 `(FILE . PLIST)'：FILE 是项目定义所在的 `projects/*.el'，PLIST 含
+`:start' / `:end'（该 `:groups' **元素**的 1-based 区间，切片用 `(1- pos)'）、
+`:form-start' / `:form-end'（所在 project form 的区间）与 `:sole'（该元素是否为
+`:groups' 里唯一元素）。无命中返回 nil。
+
+只扫 `projects/*.el'（`ebasecamp-config--project-files' 的字典序）：新写法
+（组侧 `:configs' 加载期物化）不落在项目文件里，因此这里只反映用户手写的引用。
+**多文件命中时按该列表的顺序（字典序）返回第一个**：同一项目在同一清单里重名
+定义本身就是加载错误（后加载的文件整体回滚），这里不裁决也不报错——写盘层
+只需要一个可删的位置，重名项目交给加载层的错误提示。
+读取原文而不看 model：model 可能因既有加载错误缺定义，而定位必须看到磁盘上的
+真实引用（理由同 `--legacy-group-references'）。"
+  (let ((project (ebasecamp-config-write--symbol project-name "项目名"))
+        (group (ebasecamp-config-write--symbol group-name "组名"))
+        (found nil))
+    (dolist (file (ebasecamp-config--project-files))
+      (unless found
+        (let* ((text (ebasecamp-manifest--read-text file))
+               (forms (ebasecamp-manifest--scan-text-forms text file))
+               (form (ebasecamp-config-write--project-form-in forms project))
+               (region (and form
+                            (ebasecamp-config-write--groups-element-region
+                             text form group))))
+          (when region
+            (setq found
+                  (cons file
+                        (list :start (plist-get region :start)
+                              :end (plist-get region :end)
+                              :form-start (plist-get form :start)
+                              :form-end (plist-get form :end)
+                              :sole (plist-get region :sole))))))))
+    found))
+
+(defun ebasecamp-config-write--remove-legacy-editor (project group)
+  "返回删除项目 PROJECT 的 `:groups' 里组 GROUP 旧引用的 editor。
+editor 只做一处区段删除（元素或整条 `:groups' 键），因此文件其它字节逐字节不变。"
+  (lambda (text forms file)
+    (let ((form (ebasecamp-config-write--project-form-in forms project)))
+      (unless form
+        (user-error "文件 %s 里没有项目 %s 的定义" file project))
+      (let ((region (ebasecamp-config-write--groups-element-region
+                     text form group)))
+        (unless region
+          (user-error "项目 %s 的 :groups 里没有对组 %s 的旧引用" project group))
+        (ebasecamp-manifest--replace-forms
+         text (list (ebasecamp-config-write--removal-form text region)))))))
+
+(defun ebasecamp-config-write--migrate-legacy (project-name group-name)
+  "删除项目 PROJECT-NAME 清单文件里 `:groups' 对组 GROUP-NAME 的旧引用（一次事务）。
+`:groups' 只剩该元素时整条键被移除（不留 `:groups nil'）。返回写后的加载结果。
+
+这是 A-II 跨文件路径的**第二段**，也是「只删旧引用」的独立入口；同文件路径不
+用它（那时组侧追加与项目侧删除必须在同一次事务里完成，见
+`--add-config-within-file-editor'）。拒绝条件（`user-error'，写盘前抛出）：
+项目 / 组名非法、清单里找不到该旧引用、文件里没有该项目的 form。"
+  (let* ((project (ebasecamp-config-write--symbol project-name "项目名"))
+         (group (ebasecamp-config-write--symbol group-name "组名"))
+         (reference (ebasecamp-config-write--legacy-reference-file project group)))
+    (unless reference
+      (user-error "清单里没有项目 %s 对组 %s 的旧 :groups 引用" project group))
+    (ebasecamp-config-write--edit-manifest
+     (car reference)
+     (ebasecamp-config-write--remove-legacy-editor project group))))
+
+(defun ebasecamp-config-write--migrate-across-files (group-file editor project group)
+  "跨文件「改组 + 删旧引用」：**两次写盘事务 + 备份补偿**（不引入新原子性假设）。
+GROUP-FILE 是组定义所在文件，EDITOR 是组侧编辑函数（新增配置 / 改配置
+`:project' 共用本补偿模式），PROJECT / GROUP 是删除旧引用所需的名字。
+
+① 先写组文件（`:keep-backup' 拿到事务前备份）→ ② 再删项目侧旧引用
+（`--migrate-legacy' 自己是一次事务）；② 失败（包括「写后新增加载错误」触发的
+自身回滚）时用 ① 的备份**恢复组文件原文**并把原错误 signal 出去，因此磁盘上
+不会留下「组已加配置、旧引用还在」的半截状态。两段都成功才删除备份并返回加载
+结果。对 ADR-0005 决策 2（单事务）的部分退化沿用在 ADR-0006 的口径：跨文件写盘
+没有跨文件原子性可用，只能靠显式备份补偿。"
+  (let* ((first (ebasecamp-config-write--edit-manifest group-file editor t))
+         (backup (plist-get first :backup)))
+    (condition-case err
+        (let ((result (ebasecamp-config-write--migrate-legacy project group)))
+          (ebasecamp-manifest--delete-file backup)
+          result)
+      (error
+       (ebasecamp-config-write--restore-backup group-file backup)
+       (signal (car err) (cdr err))))))
+
 ;;; 实体操作：组内配置的增改删与移动
 
-(defun ebasecamp-config-write-add-config (group-name config-name project)
+(defun ebasecamp-config-write--add-config-editor (group config project)
+  "返回「向组 GROUP 的 `:configs' 追加 CONFIG（`:project PROJECT'）」的 editor。
+拒绝条件（都是 `user-error'，在任何写盘动作之前抛出）：组内已有同名配置、
+**D2 冲突**（该组已有别的配置引用同一项目）。"
+  (lambda (text forms file)
+    (let* ((form (ebasecamp-config-write--require-group file forms group))
+           (plist (ebasecamp-config-write--form-plist text form))
+           (configs (plist-get plist :configs)))
+      (when (assq config configs)
+        (user-error "组 %s 已有配置 %s" group config))
+      (ebasecamp-config-write--check-project-conflict group configs project)
+      (ebasecamp-config-write--replace-group
+       text form
+       (ebasecamp-config-write--with-configs
+        plist (append configs (list (list config :project project))))))))
+
+(defun ebasecamp-config-write--add-config-within-file-editor (group config project)
+  "返回「组侧追加配置 + 项目侧删旧引用」的 editor（**同一次事务**内两处替换）。
+复用 `--move-config-within-file' 的 `--replace-forms' 模式：两处区段按 `:start'
+降序应用，因此写盘只有一次，不存在「组已加、旧引用没删」的中间状态。"
+  (lambda (text forms file)
+    (let* ((group-form (ebasecamp-config-write--require-group file forms group))
+           (plist (ebasecamp-config-write--form-plist text group-form))
+           (configs (plist-get plist :configs))
+           (project-form (ebasecamp-config-write--project-form-in forms project)))
+      (when (assq config configs)
+        (user-error "组 %s 已有配置 %s" group config))
+      (ebasecamp-config-write--check-project-conflict group configs project)
+      (unless project-form
+        (user-error "文件 %s 里没有项目 %s 的定义" file project))
+      (let ((region (ebasecamp-config-write--groups-element-region
+                     text project-form group)))
+        (unless region
+          (user-error "项目 %s 的 :groups 里没有对组 %s 的旧引用" project group))
+        (ebasecamp-manifest--replace-forms
+         text
+         (list
+          (cons group-form
+                (ebasecamp-config-write--render-group
+                 text group-form
+                 (ebasecamp-config-write--with-configs
+                  plist (append configs (list (list config :project project))))))
+          (ebasecamp-config-write--removal-form text region)))))))
+
+(defun ebasecamp-config-write--update-config-project-editor (group config project)
+  "返回「把组 GROUP 的配置 CONFIG 的 `:project' 改成 PROJECT」的 editor。
+配置的其它键（`:services' 覆盖）原样保留；`:project' 与原值相同时不写盘（返回
+原文），因此既有调用点的「没有改动就不碰文件」语义不变。"
+  (lambda (text forms file)
+    (let* ((form (ebasecamp-config-write--require-group file forms group))
+           (plist (ebasecamp-config-write--form-plist text form))
+           (configs (plist-get plist :configs))
+           (spec (assq config configs)))
+      (unless spec
+        (user-error "组 %s 没有配置 %s" group config))
+      (ebasecamp-config-write--check-project-conflict
+       group configs project config)
+      (if (eq project (plist-get (cdr spec) :project))
+          text
+        (ebasecamp-config-write--replace-group
+         text form
+         (ebasecamp-config-write--with-configs
+          plist
+          (mapcar (lambda (existing)
+                    (if (eq (car existing) config)
+                        (cons config
+                              (plist-put (copy-sequence (cdr existing))
+                                         :project project))
+                      existing))
+                  configs)))))))
+
+(defun ebasecamp-config-write--update-config-project-within-file-editor
+    (group config project)
+  "返回「组侧改 `:project' + 项目侧删旧引用」的 editor（同一次事务）。
+`:project' 与原值相同时组侧返回原文（不重渲染），但仍删项目侧旧引用——用户既然
+确认了迁移，旧引用就该清掉。"
+  (lambda (text forms file)
+    (let* ((group-form (ebasecamp-config-write--require-group file forms group))
+           (plist (ebasecamp-config-write--form-plist text group-form))
+           (configs (plist-get plist :configs))
+           (spec (assq config configs))
+           (project-form (ebasecamp-config-write--project-form-in forms project)))
+      (unless spec
+        (user-error "组 %s 没有配置 %s" group config))
+      (ebasecamp-config-write--check-project-conflict
+       group configs project config)
+      (unless project-form
+        (user-error "文件 %s 里没有项目 %s 的定义" file project))
+      (let ((region (ebasecamp-config-write--groups-element-region
+                     text project-form group)))
+        (unless region
+          (user-error "项目 %s 的 :groups 里没有对组 %s 的旧引用" project group))
+        (ebasecamp-manifest--replace-forms
+         text
+         (append
+          (unless (eq project (plist-get (cdr spec) :project))
+            (list
+             (cons group-form
+                   (ebasecamp-config-write--render-group
+                    text group-form
+                    (ebasecamp-config-write--with-configs
+                     plist
+                     (mapcar (lambda (existing)
+                               (if (eq (car existing) config)
+                                   (cons config
+                                         (plist-put
+                                          (copy-sequence (cdr existing))
+                                          :project project))
+                                 existing))
+                             configs))))))
+          (list (ebasecamp-config-write--removal-form text region))))))))
+
+(defun ebasecamp-config-write-add-config (group-name config-name project
+                                                    &optional migrate-legacy)
   "给组 GROUP-NAME 追加配置 CONFIG-NAME，关联项目 PROJECT（均为符号或字符串）。
 只写组侧 `:configs'（AGENTS 不变量 9），不写项目侧旧 `:groups'。
 
+MIGRATE-LEGACY 非 nil 时，额外把项目侧旧写法 `:groups' 里对本组的引用删掉
+（A-II 迁移）。**默认 nil：脚本 / 测试 / 程序化调用绝不改写项目文件**——只有
+界面层在 `y-or-n-p' 得到 yes 之后才传 t（见 `ebasecamp-ui--manifest-menu'）。
+两条编排路径按「组定义与项目定义是否在同一文件」分派：
+
+- 同文件（组写在 `projects/x.el'，项目也在该文件）→ **一次事务**内两处降序替换
+  （组侧 `:configs' 追加 + 项目侧删元素），复用 `--replace-forms'；
+- 跨文件（组在 `groups.el'、项目在 `projects/*.el'）→ **两次事务 + 备份补偿**：
+  第二段失败用第一段的备份恢复组文件原文并 signal 原错误（沿用
+  `--move-config-across-files' 的补偿模式，跨文件没有原子性可用）；
+- 没命中旧引用（或 MIGRATE-LEGACY 为 nil）→ 走原有单事务路径，逐字节不变。
+
 拒绝条件（都是 `user-error'，在任何写盘动作之前抛出）：
 - 组不存在 / 组内已有同名配置；
-- **D2 冲突**：该组已有别的配置引用同一项目（同一项目同一组只允许 1 个引用）。
+- **D2 冲突**：该组已有别的配置引用同一项目（同一项目同一组只允许 1 个引用）；
+- MIGRATE-LEGACY 非 nil 但旧引用定位到的文件里没有该项目的 form（清单被外部
+  改坏的极端情形）。
 
 成功时整组 form 被重渲染（组内部排版规范化），返回写后的加载结果；
 写后引入新加载错误时由事务回滚并 signal `ebasecamp-config-write-error'。"
   (let ((group (ebasecamp-config-write--symbol group-name "组名"))
         (config (ebasecamp-config-write--symbol config-name "配置名"))
         (project (ebasecamp-config-write--symbol project "项目名")))
-    (ebasecamp-config-write--edit-manifest
-     (ebasecamp-config-write--manifest-file-for-group group)
-     (lambda (text forms file)
-       (let* ((form (ebasecamp-config-write--require-group file forms group))
-              (plist (ebasecamp-config-write--form-plist text form))
-              (configs (plist-get plist :configs)))
-         (when (assq config configs)
-           (user-error "组 %s 已有配置 %s" group config))
-         (ebasecamp-config-write--check-project-conflict group configs project)
-         (ebasecamp-config-write--replace-group
-          text form
-          (ebasecamp-config-write--with-configs
-           plist (append configs (list (list config :project project))))))))))
+    (let* ((group-file (ebasecamp-config-write--manifest-file-for-group group))
+           (reference (and migrate-legacy
+                           (ebasecamp-config-write--legacy-reference-file
+                            project group))))
+      (cond
+       ((null reference)
+        (ebasecamp-config-write--edit-manifest
+         group-file
+         (ebasecamp-config-write--add-config-editor group config project)))
+       ((equal (expand-file-name (car reference)) group-file)
+        (ebasecamp-config-write--edit-manifest
+         group-file
+         (ebasecamp-config-write--add-config-within-file-editor
+          group config project)))
+       (t
+        (ebasecamp-config-write--migrate-across-files
+         group-file
+         (ebasecamp-config-write--add-config-editor group config project)
+         project group))))))
 
-(defun ebasecamp-config-write-update-config-project (group-name config-name project)
+(defun ebasecamp-config-write-update-config-project (group-name config-name project
+                                                                &optional migrate-legacy)
   "把组 GROUP-NAME 中配置 CONFIG-NAME 的 `:project' 改为 PROJECT。
 配置的其它键（`:services' 覆盖）原样保留；项目侧的组引用由加载期物化，不手写。
 
+MIGRATE-LEGACY 非 nil 时额外删掉项目侧旧写法 `:groups' 里对本组的引用（A-II
+迁移；界面层 `E' 在用户确认后传 t）。**默认 nil：绝不改写项目文件。**
+分派与补偿语义同 `ebasecamp-config-write-add-config'：同文件一次事务、跨文件
+两次事务 + 备份补偿。`:project' 与原值相同时组文件不写盘，但仍会删旧引用。
+
 拒绝条件（`user-error'，写盘前抛出）：组或配置不存在；**D2 冲突**——同组内
-还有别的配置引用 PROJECT。`:project' 与原值相同时不写盘，直接返回加载结果。"
+还有别的配置引用 PROJECT。"
   (let ((group (ebasecamp-config-write--symbol group-name "组名"))
         (config (ebasecamp-config-write--symbol config-name "配置名"))
         (project (ebasecamp-config-write--symbol project "项目名")))
-    (ebasecamp-config-write--edit-manifest
-     (ebasecamp-config-write--manifest-file-for-group group)
-     (lambda (text forms file)
-       (let* ((form (ebasecamp-config-write--require-group file forms group))
-              (plist (ebasecamp-config-write--form-plist text form))
-              (configs (plist-get plist :configs))
-              (spec (assq config configs)))
-         (unless spec
-           (user-error "组 %s 没有配置 %s" group config))
-         (ebasecamp-config-write--check-project-conflict
-          group configs project config)
-         (if (eq project (plist-get (cdr spec) :project))
-             text
-           (ebasecamp-config-write--replace-group
-            text form
-            (ebasecamp-config-write--with-configs
-             plist
-             (mapcar (lambda (existing)
-                       (if (eq (car existing) config)
-                           (cons config
-                                 (plist-put (copy-sequence (cdr existing))
-                                            :project project))
-                         existing))
-                     configs)))))))))
+    (let* ((group-file (ebasecamp-config-write--manifest-file-for-group group))
+           (reference (and migrate-legacy
+                           (ebasecamp-config-write--legacy-reference-file
+                            project group))))
+      (cond
+       ((null reference)
+        (ebasecamp-config-write--edit-manifest
+         group-file
+         (ebasecamp-config-write--update-config-project-editor
+          group config project)))
+       ((equal (expand-file-name (car reference)) group-file)
+        (ebasecamp-config-write--edit-manifest
+         group-file
+         (ebasecamp-config-write--update-config-project-within-file-editor
+          group config project)))
+       (t
+        (ebasecamp-config-write--migrate-across-files
+         group-file
+         (ebasecamp-config-write--update-config-project-editor
+          group config project)
+         project group))))))
 
 (defun ebasecamp-config-write-remove-config (group-name config-name)
   "从组 GROUP-NAME 删除配置 CONFIG-NAME；组本身保留（删掉最后一份配置后

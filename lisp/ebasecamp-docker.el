@@ -1,7 +1,7 @@
 ;;; ebasecamp-docker.el --- ebasecamp docker CLI 进程封装与输出解析 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.5.1
+;; Version: 0.5.2
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -267,7 +267,7 @@ STDERR 为 nil 时按空串处理。纯函数，不执行任何命令。"
 
 ;;; compose 校验
 
-(defun ebasecamp-docker-check-compose (file)
+(defun ebasecamp-docker-check-compose (file &optional root)
   "用 `docker compose -f FILE config -q' 校验 compose 文件 FILE。
 返回 plist：
 - `:ok' —— 退出码为 0 **且** stderr 不含 `level=error'。退出码 0 不足以判定
@@ -276,9 +276,18 @@ STDERR 为 nil 时按空串处理。纯函数，不执行任何命令。"
 - `:stderr' —— stderr 原文（失败时供 UI 展开）；
 - `:warnings' —— stderr 中所有 `level=warning' 行（字符串列表，按原顺序），
   warning 不影响 `:ok'。
-FILE 会被展开为绝对路径后传给 docker。"
-  (let* ((result (ebasecamp-docker-run-sync
-                  (list "compose" "-f" (expand-file-name file) "config" "-q")))
+FILE 会被展开为绝对路径后传给 docker。
+ROOT 非 nil 时在 `-f FILE' 之后、`config' 之前注入 `--project-directory'（经
+`expand-file-name' 绝对化）——该 flag 是 docker compose 的**根级** flag，必须
+位于子命令之前，用于把清单里的相对路径（含顶层 configs/secrets 的 `file:'）
+按项目 root 解析。ROOT 必须与 `ebasecamp-command-compose-args' 派发时用的
+**同一基准**，否则会重现「校验通过、启动炸」。ROOT 为 nil 时命令行与不传该
+参数时逐字节一致（回退到 compose 文件所在目录为基准）。"
+  (let* ((args (append (list "compose" "-f" (expand-file-name file))
+                       (when root
+                         (list "--project-directory" (expand-file-name root)))
+                       (list "config" "-q")))
+         (result (ebasecamp-docker-run-sync args))
          (exit (plist-get result :exit))
          (stderr (or (plist-get result :stderr) "")))
     (list :ok (and (numberp exit)
