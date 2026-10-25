@@ -2,7 +2,7 @@
 #+author: Thomas
 #+options: toc:t
 
-ebasecamp 是 Emacs 里的 Docker 环境分组管理插件（版本 0.5.1）。
+ebasecamp 是 Emacs 里的 Docker 环境分组管理插件（版本 0.5.2）。
 
 * ebasecamp 是什么
 
@@ -18,6 +18,8 @@ ebasecamp 把 Docker 环境按「组 → 配置 → 项目」组织：
 
 - *组复用*：一个组定义可被多个项目引用（每份 =:configs= 一项）；=:scope shared= 的组跨项目共用一套容器（compose 项目名固定 =ebc-shared=），=:scope per-project= 的组每个项目一套（=ebc-<project>=）。
 - *组内声明关联*：项目归属写在组侧的 =:configs=，加载期由插件物化成该项目对组的引用，界面 / 启停 / 导出五处读取点看到的是同一形态。
+- *旧写法平滑迁移*：v0.1 的项目侧 =:groups= 仍然可用 —— 与组侧配置指向同一项目同一组时由配置 *原位接管*（不报错）；界面新建 / 改配置时若发现旧引用会问你是否顺手删掉，答 yes 才改写项目文件。
+- *相对路径按项目 =:root= 解析*：派发时注入 =--project-directory=，顶层 =configs= / =secrets= 的 =file:= 、相对 =volumes= 源与 =env_file= 都以项目根为基准，而不是缓存目录。
 - *服务级多选启停*：界面里勾选具体服务，批量执行启动 / 停止 / 重启，不强制整组起停。
 - *状态轮询*：容器状态由 =docker ps --no-trunc= 采集并按标签归一，默认 3 秒轮询一次（见 =ebasecamp-status-refresh-interval=）。
 - *导入已有 compose*：用 =docker compose config --no-interpolate= 系列 flag 读取项目 compose，映射为清单文件落盘（组内 =:configs= 写法）。
@@ -177,7 +179,9 @@ ebasecamp 把 Docker 环境按「组 → 配置 → 项目」组织：
   :export-file "deploy/compose.yaml")
 #+end_src
 
-项目文件里 *不写* =:groups= —— 项目对组的引用由组内 =:configs= 在加载期物化而来；两处都写会构成「同项目同组双引用」而被加载层报错。
+项目文件里 *通常不写* =:groups= —— 项目对组的引用由组内 =:configs= 在加载期物化而来。旧写法仍然兼容（见「旧写法」一节）：项目侧 =:groups= 与组侧 *1 份* 配置指向同一项目同一组时，由组侧配置 *原位接管*、不报错；只有 *两份以上* 组侧配置指向同一项目同一组才报错。
+
+项目定义里的 =:root= *现在是路径基准*，不只是「在项目中打开」时的定位依据：生成物里的相对路径（顶层 =configs= / =secrets= 的 =file:=、以 =.= 开头的 =volumes= 源、=env_file=）都按它解析，见「compose 生成物与路径基准」一节。
 
 ** 关键字表
 
@@ -227,6 +231,33 @@ compose 允许服务引用顶层声明的 config / secret（服务级 =configs: 
 - *shared 生成物不含顶层段*：=ebc-shared= 只渲染 shared 组服务，不带顶层 =configs: / secrets:= ；shared 组服务若引用顶层 config / secret，需要自行处理。
 - *界面不编辑顶层段*：第一版只保证「导入 → 渲染往返不丢」，界面里没有编辑 =:file-configs= / =:file-secrets= 的入口，需要时手写清单（=e=）。
 
+** compose 生成物与路径基准
+
+生成物（per-project 为 =~/.cache/ebasecamp/<project>/compose.yaml= ，shared 为 =<cache>/_shared/compose.yaml=）是缓存目录里的派生产物，可随时重建。但 *清单里的相对路径不是相对生成物* ，而是 *相对项目的 =:root=* ：
+
+| 清单里的相对路径 | 解析基准 |
+|------------------+----------|
+| 顶层 =configs:= / =secrets:= 的 =file:= | 项目 =:root= |
+| =volumes:= 中以 =.= 开头的 =:source=（bind 挂载） | 项目 =:root= |
+| =env_file:= 的路径 | 项目 =:root= |
+| =compose.yaml= 自身所在位置 | =~/.cache/ebasecamp/<project>/=（只管生成物本身，不影响上面三项） |
+
+实现方式是派发给 docker 时注入 *根级 flag* =--project-directory= ：
+
+#+begin_src text
+docker compose -f <cache>/<project>/compose.yaml --project-directory <root> -p <name> up -d …
+#+end_src
+
+它是根级 flag，必须在子命令 *之前*；预校验（=config -q=）与真正的 =up= / =stop= 用 *同一个* =root= —— 基准不同会重现「校验通过、启动炸」。
+
+于是 *=:root= 现在承担实际语义*，不再只是「在项目中打开时定位用」：
+
+- 项目写了 =:root= → 相对路径按它解析；
+- 项目 *没写* =:root= → 不注入该 flag，退回「按生成物所在目录解析」（v0.5.1 及之前的行为）。此时顶层 =configs= / =secrets= 的相对 =file:= *无法校验*，预校验只给一条警告（见「启动前的 compose 预校验」），真正的失败会推迟到容器创建阶段；
+- shared 生成物（=ebc-shared=）用 *触发本次操作的那个项目* 的 =:root= —— shared 配置的 =:project= 只是渲染上下文，不参与推导。因此同一份 =_shared/compose.yaml= 由不同项目触发时基准会不同，这正是「相对路径属于触发者」的语义。
+
+*副作用（请知悉）*：注入 =--project-directory= 后 docker 会读取 =<root>/.env= （compose 的默认行为）。项目根目录里有 =.env= 时，其中的变量会参与生成物的变量解析 —— 这是 docker 的标准语义，插件既不读取也不改写该文件。
+
 ** 覆盖合并语义
 
 覆盖写在配置的 =:services= 里，按服务名逐字段处理：=environment=、=labels=、=:extra= 按键合并（项目值覆盖同键、其余键保留），=image=、=command=、=entrypoint=、=ports=、=volumes=、=healthcheck=、=depends-on=、=networks=、=working-dir=、=user=、=restart= 整体替换。覆盖组内不存在的服务名会报错。
@@ -242,7 +273,25 @@ v0.1 的写法仍然可用，视作「匿名配置」（配置名等于组名）
            (app :services ((api :ports ((18080 . 8000)))))))
 #+end_src
 
-新旧写法可以共存，但 *同一项目同一组只能有一个引用*：项目侧 =:groups= 与组侧 =:configs= 指向同一项目时加载报 =ebasecamp-config-duplicate-group-ref=；同一项目在 =:groups= 里重复引用同一组同样报错（v0.1 是静默取首个）。
+新旧写法可以共存。规则是 *同一项目同一组只允许 1 个有效引用*，但「谁说了算」取决于冲突形态：
+
+| 形态 | 结果 |
+|------+------|
+| 项目侧 =:groups= 引用某组，同时组侧 *1 份* =:configs= 配置指向同一项目同一组 | *以组侧配置为准*：加载时旧引用被 *原位接管*（列表位置不变，=:scope= 与 =:services= 取配置值），*不报错* |
+| *两份以上* 组侧配置指向同一项目同一组 | 报 =ebasecamp-config-duplicate-group-ref=，消息里点名第一份配置 |
+| 同一项目在 =:groups= 里重复引用同一组 | 报错（v0.1 是静默取首个） |
+
+「原位接管」意味着老清单 *不必* 立刻手工清理：项目文件里的 =:groups= 仍指向该组，但界面、启停、导出读到的都是配置形态（段头有配置名、覆盖按配置生效）。不过两处写法长期并存容易混淆，因此界面里 *新建配置* / *=E= 改配置关联项目* 时若检测到同一项目同一组的旧 =:groups= 引用，会弹一句确认：
+
+#+begin_src text
+项目 example 的旧写法 :groups 仍引用组 redis；新建配置后该旧引用将被组侧配置
+接管。是否同时删掉这条旧引用？
+#+end_src
+
+- 答 yes → 在 *同一批写盘事务* 里删掉项目文件里的那条旧引用；若它是 =:groups= 里唯一元素，整个 =:groups= 键一并移除（不会留下 =:groups nil=）；
+- 答 no → 写盘照常成功（由上面的「原位接管」兜住），下次新建 / 改配置还会再问一次。
+
+插件 *绝不* 在未经确认的情况下改写你的项目文件：写盘层的迁移开关默认关闭，只有你在确认框里答 yes 才打开。=M=（移动配置）*不做* 迁移 —— 跨组移动不产生新的「同项目同组」关联，撞到旧写法同样由接管兼容。
 
 * 命令表
 
@@ -327,6 +376,13 @@ point 落在某个配置段内时额外生效。段指右栏里的一份配置�
 
 - 本次要启动 shared 与 per-project 两类生成物时 *逐个校验*，全部通过才进入启动，不会出现「已启动一部分」的中间态；
 - 只要有生成物不合法就 *一个容器都不启动*，连 external network =ebasecamp= 都不创建（零副作用），并在提示区显示 stderr 首行这类可读错误，例如 =service "api" refers to undefined config web_cfg: invalid compose project= —— 不再是笼统的 =invalid compose project= ；
+- *顶层 =configs= / =secrets= 的 =file:= 存在性单独检查*：=config -q= 只校验 =env_file= ，*不校验*顶层 config / secret 的 =file:= （缺文件要到容器创建阶段才以 =bind source path does not exist= 暴露）。因此 v0.5.2 在 =config -q= 之前由插件自己按 *项目 =:root=* 逐条检查 =file:= ：相对路径拼 =<root>/<file>= 后判存在性，绝对路径直接判；没有 =file:= 的条目（=external: true= / 纯 =name:=）跳过。任一条缺失就 *中止并给出可读错误*，一个生成物都不写、一个 docker 进程都不派发：
+
+  #+begin_src text
+  顶层 config `app_cfg' 的 file `./conf/app.conf' 不存在（基准：/home/me/proj/conf/app.conf）
+  #+end_src
+
+- 项目 *没有* =:root= 而有相对 =file:= 时无法判定 → *只给警告、不阻塞启动*，成功提示末尾会追加「（N 条预校验警告）」；
 - =x= （停止）与 =D= （销毁）*不做*预校验：它们作用于已经存在的容器，生成物暂时不合法时更应该允许先把服务停掉。
 
 ** 关于 =SPC=
@@ -435,6 +491,10 @@ point 落在某个配置段内时额外生效。段指右栏里的一份配置�
 - shared 生成物（=ebc-shared=）不输出顶层 =configs= / =secrets= ：shared 组服务引用顶层 config / secret 时需自行处理。
 - v0.5.1 之前导入的清单缺 =:file-configs= / =:file-secrets= ：引用顶层 config 的服务启动会报 =refers to undefined config= ，需对原 compose *重新导入一次* 补齐（插件不自动改清单）。
 - 同一组名在多处定义是加载层硬错误：后加载的文件会 *整体回滚* ，其中项目不会出现在界面中；界面写操作遇到同名组直接拒绝。
+- 导出到 *项目 =:root= 之外* 的目录时，顶层 =configs.file= 的相对路径仍会失效（导出物的路径基准由导出目标位置决定，插件不做改写）。
+- 相对 =volumes= 源（以 =.= 开头的 bind 挂载）*没有* 存在性检查：预校验只覆盖顶层 =configs= / =secrets= 的 =file:= ，volume 源缺失要到容器创建阶段才报 =bind source path does not exist= 。
+- =M=（移动配置）*不做* 旧 =:groups= 引用迁移：它不产生新的「同项目同组」关联，若目标项目仍用旧写法引用该组，由「原位接管」兼容（要清理旧引用请用 =X= 新建配置，或答 yes 的确认提示）。
+- 项目没写 =:root= 时的相对路径无法校验：预校验只给「（N 条预校验警告）」；顶层 =configs= / =secrets= 的 =file:= 与相对 =volumes= 源要到容器创建阶段才报 =bind source path does not exist= （=env_file= 例外 —— =config -q= 会校验它，此时基准是生成物所在的缓存目录）。
 
 * 排查：=M-x ebasecamp= 提示命令不存在
 
@@ -475,6 +535,6 @@ make check EMACS=/path/to/emacs STRAIGHT_BUILD=/path/to/build-XX.X
 - [[file:docs/user-guide.org][用户指南]]：安装、清单写法、界面操作、常见任务、清单自检。
 - [[file:docs/compose-generation.org][compose 生成与导入导出规则]]：清单到 compose 的映射、导入映射表、导出物差异。
 - [[file:docs/troubleshooting.org][排障手册]]：命令不存在 / 界面空白 / 加载报错 / =config -q= 失败 / 导入导出异常 / 端口冲突 / 状态不刷新。
-- =docs/adr/0001-architecture.org= ~ =0006-manifest-locate-compose-configs.org=：架构决策（ADR；0005 为清单写盘，扩展 0003 决策 6；0006 为跨文件定位与 compose 顶层 configs/secrets，扩展 0005 决策 1）。
+- =docs/adr/0001-architecture.org= ~ =0007-legacy-groups-and-project-directory.org=：架构决策（ADR；0005 为清单写盘，扩展 0003 决策 6；0006 为跨文件定位与 compose 顶层 configs/secrets，扩展 0005 决策 1；0007 为旧 =:groups= 接管与迁移 + compose 路径基准，修订不变量 9）。
 - =openspec/completed/=：已归档计划（v0.2 / v0.3 / v0.4 与 M1–M3 四份）；=openspec/active/=：进行中计划（v0.5 清单写操作）；=openspec/decisions.md=：决策日志；=openspec/tech-debt.md=：技术债。
 - =AGENTS.md=：仓库地图与不变量清单。

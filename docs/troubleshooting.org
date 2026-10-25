@@ -146,7 +146,7 @@ M-x ebasecamp
   :root "~/work/example")
 #+end_src
 
-  改完 =M-x ebasecamp-reload= 。注意 *同一项目同一组只能有一个引用* ：项目侧 =:groups= 与组侧 =:configs= 同时指向同一项目会报 =ebasecamp-config-duplicate-group-ref=，迁移时先删项目侧那一项。
+  改完 =M-x ebasecamp-reload= 。v0.5.2 起旧 =:groups= 与组侧 =:configs= 指向同一项目同一组 *不再报错* —— 旧引用由组侧配置 *原位接管* （顺序不变，=:service-overrides= 取配置的值）；只有 *两份以上组侧配置* 指向同项目同组才报 =ebasecamp-config-duplicate-group-ref= 。因此项目侧旧引用可以留着不管，也可以在 =X= 新建 / =E= 改配置时顺手删掉（界面会问「是否同时删掉这条旧引用」，答 no 也能成功）。
 - 打开界面时 =message= 会回报 =ebasecamp：N 组 · M 配置（K 个旧写法关联）=（无旧写法关联时省略括号段）。用这行回执确认清单读到了什么：组数对、配置数为 0 且有旧写法关联 → 命中原因为 4，按上一条迁移。
 - 清单为空但目录在 → 手工补 =groups.el= 与 =projects/<name>.el= ，写法见 [[file:user-guide.org][用户指南]]。
 
@@ -169,7 +169,7 @@ M-x ebasecamp
 | 5 | =shared 组 mysql 至多 1 份配置（实际 2 份）= | shared 组写了多份 =:configs= | =link-configs= 的 =:shared-multiple-configs= （E3） |
 | 6 | =配置 c1/g1 覆盖了不存在的服务 db= | 配置的 =:services= 覆盖了组里没有的服务名 | =link-configs= 的 =:unknown-service= |
 
-补充两类同源错误：=项目 myapp（…）引用了未定义的组 ghost= （组没定义，属定义期）与 =项目 myapp 重复引用组 mysql（来源：配置 c2）= （旧 =:groups= 与配置指向同一组，属物化期，D2：同项目同组只允许 1 个引用）。
+补充两类同源错误：=项目 myapp（…）引用了未定义的组 ghost= （组没定义，属定义期）与 =项目 myapp 重复引用组 mysql（来源：配置 c2）= （属物化期：*两份以上组侧配置* 指向同一项目同一组，D2 —— 消息里点名的是 *第一份* 配置；旧 =:groups= 与配置共存 *不* 报这个错，见下文第 16 条）。
 
 ** 排查命令
 
@@ -178,12 +178,13 @@ M-x ebasecamp
   (princ (format "%s :: %S\n" (plist-get e :message) (plist-get e :condition))))
 #+end_src
 
-=:file= 是有用线索：定义期错误指向出错的项目文件，物化期错误 *恒指向* =<清单目录>/groups.el= （配置只能写在那里）。
+=:file= 是有用线索：定义期错误指向出错的项目文件，物化期错误 *恒指向* =<清单目录>/groups.el= （物化期错误不感知具体文件，统一归属 =groups.el=）。
 
 ** 修法
 
-- 1 / 补充第 2 类：同一项目同一组只保留 *一个* 引用 —— 要么删掉重复的 =(组名)= ，要么把它改成组内 =:configs= 的新写法（两种来源混用会撞）。
-- 2 / 3 / 5 / 6：改 =groups.el= 里的 =:configs= 段落，补齐 =:project= 、删掉 =:scope= 、shared 组只留 1 份配置、覆盖的服务名必须在组 =:services= 里存在。
+- 1：旧写法 =:groups= 里同一个组写了两遍 → 删掉重复的那个 =(组名)= 。
+- 补充第 2 类：同一项目同一组只允许 *一个有效引用* —— 旧 =:groups= 与组侧配置共存时由组侧配置 *原位接管* （不报错，无需处理）；只有 *两份以上组侧配置* 指向同项目同组才算冲突，删掉多余的那份配置即可（详见下文第 16 条）。
+- 2 / 3 / 5 / 6：改 *组定义所在文件* 里的 =:configs= 段落（=groups.el= 或 =projects/*.el= ，导入产物常见后者；用 =grep ':configs' groups.el projects/*.el= 定位），补齐 =:project= 、删掉 =:scope= 、shared 组只留 1 份配置、覆盖的服务名必须在组 =:services= 里存在。
 - 4：把配置的 =:project= 指向已定义项目，或先补上 =projects/<name>.el= 。
 - 改完 =M-x ebasecamp-reload= ；批量核对可直接用上一条命令，=:errors= 应为 =nil=。
 
@@ -288,7 +289,7 @@ docker compose -f ~/.cache/ebasecamp/<project>/compose.yaml config | head -40
 | =mapping key "ports" already defined= / =… "volumes" already defined= | *已修复（D6）* ：=:extra= 的同名桶与显式 =:ports= / =:volumes= 已合并为单一序列。若再见，说明清单里 *同时* 有重复来源 —— 检查该服务是否既写了 =:ports= / =:volumes= 又在 =:extra= 里手写了 ="ports"= / ="volumes"= （正常渲染不会再产出重复键；旧版插件生成的清单无此问题） |
 | =service "X" refers to undefined network Y= | 服务引用了未声明网络；渲染器本会声明，说明 =:extra= 里手写了网络的错形态 |
 | =undefined volume= / =undefined service= | 命名卷或 =depends_on= 指向不存在对象（多来自 =:extra= 透传） |
-| =env file … not found= | =env_file= 相对路径按 *compose 文件所在目录* 解析，文件不在那里 |
+| =env file … not found= | =env_file= 相对路径的基准随场景不同：导出物、以及直接 =docker compose -f <项目自身 compose>= 时，按 *compose 文件所在目录* 解析；启动前预校验走缓存生成物并带 =--project-directory <项目 root>= ，此时按项目的 =:root= 解析（见第 14 条）。文件不在对应基准下就会报这个错 |
 | =additional property … is not allowed= | 清单 =:extra= 里写了非 compose schema 的字段（tech-debt #8） |
 
 ** 修法
@@ -456,7 +457,7 @@ etaf 键层确实装在 =emulation-mode-map-alists= 最前面（本可遮住 evi
 - *升级到 0.3.0 或更新*：UI buffer 现由 =ebasecamp-ui-mode= （派生 =special-mode= ）管理并设 =buffer-read-only t=，根 Host 带 =:key-scope 'local=，未绑定 printing key 一律被吞。
 - 确认两件事：=major-mode= 是 =ebasecamp-ui-mode= （不是 =fundamental-mode= ）、=buffer-read-only= 为 =t=。若 mode 没生效，说明加载的仍是旧代码 —— 清掉残留 =.elc= （=make clean= ）并重启 Emacs。
 - 已在旧 buffer 里时，=M-x ebasecamp-reload= 重载清单并刷新界面；仍不正常则 =q= 关掉界面再 =M-x ebasecamp= 重开。
-- 真正的写入口是 =e= ：它打开 =groups.el= 并定位到当前组定义（普通 =emacs-lisp-mode= buffer，可正常编辑）。详见 [[file:user-guide.org][用户指南]] 的「界面操作与键位」节。
+- 真正的写入口是 =e= ：它打开 *组定义所在的清单文件* （按组名跨文件定位，=groups.el= 或 =projects/*.el= 皆可）并定位到当前组定义（普通 =emacs-lisp-mode= buffer，可正常编辑）。详见 [[file:user-guide.org][用户指南]] 的「界面操作与键位」节。
 
 * 12. 界面内按键无反应 / =SPC= 没有切换勾选
 
@@ -508,6 +509,144 @@ etaf 键层确实装在 =emulation-mode-map-alists= 最前面（本可遮住 evi
 ** 修法
 
 切换组用 =n= （下一个）/ =p= （上一个）；=RET= 或点击继续当展开 / 收起用。清单为空时按 =n= 只会在提示区写一条 info「清单里没有组」，不报错。
+
+* 14. 启动前预校验报「顶层 config 的 file 不存在」
+
+** 现象
+
+按 =s= （或段内启动、=M-x= 派发）后 notice 直接失败，消息形如：
+
+#+begin_src text
+顶层 config `app_cfg' 的 file `./conf/app.conf' 不存在（基准：/home/thomas/work/myapp）
+#+end_src
+
+一个容器都没起，=~/.cache/ebasecamp/<project>/compose.yaml= 也没被重写（预校验在写生成物之前就中止）。secret 变体只把消息里的 =config= 换成 =secret=。
+
+v0.5.1 及更早没有这层检查，形态是「预校验通过、建容器才炸」：=docker compose create= 报 =bind source path does not exist: <缓存目录>/conf/app.conf=，而且此时可能已经起了别的 scope 的批次。
+
+** 原因
+
+清单顶层 =configs:= / =secrets:= 的 =file:= 是 *相对项目仓库* 的路径，而生成物写在 =<cache>/<project>/compose.yaml= 。不传 =--project-directory= 时 docker 一律按 *compose 文件所在目录* 解析相对路径（v0.5.2 探针 T3：=configs.<n>.file= 被解析成缓存目录下的路径），文件当然不存在。
+
+这一层只能由插件自己拦 —— 两条 docker 命令都测不出来（都是 docker 的既定行为，不是插件缺陷）：
+
+| 命令 | 能测出缺失吗 | 说明 |
+|------+--------------+------|
+| =docker compose -f <生成物> config -q= | 不能 | 恒 exit 0：它只校验 =env_file:= 的存在性（探针补证 3），不校验顶层 =configs: /=secrets:= 的 =file:= |
+| =docker compose -f <生成物> up --dry-run= | 不能 | 加不加 =--project-directory= 输出完全相同、两者都 exit 0（探针 T7a/T7b） |
+| =docker compose -f <生成物> create= | 能 | exit 1，=bind source path does not exist= —— 但容器已经开始创建 |
+
+v0.5.2 起 =ebasecamp-command--preflight= 在 *写生成物与 =check-compose= 之前* 逐条按项目 =:root= 展开 =file:= 检查存在性；缺失即返回与 =check-compose= 失败 *同构* 的结果（=:failed t=、=:exit= nil、可读 =:stderr=，界面零改动），因此一个生成物都不写、一个 docker 进程都不派发。派发与校验同时统一带 =--project-directory <项目 root>=，所以「校验用的基准」与「真正启动用的基准」是同一个。
+
+判据细节：绝对路径直接按自身判定；相对路径拼 =<root>/<file>=；没有 =file:= 的条目（=external: true= 或只写 =name:=）跳过不检查。
+
+** 排查命令
+
+看清单声明了什么（原样值，未展开）：
+
+#+begin_src elisp
+(let ((p (ebasecamp-model-project 'myapp)))
+  (list :root (ebasecamp-project-root p)
+        :file-configs (ebasecamp-project-file-configs p)
+        :file-secrets (ebasecamp-project-file-secrets p)))
+#+end_src
+
+看文件到底在不在（基准是 *项目 root* ，不是缓存目录）：
+
+#+begin_src text
+ls -l /home/thomas/work/myapp/conf/app.conf
+#+end_src
+
+要确认 docker 把 =file:= 解析成了什么时，必须 *显式带同一个 flag* （这条会插值并展开 =${VAR}= ，输出别贴进 issue）：
+
+#+begin_src text
+docker compose -f ~/.cache/ebasecamp/myapp/compose.yaml \
+  --project-directory /home/thomas/work/myapp config --format json
+#+end_src
+
+** 修法
+
+- 文件本该在项目仓库里 → 按 =<项目 root>/<相对路径>= 放好（上例 =/home/thomas/work/myapp/conf/app.conf=），再 =M-x ebasecamp-reload= 后重试。
+- 清单里的相对路径写错 → 改 =file:= 的值（相对路径一律按项目 =:root= 解析；占位符保持 =${VAR}= 原样，不变量 6）。
+- 该文件不由本项目提供（镜像自带、或由部署环境另放）→ 把该条目改成 =external: true= 或只写 =name:= ；没有 =file:= 的条目直接跳过检查。
+- 这份顶层声明根本不需要 → 删掉该条目；服务侧 =configs:= / =secrets:= 里对它的引用要一并删，否则 =config -q= 会报 =service "x" refers to undefined config= 。
+
+* 15. 成功提示末尾多出「（N 条预校验警告）」
+
+** 现象
+
+启动成功，但 notice 末尾按计数追加「（N 条预校验警告）」；=ebasecamp-command-run= 的 on-complete 结果 plist 里 =:preflight-warnings= 是字符串列表，单条形如：
+
+#+begin_src text
+项目 myapp 无 :root，无法校验顶层 config `app_cfg' 的 file `./conf/app.conf'
+#+end_src
+
+警告 *不改变* =:ok= / =:failed= / =:exit= ，启动照常进行。
+
+** 原因
+
+顶层 =configs:= / =secrets:= 的 =file:= 是相对路径，判定基准必须是项目 =:root= ；项目没有 =:root= 时插件不知道基准，于是既不判「存在」也不判「缺失」，只记一条 warning（缺 =:root= 是模型允许的状态，不该硬失败）。同一情形下派发也不带 =--project-directory=，docker 退回「按 compose 文件所在目录解析」的旧基准 —— 这类相对路径几乎必然在 =create= 阶段失效。
+
+=:preflight-warnings= 与 =ebasecamp-docker-check-compose= 的 =:warnings= *不是同一个东西* ：后者是 compose stderr 里的 =level=warning= 行，前者是本插件自己收集的「无法判定」条目。刻意分开命名，别把两者混看。
+
+** 排查命令
+
+#+begin_src elisp
+(ebasecamp-project-root (ebasecamp-model-project 'myapp))   ; nil 即命中本情形
+#+end_src
+
+#+begin_src text
+grep -n ':root' ~/.config/ebasecamp/projects/myapp.el
+#+end_src
+
+** 修法
+
+给项目补 =:root=（项目仓库路径，=~= 开头也可以），=M-x ebasecamp-reload= 后警告消失。补 =:root= 顺带修好所有相对路径的基准：顶层 =configs: /=secrets:= 的 =file:= 、以 =.= 开头的 bind 卷源、=env_file= 。项目 =:root= 的可选性是 v0.5.3 的范围，本版只做「回退 + warning」。
+
+* 16. 新建 / 改配置时报「项目 X 重复引用组 Y」
+
+** 现象
+
+=X= （新建配置）或 =E= （改配置的 =:project=）提交后事务回滚，notice 形如：
+
+#+begin_src text
+写入 /home/thomas/.config/ebasecamp/groups.el 后清单新增 1 个错误，已回滚：项目 example 重复引用组 redis（来源：配置 cache）
+#+end_src
+
+** 原因
+
+v0.5.2 起这个错 *只剩一种情形* ： *两份以上组侧配置* 指向同一项目同一组。旧写法 =:groups= 与组侧 =:configs= 指向同项目同组 *不再报错* —— 旧引用由组侧配置 *原位接管* （顺序仍是原位置，=:service-overrides= 取配置的值）。
+
+为什么仍要拦：容器标签没有「配置」维度（只有 =ebasecamp.managed= / =.project= / =.group= / =.service= / =.scope= 五项），同项目同组的第二份配置会渲染出同名的 compose 服务 → 服务名撞，因此同一项目同一组只允许 1 个 *有效引用* （见 [[file:architecture.org][架构]] 不变量清单第 10 条）。
+
+消息里的「来源：配置 X」点名的是 *第一份* 配置 —— 也就是与新写入那份冲突的对象。纯旧 =:groups= 写法（没有任何组侧配置）永远不会报这个错。
+
+** 排查命令
+
+#+begin_src elisp
+;; 找出「同项目同组有多份组侧配置」的组
+(dolist (g (ebasecamp-model-groups))
+  (let ((by-project (make-hash-table :test #'eq)))
+    (dolist (c (ebasecamp-group-configs g))
+      (push (car c) (gethash (plist-get (cdr c) :project) by-project)))
+    (maphash (lambda (project configs)
+               (when (cdr configs)
+                 (princ (format "组 %s → 项目 %s：%S\n"
+                                (ebasecamp-group-name g) project configs))))
+             by-project)))
+#+end_src
+
+也可以直接看文本：
+
+#+begin_src text
+grep -n ':configs' ~/.config/ebasecamp/groups.el ~/.config/ebasecamp/projects/*.el
+#+end_src
+
+** 修法
+
+- 多余的那份是笔误 → =X= → 删配置，或 =E= 把它的 =:project= 改到正确项目。
+- 确实要在同一项目里跑同一组的两套参数 → *当前不支持* （服务名会撞）；绕法是为第二套 *复制一个组* （不同组名，各挂一份配置）。
+- 旧 =:groups= 那条 *不是* 冲突来源：它已被组侧配置接管；重建配置时界面会先问「是否同时删掉这条旧引用」，答 yes 即顺手清理（A-II 迁移），答 no 也能成功（下次再提示）。
 
 * 相关文档
 

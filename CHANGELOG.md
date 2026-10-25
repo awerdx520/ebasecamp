@@ -2,6 +2,24 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/) 与 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式。
 
+## [0.5.2] - 2026-10-24
+
+修两处「老清单越用越坏」的阻断级缺陷：项目仍用旧 `:groups` 时界面新建配置必然回滚；生成物在缓存目录导致清单里的相对路径失效。另把 compose 顶层 `configs` / `secrets` 的文件存在性纳入启动前预校验。
+
+### 修复
+
+- **界面新建配置在「项目仍用旧 `:groups`」时必然失败**：同一组同时被项目侧旧 `:groups` 与组侧 `:configs` 引用时，加载层原先一律报 `ebasecamp-config-duplicate-group-ref`，写盘事务因此回滚（实测原文：`写入 …/groups.el 后清单新增 1 个错误，已回滚：项目 example 重复引用组 redis（来源：旧 :groups）`）—— 而示例清单正是这种形态，等于任何新建配置都做不成。现在 `ebasecamp-model-link-configs` 用**双簿记**（`sources` 只承载错误消息来源、`legacy` 只标记「可被接管」）判定：旧引用由组侧配置**原位接管**（列表位置不变，`:scope` / `:service-overrides` 取配置值、不报错），只有**两份以上组侧配置**指向同一项目同一组才报错并点名第一份配置。接管用 `setcar` 改引用 cell，不动 reference plist，基线快照与幂等不受影响（不变量 9 相应修订）。
+- **生成物在缓存目录导致顶层 `configs` / `secrets` 的相对 `file:` 失效**：清单里的相对路径（顶层 `configs`/`secrets` 的 `file:`、以 `./` 开头的 `volumes` 源、`env_file`）属于项目根，而 docker 默认按生成物所在的 `~/.cache/ebasecamp/<project>/` 解析，缺失只在容器创建阶段以 `bind source path does not exist` 暴露（`config -q` 照样 exit 0）。现在派发与预校验统一注入根级 flag `--project-directory <项目 root>`（`compose -f FILE --project-directory ROOT -p NAME <subcmd>`），预校验与 `up` / `stop` 用同一基准，不再出现「校验通过、启动炸」。
+- **预校验对顶层 `configs` / `secrets` 的 `file:` 缺失无感知**：`docker compose config -q` 只校验 `env_file`，不校验这一层。现在 `ebasecamp-command--preflight` 在逐分支写盘与 `check-compose` **之前**由 Elisp 侧按项目 root 逐条检查 `file:`（绝对路径直接判，相对路径判 `<root>/<file>`，`external: true` / 纯 `name:` 跳过），缺失时给出可读错误并中止（消息形如「顶层 config `app_cfg` 的 file `./conf/app.conf` 不存在（基准：/home/me/proj/conf/app.conf）」）：一个生成物都不写、一个 docker 进程都不派发。
+
+### 变更
+
+- **项目 `:root` 现在决定相对路径基准**：不再只是「在项目中打开」的定位依据与导出落点。项目没写 `:root` 时退回旧行为（按生成物目录解析），此时相对 `file:` 无法校验，预校验只给警告、不阻塞启动。
+- **docker 会读取 `<项目 root>/.env`**：`--project-directory` 的 compose 默认行为，其中变量参与生成物解析。插件既不读取也不改写该文件。
+- **新建 / 改配置时询问是否清理旧 `:groups` 引用**：界面检测到同项目同组的旧写法引用时弹 `y-or-n-p`（「…旧引用将被组侧配置接管。是否同时删掉这条旧引用？」）。答 yes 才迁移 —— 同文件情形在一次事务内完成，跨文件情形两次事务 + 备份补偿；该组是 `:groups` 唯一元素时整条键移除（不留 `:groups nil`）。答 no 写盘仍成功（走接管兼容），下次再问。写盘层 `migrate-legacy` 默认 `nil`，脚本 / 测试调用零行为变更，绝不静默改写项目文件。`M`（移动配置）不做迁移。
+- **成功提示在存在预校验警告时追加「（N 条预校验警告）」**：警告集合刻意命名 `:preflight-warnings`（区别于 `check-compose` 从 compose stderr 抽出的 `:warnings`），经 `run` → `dispatch` → `report` → UI 成功分支透传；警告不改变成败。
+- **测试基线 415 → 436**（净新增 21 项；其中 1 项既有用例因语义反转被新增用例顶替）。
+
 ## [0.5.1] - 2026-10-23
 
 修复两处阻断级缺陷：清单没有 `groups.el` 时界面写操作全部失败；服务引用 compose 顶层 `configs` / `secrets` 时启动失败。另把 compose 校验前置到启动之前。

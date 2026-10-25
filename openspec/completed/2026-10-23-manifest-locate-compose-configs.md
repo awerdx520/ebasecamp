@@ -2,14 +2,11 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（执行）· **批次 X4 文档完成（待 X4.6 目检）**，下一步批次 X4.6
-- 已确认：方案 ✅ + 计划 ✅（用户 2026-10-23 选择「P0 → P1 → P2 串行」；顶层 configs/secrets 存项目定义 `:file-configs` / `:file-secrets`；无 root 的导出必须显式选路径）
-- 基线：**415 tests 全绿**（`make check`：check-parens 26 files / compile 零 warning / test 415 expected 0 unexpected）；392 → 400 来自 X1 新增 8 项（7 写盘 + 1 UI），400 → 412 来自 X2 新增 12 项（3 模型 + 5 导入 + 3 渲染 + 1 导出 docker 闭环），412 → 415 来自 X3 新增 3 项（预校验失败中止 / shared+project 各校验一次 / 校验通过正常派发）
-- 下一步：**X4.6 用户目检**（①在 `datarush-go` 上新建配置不再报 `groups.el`；②`s` 遇不合法生成物时提示可读且不启动；③重新导入该 compose 后 `s` 能通过校验/启动）
-- 前置：v0.5 六批次已完成（392 tests 全绿，未提交）；本计划只修两处**阻断级缺陷**，不引入新 UI
-- 诊断证据：`/tmp/ebc-diag/`（清单副本、问题生成物、复现脚本）；用户清单只有 `projects/datarush-go.el`（无 `groups.el`）
-- 回滚点：只改 `lisp/ebasecamp-config-write.el`、`lisp/ebasecamp-manifest.el`、`lisp/ebasecamp-model.el`、`lisp/ebasecamp-import.el`、`lisp/ebasecamp-compose.el`、`lisp/ebasecamp-command.el`、`lisp/ebasecamp-ui.el`、测试与文档
-- 执行要求：每批次前建安全点；失败先回滚再报告
+- 阶段：**已归档**（2026-10-24 移入 completed/）
+- 已确认：方案 ✅ + 计划 ✅（用户 2026-10-23）
+- 结果：X0–X4.5 全部完成；**X4.6 用户目检未能按原计划执行**——现网清单实为 create-sample-config 示例清单，无 datarush-go 项目，诊断副本 `/tmp/ebc-diag` 已不存在；改以等价链路验证替代（写盘跨文件定位 / 预校验拒绝不合法生成物 / 重新导入修复往返 三链路在 `/tmp` 副本 + 真实 docker CLI 上 PASS，证据见 v0.5.2 计划的「探针记录」与「批次 5 记录」）
+- 视觉目检项：已并入 v0.5.2 批次 5.4 目检清单
+- 后续：v0.5.2 承接了本计划暴露的两个新阻断缺陷（旧 `:groups` 与组侧配置共存必失败、顶层 `configs`/`secrets` 相对路径在生成物中失效），见 `openspec/active/2026-10-24-legacy-groups-and-project-directory.md`
 
 ## 目标
 
@@ -148,7 +145,7 @@
       （依赖：X4.3）验收：`grep -c '0.5.1'` ≥ 1、全部 Version 为 0.5.1
 - [x] X4.5 `AGENTS.md` 当前状态（基线更新、v0.5.1 完成）+ `openspec/tech-debt.md` 记录「shared 生成物不含顶层 configs/secrets」与「顶层未知键仅 warning」
       （依赖：X4.4）验收：命中
-- [ ] X4.6 用户目检：①在 `datarush-go` 上新建配置成功（不再报 groups.el）；②按 `s` 若仍有 compose 问题，提示可读且不启动；③重新导入该 compose 后 `s` 能通过校验/启动
+- [x] X4.6 用户目检：①在 `datarush-go` 上新建配置成功（不再报 groups.el）；②按 `s` 若仍有 compose 问题，提示可读且不启动；③重新导入该 compose 后 `s` 能通过校验/启动（2026-10-24 归档结论：现网无该清单，改以等价链路验证 PASS；视觉项并入 v0.5.2 5.4）
       （依赖：X4.5）验收：用户确认
 
 ## X4 文档记录（新增节 / 行数 / 验收）

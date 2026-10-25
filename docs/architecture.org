@@ -11,7 +11,7 @@ ebasecamp 是 Emacs 里的 Docker 环境分组管理插件。v0.2 起，模型�
 - *清单是唯一事实源*：组与项目以 Elisp 形式保存在 =~/.config/ebasecamp/= （=groups.el= 与 =projects/*.el=）；compose 文件要么是可重建缓存（=~/.cache/ebasecamp/=），要么是用户显式触发的部署导出物。
 - *下游只读统一形态*：无论组引用来自旧写法（项目侧 =:groups=）还是新写法（组侧 =:configs= 物化而来），进入渲染 / 命令 / 状态 / 导出层时都是同一个 plist 形态 =(:group SYMBOL :scope SCOPE :service-overrides ALIST)=。
 
-本文档描述 *当前实现* （HEAD，v0.2 批次 C6 完成态）；代码是最终依据，文档与代码冲突时以代码为准并回头修文档。数据模型的设计理由见 [[file:adr/0001-architecture.org][ADR-0001]]，compose 映射细节见 [[file:compose-generation.org][compose 生成]]，操作步骤见 [[file:user-guide.org][用户指南]]。
+本文档描述 *当前实现* （v0.5.2）；代码是最终依据，文档与代码冲突时以代码为准并回头修文档。数据模型的设计理由见 [[file:adr/0001-architecture.org][ADR-0001]]，compose 映射细节见 [[file:compose-generation.org][compose 生成]]，操作步骤见 [[file:user-guide.org][用户指南]]。
 
 * 分层与依赖方向
 
@@ -116,11 +116,27 @@ ebasecamp 是 Emacs 里的 Docker 环境分组管理插件。v0.2 起，模型�
 1. 每个项目的 =groups= 槽先回到「物化前基线」（见幂等）。
 2. 逐组逐配置校验，任一命中即记一条错误并 *跳过该配置*，不中断其余项：
    - 配置引用的项目未定义 → =:undefined-project=；
-   - 同项目同组已有引用（来自旧 =:groups= 或另一份配置）→ =:duplicate-group=；
+   - 同项目同组已有 *另一份配置* 物化出的引用 → =:duplicate-group= （由旧 =:groups= 提供的引用 *不算冲突*，见下「双簿记」）；
    - shared 组配置份数 > 1 → =:shared-multiple-configs=，*整组跳过*（无法判定哪份生效）；
    - 覆盖了组内不存在的服务 → =:unknown-service=；
    - 覆盖项本身非法 → =:invalid-services=（模型层已校验，此处兜底）。
-3. 通过的配置转成引用后 =append= 到项目 =groups= 末尾：*旧 =:groups= 引用在前，物化结果按「组定义顺序 → 配置定义顺序」在后*。
+3. 通过的配置转成引用后：该引用若正由旧 =:groups= 提供且尚未被接管 → *原位替换*（=:group= / =:scope= / =:service-overrides= 取配置值，列表位置不变）；否则 =append= 到项目 =groups= 末尾 —— *旧 =:groups= 引用在前，物化结果按「组定义顺序 → 配置定义顺序」在后*。
+
+** 双簿记：=sources= 与 =legacy= 不可混用
+
+「能否被接管」*不能* 靠比较来源字符串决定（=“旧 :groups”= / =“配置 X”= / 兜底 =“另一份配置”= 三种形态共存）。因此 =ebasecamp-model-link-configs= 内并列维护两个 hash，键都是 =(项目名 . 组名)=：
+
+| 簿记 | 内容 | 用途 |
+|------+------+------|
+| =sources= | 当前有效引用的 *来源串*（旧 =:groups= / 「配置 <配置名>」/ 兜底「另一份配置」） | *只* 拼进错误消息，任何行为分支都不比较它的值 |
+| =legacy= | 值恒为 =t=，标记「该引用当前由旧 =:groups= 提供、可被组侧配置接管」 | 冲突时 *唯一* 的判据 |
+
+流程：步骤 1 回填基线时对每条旧引用 *同时* 写两个 hash；E2 命中「同项目同组已有引用」时先查 =legacy= ——
+
+- 有标记 → 接管、不记错误；随后 =remhash= 该键并把 =sources= 更新为「配置 <名>」。**顺序很重要**：不清标记的话，第二份配置会再接管一次并 *静默丢掉第一份*；
+- 无标记 → 报 =:duplicate-group=，来源取 =sources=（nil 时兜底「另一份配置」）。
+
+*原位替换只对 groups 槽里那个列表 cell 做 =setcar=* ，不改 reference plist、也不改基线快照：基线是浅拷贝，改 plist 会污染下次重算的起点从而破坏幂等；改 cell 则既保持「旧引用位置不变」，又让每次重算的结果稳定。配置的定义顺序因此不影响结果。
 
 错误项与 =ebasecamp-config-load= 的 =:errors= 元素同形 =(:file PATH :condition CONDITION-DATA :message STRING)=；模型层不感知文件，=:file= 恒为 nil，由 =ebasecamp-config--link-configs= 统一补填成 =<dir>/groups.el= （配置只能写在 groups.el）。
 
@@ -163,7 +179,9 @@ ebasecamp 是 Emacs 里的 Docker 环境分组管理插件。v0.2 起，模型�
 
 * 不变量清单
 
-以下每条都可机械检查（命令或断言），违反即视为缺陷而非风格问题。前 8 条沿用 v0.1（与 [[file:../AGENTS.md][AGENTS.md]] 对齐），第 9–11 条为 v0.2 新增，第 12 条为 v0.3 新增（ADR-0003），第 13 条为 v0.4 新增（ADR-0004）。
+以下每条都可机械检查（命令或断言），违反即视为缺陷而非风格问题。前 8 条沿用 v0.1（与 [[file:../AGENTS.md][AGENTS.md]] 对齐），第 9–11 条为 v0.2 新增，第 12 条为 v0.3 新增（ADR-0003）、第 13 条为 v0.4 新增（ADR-0004），第 10 条与第 12 条由 v0.5.2 修订、第 14 条为 v0.5.2 新增（ADR-0007）。
+
+*编号与 =AGENTS.md= 的清单不等价*（那边 1–15、本表 1–14，自 v0.2 起就分叉）：本表第 9 / 10 / 11 条分别对应 =AGENTS.md= 第 11 / 9 / 10 条（本表把「物化产物键名必须是 =:service-overrides=」一条提到第 9 位，=AGENTS.md= 里它是第 11 条），第 12 / 13 条与 =AGENTS.md= 同号，*第 14 条对应 =AGENTS.md= 第 15 条*；=AGENTS.md= 第 14 条「清单写盘必须经 =ebasecamp-manifest--write-transaction=」在本表内没有对应行（该要求写在下文「清单写盘」节的正文里）。
 
 | # | 不变量 | 违反后果 |
 |---+--------+----------|
@@ -176,10 +194,11 @@ ebasecamp 是 Emacs 里的 Docker 环境分组管理插件。v0.2 起，模型�
 | 7 | =docker ps= 必须带 =--no-trunc= | ID / Labels 被截断，归属判定失效 |
 | 8 | =config -q= 判据是「退出码 0 *且* stderr 不含 ~level=error~」 | 未定义变量的错误漏报 |
 | 9 | 物化产物的键名必须是 =:service-overrides=，*不得* 写 =:services= | 覆盖被下游静默丢弃（渲染 / 命令 / 导入都按 =:service-overrides= 读） |
-| 10 | 同一项目 + 同一组只允许 *1 个引用*（旧 =:groups= 与配置侧合计） | 容器标签无配置维度、服务名会撞；后一份覆盖静默丢失。加载期即报 =ebasecamp-config-duplicate-group-ref= |
+| 10 | 同一项目 + 同一组只允许 *1 个有效引用*：旧 =:groups= 与组侧 =:configs= 指向同项目同组时以 *组侧配置* 为准（原位接管、不报错），仅当 *两份以上* 组侧配置指过来才报 =ebasecamp-config-duplicate-group-ref= | 容器标签无配置维度、服务名会撞；误按「一律报错」实现会让老清单无法新建配置，误按「静默合并」实现会丢掉后一份覆盖 |
 | 11 | =shared= 组至多 1 份配置，且该配置的 =:project= 必填 | 多宿主会互相覆盖 =_shared/compose.yaml= 与 =ebc-shared= 容器集合；缺 =:project= 无法推出渲染上下文 |
-| 12 | UI buffer 必须只读（=ebasecamp-ui-mode= 派生 =special-mode= + =buffer-read-only t=），最外层 Host 用 =:key-scope 'local= 吞未绑定 printing key；写只经 =e= 打开的 =groups.el= | 界面能打字 → 改动无处落地且误导；写能力脱离清单文件 |
+| 12 | UI buffer 必须只读（=ebasecamp-ui-mode= 派生 =special-mode= + =buffer-read-only t=），最外层 Host 用 =:key-scope 'local= 吞未绑定 printing key；写只经界面表单（=S= / =E= / =M= / =X=）或 =e= 打开的 *组定义实际所在* 的清单文件（按组名跨文件定位，=groups.el= 与 =projects/*.el= 皆可；定位失败退 =groups.el= → 第一个项目文件，只 =message= 不 signal），两者都经 =ebasecamp-manifest--write-transaction= | 界面能打字 → 改动无处落地且误导；写能力脱离清单文件 |
 | 13 | UI 样式不得硬编码色值 —— 只允许出现在 palette / token 定义区与 =defcustom= 默认值，render 区一律走 =etaf-theme-token= | 硬编码色值在暗色主题下发白（v0.3 前的实际问题），且无法随 =load-theme= 切换 |
+| 14 | 预校验与派发必须用 *同一个* =--project-directory= 基准（都由 =ebasecamp-command--preflight= / =--dispatch= 从同一个项目对象的 =:root= 推导） | 校验按缓存目录、启动按项目 root（或反之）→ 重现「校验过、启动炸」：=config -q= 通过而 =create= 报 =bind source path does not exist= |
 
 第 5 条的三个 flag 缺一不可，缺 =--no-interpolate= 时退出码仍为 0（静默失败），因此只能靠代码审查 + 密钥断言测试守住。
 
@@ -261,7 +280,7 @@ etaf 只在 *边界 Host* 内吞掉未绑定的 printing key。边界指 =:key-s
 UI buffer 只读，写操作有两条路，但 *共用同一写盘事务内核* （见「清单写盘」一节）：
 
 1. *界面表单*（v0.5 起）：=S= 编辑 point 所在服务的 6 个字段、=E= 改配置的 =:project= 、=M= 移动配置、=X= 打开清单操作菜单（配置 / 项目 / 组的 CRUD）。这些入口只在界面 buffer 里收键，实际写入由 =ebasecamp-config-write.el= 调 =ebasecamp-manifest--write-transaction= 完成，界面 buffer 本身仍然只读。
-2. *手写清单*：=ebasecamp-ui-edit-manifest= （根级键 =e= ）取会话的 =selected-group= ，用 =find-file= 打开 =<dir>/groups.el= ，再定位到 =(ebasecamp-define-group <组名>= 那一行。三条降级路径：无选中组、文件不存在时走 =user-error= ；文件里找不到组定义时退到 =point-min= 并 =message= 提示，不 signal。函数只打开文件，不读取也不打印任何密钥值；保存后的重载由 =g= 走 =ebasecamp-reload= 完成。
+2. *手写清单*：=ebasecamp-ui-edit-manifest= （根级键 =e= ）取会话的 =selected-group= ，先用 =ebasecamp-config-write--manifest-file-for-group= 按组名 *跨文件定位组定义实际所在的文件* （=groups.el= 与 =projects/*.el= 皆可——组定义在哪个文件，就打开哪个文件），再在该文件里定位到 =(ebasecamp-define-group <组名>= 那一行。三档降级都不阻断编辑：无选中组走 =user-error= ；定位失败（清单里没有该组 / 同名组重复定义）先 =message= 说明原因，再退回 =groups.el= （不存在则退到第一个项目文件），连可编辑的清单文件都没有才 =user-error= ；文件里搜不到 =(ebasecamp-define-group <组名>= 时退到 =point-min= 并 =message= 提示，*不 signal* （清单可以手写，定位失败不该阻断编辑）。函数只打开文件，不读取也不打印任何密钥值；保存后的重载由 =g= 走 =ebasecamp-reload= 完成。
 
 无论走哪条路，「写」最终都落在清单文件上：表单路径经事务内核（含备份、原子写、错误集差分回滚），手写路径由用户自己保存。ADR-0003 的决策 6（唯一写入口 = =e= ）已由 ADR-0005 扩展，界面 buffer 只读这一条不变。
 
@@ -433,6 +452,22 @@ compose 允许服务引用顶层声明的 config / secret。v0.5.1 之前这条�
 
 保存流程：先在本地跑一遍字段解析做校验，失败只更新 error ref、*不关闭* dialog；通过后走 =etaf-next-tick= 调写盘（让「保存中」状态先渲染），写后 =ebasecamp-reload= + 刷新并恢复选中组，成功 notice，最后关闭 dialog。dialog 不能同步返回用户输入，需要同步输入的地方（选项目 / 选组 / 输入名字）一律 =etaf-call-with-input= + =completing-read= / =read-string= ，与既有 =I= / =o= / =e= 一致。
 
+** 派发参数构造与路径基准（=ebasecamp-command-compose-args=）
+
+compose 命令行的唯一构造点是 =ebasecamp-command-compose-args (ACTION FILE PROJECT-NAME SERVICES &optional ROOT)= ：
+
+#+begin_src text
+compose -f FILE [--project-directory ROOT] -p NAME <subcmd> ...
+#+end_src
+
+- =ROOT= 非 nil 时在 =-f FILE= 之后、子命令 *之前* 插入根级 flag =--project-directory= 与 =(expand-file-name ROOT)= —— 该 flag 属于根级选项，放子命令之后就报 =unknown flag=；=-p= 仍显式传入，项目名不漂移；
+- =ROOT= 为 nil 时参数序列与 v0.5.1 *逐字节一致*（既有用例零改动）：退回「相对路径按 compose 文件所在目录解析」的旧基准；
+- *为什么需要注入*：生成物在 =<cache>/<project>/= ，而清单里的相对路径（顶层 =configs= / =secrets= 的 =file:=、以 =.= 开头的 =volumes= 源、=env_file=）属于 *项目根*；不注入时 docker 一律按生成物目录解析（探针 T3 实测 =configs.<n>.file= 被解析成缓存路径），缺失只在容器创建阶段以 =bind source path does not exist= 暴露；
+- *ROOT 从哪来*：=--preflight= 与 =--dispatch= 都取 =ebasecamp-command-run= 里的 *同一个* 项目对象（=ebasecamp-command--project=），即 *触发本次操作的项目*；=ebc-shared= 生成物也用它的 root —— shared 配置的 =:project= 只是渲染上下文，不参与推导；
+- *与预校验同基准*：=ebasecamp-docker-check-compose (FILE &optional ROOT)= 注入同一个 flag，否则重现「=config -q= 通过、=create= 炸」（不变量 14）；
+- *副作用*：注入后 docker 会读取 =<root>/.env=（compose 默认行为，探针补证 5），其中的变量参与生成物解析；插件既不读取也不写该文件；
+- *不注入的两处*：=ebasecamp-import.el= 读的是 *用户项目自身* 的 compose 文件，其所在目录即项目根，基准本就正确（ADR-0007 记明该理由）；=ebasecamp-export.el:209= 的 =check-compose= 不传 root —— 导出目标由用户选定，只影响 =env_file= 相对路径的判定基准（记入技术债，导出物中顶层 =configs.file= 的相对路径在非项目根目录下同样失效）。
+
 ** 启动前预校验（=ebasecamp-command--preflight=）
 
 生成物是否合法原先只在 docker 那一步暴露：=up= 直接失败，界面只看到 =invalid compose project= 这类笼统 stderr。v0.5.1 把校验前置到 =ebasecamp-command-run= —— 位置在 =check-requires= 之后、=ebasecamp-command-ensure-network= *之前* ，因此生成物不合法时连 external network 都不创建（零副作用），随后才建网络并派发。
@@ -444,6 +479,9 @@ compose 允许服务引用顶层声明的 config / secret。v0.5.1 之前这条�
 - *失败载荷与成功路径同构*：失败时返回与 =--dispatch= 的 report 同字段的结果 plist（=:action= / =:project= / =:ok= / =:results= / =:auto-started-shared= / =:order= ），失败分支带 =:failed t= + =:exit= + =:stderr= 原文（UI 的 =ebasecamp-ui--report-result= 用 =ebasecamp-docker--first-line= 展示首行），其余分支标 =:skipped t=，=:order= 为 nil（一个都没派发）；=ebasecamp-command-run= 此时返回 nil。
 - *动作范围只有 =start= / =restart=* （=ebasecamp-command--validated-actions=）：=stop= / =down= 不校验 —— 它们作用于已存在的容器，生成物暂时不合法时更应先允许把服务停掉。测试里把 =down= 的 =check-compose= 桩成 =error= 来守住这条不变量。
 - *既有用例显式打桩 =ebasecamp-docker-check-compose=* ：此前它们只打桩 =run-sync= ，校验会经同一桩「侥幸」通过；显式打桩让用例不再依赖 =check-compose= 的内部实现。
+- *两层检查，v0.5.2 加的是第二层*：=config -q= 只校验 =env_file= —— 顶层 =configs= / =secrets= 的 =file:= 缺失它照样 exit 0（探针 T2 / 补证 3），于是缺失要到 =create= 阶段才炸。因此在 *逐分支写盘与 =check-compose= 之前* 由 Elisp 侧自己核对：=--file-declarations= 只取 *本项目* 的 =:file-configs= / =:file-secrets= 中带 =file:= 的条目（=external: true= / 纯 =name:= 跳过），=--missing-file-declarations= 按 =ROOT= 判存在性 —— 绝对路径直接判，相对路径判 =<root>/<file>= ，无 =ROOT= 则 *只记 warning* 不判缺失。
+- *缺失的失败载荷与 =check-compose= 失败同构*：=:failed t= + =:exit= nil + =:stderr= 可读消息「顶层 config `app_cfg' 的 file `./conf/app.conf' 不存在（基准：<绝对路径>）」，并落在 *per-project 分支* 上（=--project-branch-index= ，否则 UI 会把错误归到 shared 批次）。因此一个生成物都不写、一个 docker 进程都不派发（连 =network inspect= 都不执行）。
+- *warning 不改变成败，但必须能到 UI*：warning 集合刻意命名 =:preflight-warnings= （不复用 =:warnings= —— 那是 =check-compose= 从 compose stderr 抽出的 =level=warning= 行）。透传链：=--preflight= 返回 → =ebasecamp-command-run= 的 *成功分支* 取 =:preflight-warnings= → =ebasecamp-command--dispatch (&optional PREFLIGHT-WARNINGS)= → report 的 on-complete plist 带 =:preflight-warnings= → =ebasecamp-ui--report-result= 成功分支在 detail 末尾追加「（N 条预校验警告）」。⚠ =--preflight-report= 是 *失败路径专用*，成功场景根本不经过它，不要在那里拼成功提示。
 
 ** 已知边界
 

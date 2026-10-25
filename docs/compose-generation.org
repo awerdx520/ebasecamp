@@ -2,7 +2,7 @@
 #+author: Thomas
 #+options: toc:t
 
-本文描述 *当前实现* （HEAD，v0.2 批次 C6 完成态）的 compose 读写规则。代码是最终依据：文档与 =lisp/= 冲突时以代码为准，并回头修文档。
+本文描述 *当前实现* （v0.5.2）的 compose 读写规则。代码是最终依据：文档与 =lisp/= 冲突时以代码为准，并回头修文档。
 
 相关实现：=lisp/ebasecamp-compose.el= （清单 → YAML 渲染）、=lisp/ebasecamp-import.el= （compose JSON → 清单 + 落盘）、=lisp/ebasecamp-export.el= （部署物导出）、=lisp/ebasecamp-docker.el= （docker 调用与 =config -q= 校验）。
 
@@ -16,6 +16,25 @@ compose 文件在本插件里只有一个合法来源方向： *清单 → compo
 | 部署导出物 | =docker-compose.ebasecamp.yaml= | =<project :root>= 下，或项目 =:export-file= 指定处 | 用户显式 =M-x ebasecamp-export-compose= | 交给部署环境（脱离 ebasecamp）直接 =docker compose up -d= |
 
 两条链路的差别是 *输入调整* 而不是两套渲染代码：导出复用 =ebasecamp-compose-render= ，只在渲染前做两件事（只渲 per-project 组、关闭 =:shared-network=）。因此 YAML 语法、标签注入、卷命名、=depends_on= 处理两边完全一致。
+
+* 生成物的路径基准（=--project-directory=）
+
+生成物写在缓存目录（=<cache>/<project>/compose.yaml= ，shared 为 =<cache>/_shared/compose.yaml= ），但清单里的 *相对路径* 属于 *项目仓库* —— 顶层 =configs: /=secrets:= 的 =file:= 、以 =.= 开头的 bind 卷源、=env_file= 都是。两者不是同一个目录，因此派发与预校验都必须显式告诉 docker 用哪个目录当基准：
+
+#+begin_src text
+compose -f <生成物> [--project-directory <项目 root>] -p <项目名> <子命令> ...
+#+end_src
+
+四条要点：
+
+1. *=--project-directory= 是根级 flag* ，必须落在 =-f FILE= 之后、子命令 *之前*；放到子命令之后 docker 报 =unknown flag= （v0.5.2 探针补证 6）。参数序列由 =ebasecamp-command-compose-args= 唯一构造（见 [[file:architecture.org][架构]] 的「派发参数构造与路径基准」节）；=-p= 仍显式传入，项目名不漂移。
+2. *默认基准是 compose 文件所在目录*。不传 flag 时 docker 按生成物所在的缓存目录解析相对路径（探针 T3：=configs.<n>.file= 变成缓存目录下的路径），缺失只在 =create= 阶段以 =bind source path does not exist= 暴露。
+3. *=ebc-shared= 用「触发本次操作的项目」的 root* ：shared 配置的 =:project= 只是渲染上下文（宿主），不是业务绑定，不能拿它反推基准。
+4. *=:root= 为 nil 时不传 flag* ，退回旧基准（相对路径基本失效），并由预校验给一条 warning（见 [[file:troubleshooting.org][故障排查]] 第 15 条）。
+
+必然的副作用（不是缺陷）：带上 =--project-directory= 后 docker 会 *额外读取* =<root>/.env= 参与插值 —— 它认定的「compose 项目目录」就是那个目录。插件自己不读取、不打印、不落盘任何密钥值（不变量 6），但项目 root 下有 =.env= 时插值结果可能与不带 flag 时不同。
+
+预校验（=docker compose config -q= ）与真实派发 *必须同基准* ，任一缺失就会重现「校验通过、启动炸」。但 =config -q= *不* 校验顶层 =configs: /=secrets:= 的 =file:= 是否存在（它只校验 =env_file:= ），这一层由 =ebasecamp-command--preflight= 自己按项目 root 检查 —— 见 [[file:troubleshooting.org][故障排查]] 第 14 条。
 
 * 读取项目 compose：唯一合法命令
 
@@ -209,11 +228,24 @@ compose 的 =env_file= 合法形态是「字符串 / 字符串列表 / ={path, r
 
 ** 输出结构
 
-段顺序固定：=name:= → =services:= → =networks:= （=:shared-network= 非 nil 或有自定义网络时）→ =volumes:= （有命名卷时）。段落之间单换行，文本以单个换行结尾；服务为空时输出 =services: {}= 。
+段顺序固定：=name:= → =services:= → =networks:= （=:shared-network= 非 nil 或有自定义网络时）→ =volumes:= （有命名卷时）→ =configs:= （项目有 =:file-configs= 时）→ =secrets:= （项目有 =:file-secrets= 时）。段落之间单换行，文本以单个换行结尾；服务为空时输出 =services: {}= 。后两段的来源与边界见下节「顶层 =configs= / =secrets=」。
 
 单个服务体的字段顺序固定：=image= → =entrypoint= / =command= → =working_dir= / =user= / =restart= → =environment= → =labels= → =ports= → =volumes= → =networks= → =depends_on= → =healthcheck= → =:extra= 展开。2 空格缩进、block style。
 
 =ports= / =volumes= 是 *合并后的单一序列* ：显式字段的简单项在前（=:ports= 的 ="8080:80"= 字符串、=:volumes= 的 ="src:tgt[:ro]"= 字符串），=:extra= 同名桶的复杂对象项（alist）在后。两者都不为空时仍只渲染 *一个* =ports:= / =volumes:= 键。
+
+** 顶层 =configs= / =secrets=
+
+来源是项目的两个槽：=:file-configs= / =:file-secrets= （值必须是「键全为字符串的 alist」，可多层嵌套；模型层按与渲染层 =--mapping-p= 一致的判据校验，因此不会出现「加载通过、渲染成垃圾 YAML」）。渲染由 =ebasecamp-compose--file-declarations-section= 用 =--yaml-map= 输出：键缩进 2、嵌套层 4；${VAR}= 与相对路径原样输出，不插值。
+
+是否输出由本次渲染的引用决定：refs *全为 shared* 时省略 —— 因此 =ebc-shared= 生成物 *不含* 顶层段；其余情况输出。于是 =ebasecamp-export--deployment-project= 的副本（只留 per-project refs）自然带上顶层段，导出侧无需改动。
+
+两条已知边界：
+
+- =content:= 多行字符串 *不可表达* ：渲染层只有单行标量写法，双引号标量折行会静默改内容且 =config -q= 仍 exit 0。第一版只保证 =file:= / =external= / =name:= 形态往返。
+- =shared= 生成物不含顶层段（同上）：shared 组的服务若引用顶层 config / secret，需部署环境自行提供。
+
+导入侧对应地把 compose 顶层 =configs= / =secrets= 填进这两个槽（其余未知顶层键只给 warning 后忽略），落盘与读取口径见 [[file:architecture.org][架构]] 的「compose 顶层 =configs= / =secrets=（模型与渲染）」一节。
 
 ** 混合项合并为单一键（D6 修复）
 
@@ -287,7 +319,7 @@ compose 的 =env_file= 合法形态是「字符串 / 字符串列表 / ={path, r
 
 - *compose 项目名* ：本次渲染的组 *全部* 为 shared → =ebc-shared= ；否则 =ebc-<project>= 。项目名与所有组名都要过 =[a-z0-9_-]+= 校验，不合法直接 signal。
 - *命名卷* ：=:type volume= 渲染为 =ebasecamp-<scope>-<group>-<source>= （scope 取 =shared= / =per-project= ），挂载形如 =ebasecamp-per-project-app-api-cache:/cache= ，并在 *顶层 =volumes:=* 段以空映射声明（去重）。加引号是因为含 =:= 。
-- *bind 卷* ：渲染为 ="<source>:<target>"= ，不做路径绝对化（保持清单里的相对形式，相对当前 compose 文件所在目录解析）；=:read-only= 非 nil 时追加 =:ro= 。
+- *bind 卷* ：渲染为 ="<source>:<target>"= ，不做路径绝对化（保持清单里的相对形式）；解析基准由派发时的 =--project-directory <项目 root>= 决定（见上文「生成物的路径基准」），不带 flag 时才退回 compose 文件所在目录；=:read-only= 非 nil 时追加 =:ro= 。
 - *容器名* ：插件 *不设* =container_name= ，由 compose 按 =<compose 项目名>-<service>-1= 推导，避免跨项目重名。
 
 ** 标签与网络

@@ -1,0 +1,170 @@
+#+title: ADR-0007 旧 :groups 接管与 compose 路径基准
+#+date: 2026-10-24
+#+status: 已接受（Accepted）
+
+* 背景
+
+v0.5.1 交付了「写盘跨文件定位 + compose 顶层 =configs= / =secrets= + 启动前预校验」。真机闭环时暴露两处 *阻断级* 缺陷：一处让「在界面里新建配置」在现网示例清单上必然失败，一处让「预校验通过」的生成物在启动阶段崩掉。探针脚本在 =/tmp/ebc-v052-5/=，完整探针表见 =openspec/active/2026-10-24-legacy-groups-and-project-directory.md= 的「探针记录」节。
+
+** 根因一：旧 =:groups= 与组侧 =:configs= 是 *同一条关联* 的两种写法
+
+ADR-0002 把「组与项目」的关联从项目侧（=projects/*.el= 的 =:groups=）搬到组侧（=groups.el= 的 =:configs=），但 *没有、也不应该* 清理用户清单里既有的旧写法：加载层为兼容 v0.1 仍然读 =:groups=，组侧 =:configs= 又在加载末尾物化一份引用。于是「同一项目同一组」天然会同时被两个来源指向：
+
+- 旧 =:groups= 的 =(redis)= 元素 —— v0.1 写法，没有配置名，没有 =:service-overrides=；
+- 组侧 =:configs= 的 =(cache :project example)= —— 新写法，物化成 =(:group redis :scope per-project :service-overrides …)=。
+
+v0.5.1 及之前的不变量 9 原文是「同一项目对同一组重复引用 *一律加载报错* =ebasecamp-config-duplicate-group-ref=，不做静默合并」，实现为 E2 判据「同项目同组已有引用（不论来源）即记 =:duplicate-group="。只要清单里存在未清理的旧写法，「在界面里给这个组新增配置」就必然撞上这份旧写法 —— 这不是用户写错了，是同一条关联被写了两遍。
+
+现网示例清单正是这个形态（探针 P1）：=groups.el= 的 =mysql=（shared）与 =redis=（per-project）都 *没有* =:configs=，=projects/example.el= 用旧写法 =:groups ((mysql) (redis))=。实测错误原文：
+
+#+begin_example
+写入 …/groups.el 后清单新增 1 个错误，已回滚：项目 example 重复引用组 redis（来源：旧 :groups）
+#+end_example
+
+即：用户唯一能做的「新建配置」操作被自己的兼容写法挡死，事务回滚，界面无任何可操作出口。
+
+** 根因二：生成物写在 cache 目录，相对路径的解析基准却在生成物目录
+
+两条既有不变量在这一点上互相抵触，谁都没错：
+
+- 不变量 6：清单只保存 =${VAR}= 引用与 *相对路径*，渲染层原样输出（v0.5.1 明确「=ebasecamp-compose.el= 一行不改」）；
+- 不变量 4：生成物固定位于 =~/.cache/ebasecamp/<project>/compose.yaml=。
+
+而 docker compose 解析相对路径的默认基准是 *compose 文件所在目录*。于是用户清单里的 =configs.app_cfg.file: ./conf/app.conf= 被解析成 =<cache>/<project>/conf/app.conf=（探针 T3 实测 =/tmp/ebc-b/cache/conf/app.conf=），必然不存在 —— 但 =docker compose config -q= 仍 exit 0（T2 实测：=config= *不校验* 顶层 config / secret 的 =file:= 是否存在），错误要到容器创建阶段才以 =bind source path does not exist= 暴露（补证 1）。这是一条「校验通过、启动炸」的静默通路。
+
+* 决策
+
+** 1. 旧 =:groups= 与组侧 =:configs= 指向同一项目同一组时，由组侧配置 *原位接管*（A-I）
+
+加载期去重落在 =ebasecamp-model-link-configs=（=lisp/ebasecamp-model.el=），改为 *双簿记*：两个 hash 的键都是 =(项目名 . 组名)=，但语义严格分工。
+
+- =sources=：只登记「当前有效引用的来源」，取值三种形态 —— 旧 =:groups= 为 =\"旧 :groups\"=、物化成功为 =(format \"配置 %s\" config-name)=、兜底串 =\"另一份配置\"=。*它的值只用于拼错误消息，任何行为分支都不得比较它*。
+- =legacy=：只登记「该引用当前由旧 =:groups= 提供、可被组侧配置接管」这一个布尔事实（值 =t=）。步骤 1 遍历项目基线时对每条旧引用置位。
+
+E2 命中「同项目同组已有引用」时的分叉：
+
+- =legacy= *有* 标记 → 不记错误，落入物化分支，用 =ebasecamp-model--replace-group-reference= 把该引用 *原位替换* 成物化结果（=:group= / =:scope= / =:service-overrides= 取组侧配置），随后立刻 =(remhash (cons project group) legacy)= 并把 =sources= 更新为 =(format \"配置 %s\" config-name)=；
+- =legacy= *无* 标记 → 保持原判定，记 =:duplicate-group=，消息仍为 =来源：%s=，取 =sources= 的值（=or= 兜底 =\"另一份配置\"=）。
+
+*为什么不报错*：两条写法指向的是 *同一条* 关联（同项目 + 同组），容器标签里没有配置维度、只有 =ebasecamp.project= / =group= / =service= 三个名字（技术债 #25），因此「接管的到底是哪份配置」对容器不产生任何差异 —— 报错只会把用户的兼容写法变成操作阻断。原不变量 9「一律报错」的真实意图是防止 *两份配置抢同一个组*（那才会让「哪份生效」不可判定），而不是禁止两种写法指向同一关联。
+
+*只有两份以上配置才报错*：接管成功即 =remhash= 清掉 =legacy= 标记，因此第二份指向同项目同组的配置到达时已无标记可接管，走 =:duplicate-group= 且消息点名 *第一份* 配置（=sources= 已被更新为它的名字）。这条 =remhash= 是本决策唯一容易写错的地方：漏掉它，第二份配置会再次接管并 *静默丢掉第一份*（=ebasecamp-model-test-taken-over-then-second-config-conflicts= 专门守护）。
+
+*顺序语义与幂等*：替换是 =setcar= 级的原位替换，旧引用在项目的 =groups= 槽里位置不变（用例断言 =((db) (redis))= 接管后仍在第 1、2 位）；=sources= / =legacy= 每次调用在函数内新建，函数每次从基线重算，不累积。
+
+*不变量 9 修订（=AGENTS.md=，批次 1.2 已落地）*：原文
+
+#+begin_quote
+组与项目的关联只在组侧声明（=:configs= 的 =:project=）；项目文件不再写 =:groups= 关联（旧写法保留兼容，但同一项目对同一组重复引用一律加载报错 =ebasecamp-config-duplicate-group-ref=，不做静默合并）。
+#+end_quote
+
+修订后
+
+#+begin_quote
+组与项目的关联只在组侧声明（=:configs= 的 =:project=）；项目文件不再写 =:groups= 关联。旧写法保留兼容：当旧 =:groups= 与组侧 =:configs= 指向 *同一项目同一组* 时，以 *组侧配置* 为准原位接管（不报错，=:service-overrides= 取配置的值）；只有 *两份以上组侧配置* 指向同一项目同一组时才报 =ebasecamp-config-duplicate-group-ref=（容器标签无配置维度，服务名会撞），不做静默合并。
+#+end_quote
+
+依据就是本节两条：①同一关联的双写不构成歧义（容器标签无配置维度），报错等于阻断兼容路径；②「两份以上配置」才是真正的歧义源。修订只改这一条，其余不变量不动 —— 若代码先落地而文档不改，会出现「文档说报错、实现说不报错」的反向口径。
+
+*A-II（配套）：旧写法的清理只在用户确认后发生*
+
+接管解决了「报错」，但没解决「旧写法一直留着」—— 它会让每次新建配置都走兼容路径，用户永远看不出该组已经是组侧声明的。写盘层因此新增可选的迁移能力，*默认关闭*：
+
+- =ebasecamp-config-write--legacy-reference-file (PROJECT-NAME GROUP-NAME)=：只扫 =ebasecamp-config--project-files=（字典序），返回 =(FILE . (:start :end :form-start :form-end :sole))= —— 该 =:groups= *元素* 的 1-based 区间、所在 project form 区间、是否为唯一元素；无命中 =nil=。*刻意不复用* =ebasecamp-manifest--locate-form=（单命中语义）与 =--legacy-group-references=（只返回项目名、无位置）。
+- =ebasecamp-config-write--migrate-legacy (PROJECT-NAME GROUP-NAME)=：删掉项目文件里该组的旧引用（一次事务）；该组是 =:groups= 里唯一元素时删 *整个键*（用 =plist-remprop= 级处理，不置 nil —— =--project-form= 用 =plist-member= 判定，留 nil 会渲染出 =:groups nil=）。
+- 写盘入口加 *默认 nil* 的第 4 个可选参数：=ebasecamp-config-write-add-config= / =-update-config-project= 的 =MIGRATE-LEGACY=。默认 nil 时连 =--legacy-reference-file= 都不跑，程序化调用零行为变更。
+- 两条编排路径 *必须分开实现*：① 同文件（组定义与项目定义在同一个 =projects/x.el=）→ =--add-config-within-file-editor= 在 *一次事务* 内两处降序替换（组侧追加 + 项目侧删元素，复用 =--replace-forms= 模式），不存在「组已加、旧引用没删」的中间态；② 跨文件（组在 =groups.el=、项目在 =projects/*.el=，最常见）→ =--migrate-across-files= 两次事务 + 备份补偿。
+- =--edit-manifest= 扩展为 =(FILE EDITOR &optional KEEP-BACKUP)=：非 nil 时把 =:keep-backup= 透传给 =ebasecamp-manifest--write-transaction=，返回 =(plist :result LOAD-RESULT :backup BACKUP-PATH)=，跨文件编排因此拿得到第一段的事务前备份；默认 nil 时返回值形态与历史一致（既有调用点零改动）。这是 A-II 能在不引入新原子性假设的前提下做补偿的前提。
+- *触发点唯一*：=ebasecamp-ui--confirm-legacy-migration (GROUP PROJECT ACTION)= 在 =--manifest-menu= 的「新建配置」与 =E=（=--open-config-editor=）里先跑只读的 =--legacy-reference-p=，命中才 =y-or-n-p= 问「项目 example 的旧写法 :groups 仍引用组 redis；新建配置后该旧引用将被组侧配置接管。是否同时删掉这条旧引用？」——答 yes 才把 =t= 传进写盘层，答 no 仍走 A-I 兼容路径（下次再问）。
+
+*跨文件迁移仍是「两次事务 + 显式备份补偿，非单事务原子」*：先写组文件（=:keep-backup t=）→ 再删项目侧旧引用；第二段失败（含它自己的「写后新增错误」回滚）时用第一段备份恢复组文件原文并 =signal= 原错误，两段都成功才删备份。这与 ADR-0006 对 ADR-0005 决策 2 的口径完全一致：跨文件写盘没有跨文件原子性可用，只能显式补偿，不许假装原子。
+
+** 2. compose 的路径基准统一用 =--project-directory <项目 root>=（B-I）
+
+派发与预校验 *必须同基准*，否则会重现「校验通过、启动炸」。探针实测（2026-10-24，全部在 =/tmp= 内）：
+
+| 项 | 命令 | 实测 |
+|---|---|---|
+| T2 | =-f <cache>/compose.yaml config -q= | *exit 0* —— =config -q= *不校验* 顶层 config / secret 的 =file:= 是否存在 |
+| T3 | =-f <cache>/compose.yaml config --format json= | =configs.my_cfg.file = /tmp/ebc-b/cache/conf/app.conf= —— 基准 = *compose 文件所在目录* |
+| T4 | 同上 + =--project-directory <proj>= | =configs.my_cfg.file = /tmp/ebc-b/proj/conf/app.conf= —— 基准被改写为项目 root |
+| T7a / T7b | =up --dry-run=（有 / 无该 flag） | 两者都 exit 0、输出相同 —— *dry-run 测不出基准* |
+| 补证 1 | =compose create=（未启动）缺失源 | *exit 1*：=bind source path does not exist: /tmp/ebc-b/cache/conf/app.conf= |
+| 补证 2 | 同上 + =--project-directory <proj>= | exit 0（源存在即可） |
+| 补证 3 | =env_file: ./app.env= 缺失 | =config -q= *exit 1* —— =config= 会校验 =env_file=，却不校验 configs / secrets |
+| 补证 4 | secret 变体 | 规则与 configs 完全一致 |
+| 补证 5 | 相对 volume source / =.env= | =--project-directory= 一并生效；*加上该 flag 后 docker 会读取 `<root>/.env`* |
+| 补证 6 | flag 位置 | =--project-directory= 是 *根级* flag，必须在子命令 *之前*（=compose -f FILE --project-directory DIR <子命令>=）；=-p= 显式传入，项目名不漂移 |
+
+实现（三处，同一份 root 推导）：
+
+- =ebasecamp-command-compose-args (ACTION FILE PROJECT-NAME SERVICES &optional ROOT)=：=ROOT= 非 nil 时在 =-f FILE= 之后、=-p NAME= 之前插入 =--project-directory= + =(expand-file-name ROOT)=，即 =compose -f FILE --project-directory DIR -p NAME <子命令>=；=ROOT= 为 nil 时 *不注入任何占位*，返回序列与历史逐字节一致（既有测试零改动）。
+- =ebasecamp-command--preflight= 在逐分支循环之前 =let= 一次 =(root (ebasecamp-project-root object))= 并把它传给 =ebasecamp-docker-check-compose=；=--dispatch= 的 =launch= 用同一个 =(ebasecamp-project-root object)= 构造派发参数。
+- =ebasecamp-docker-check-compose (FILE &optional ROOT)=：同样在 =-f FILE= 与 =config= 之间注入该 flag。
+- 生成物 =ebc-shared= 取 *触发本次操作的项目* 的 root：preflight 与 dispatch 都读同一个 =object=（=ebasecamp-command-run= 里 =(ebasecamp-command--project project)= 得到的那个），*不* 从 shared 配置的 =:project= 反推 —— 那个 =:project= 只是渲染上下文与容器标签归属（不变量 10），可能根本不是触发者。真实闭环实测：shared 分支派发参数带的是触发项目 =example= 的 root（=… "/cache/_shared/compose.yaml" "--project-directory" "/tmp/ebc-v052-5/project" "-p" "ebc-shared" …=）。
+- =:root= 为 nil（模型允许，=model.el= 只在非 nil 时校验类型）→ *不传 flag*，退回「以生成物所在目录为基准」的历史行为，由决策 3 给 warning 而不是硬失败。这保证了「root 缺失不会让原本能跑的项目突然跑不了」。
+
+*`.env` 额外读取是行为变更，必须记录*：加上 =--project-directory= 之后，docker 会额外读取 =<root>/.env= 参与变量插值（补证 5）。对清单语义没有影响（插件不读、不打印、不落盘密钥值，不变量 6），但生成物的最终解析结果可能因此与以前不同（用户在项目 root 下放了 =.env= 时）。这是 *docker 的既定行为*，不是插件 bug，已同步到 =AGENTS.md= 的「已知特性」表。
+
+导入层 =ebasecamp-import.el= 的 =docker compose config= 调用 *不加* 该 flag：=--config-json= 与 =ebasecamp-import-parse= 读的是 *用户项目自身* 的 compose 文件，其所在目录就是项目 root，基准本就正确；加 =--project-directory= 反而会引入「导入时按另一个目录解析」的第二套基准，且导入路径上根本没有「项目 root」概念（项目定义正在被创建）。同理 =ebasecamp-export.el= 的校验不传 root（导出目标由用户选，见「已知边界」）。
+
+** 3. 预校验新增顶层 =configs= / =secrets= 的 =file:= 存在性检查（B-II）
+
+依据是同一条探针的反面结论：=config -q= 只校验 =env_file=（补证 3），*不校验* 顶层 config / secret 的 =file:=（T2），=up --dry-run= 也测不出（T7a / T7b），唯一的真实反馈是容器创建阶段的 =bind source path does not exist=（补证 1）。所以这一层只能由 Elisp 侧补。
+
+实现（全在 =ebasecamp-command.el=，位置在逐分支写盘与 =check-compose= *之前*）：
+
+- =ebasecamp-command--file-declarations (OBJECT)=：遍历项目的 =:file-configs= / =:file-secrets=，取每条 =(cdr (assoc \"file\" (cdr entry)))=，非字符串（=external: true= / 只有 =name:=）跳过；只取 *本项目* —— shared 生成物本就不输出顶层段（技术债 #32），无从检查。
+- =ebasecamp-command--missing-file-declarations (OBJECT ROOT)=：绝对路径直接 =file-exists-p=；相对路径 + =ROOT= 非 nil → =(expand-file-name file ROOT)= 后判断；相对路径 + =ROOT= 为 nil → *不判缺失*，只产出一条 warning「项目 X 无 :root，无法校验顶层 config `app_cfg' 的 file `./conf/app.conf'」。
+- 缺失 → 立即返与 =check-compose= 失败 *同构* 的失败载荷（=:failed t= + =:exit= nil + =:stderr= 可读消息「顶层 config `app_cfg' 的 file `./conf/app.conf' 不存在（基准：<绝对路径>）」），循环一次都不进 ⇒ 一个生成物都不写、一个 docker 进程都不派发。UI 零改动。
+- 失败分支必须落在 *per-project 分支* 上（=--project-branch-index=）：顶层段是项目级声明，自动补齐 shared 时分支顺序是 =(shared project)=，硬用 index 0 会把错误归到 shared 批次。
+- warning 集合命名 =:preflight-warnings=，*刻意不复用* =check-compose= 的 =:warnings=（后者是 compose stderr 的 =level=warning= 行，语义不同）。透传链路：=--preflight= 返回值 → =ebasecamp-command-run= 成功分支作为第 8 实参传给 =--dispatch= → =report()= 写进 on-complete plist → =ebasecamp-ui--report-result= 成功分支在 detail 末尾追加「（N 条预校验警告）」。*警告不改变* =:ok= / =:failed= / =:exit=。
+
+- *明确不检查*：相对 =volumes= source 的存在性（补证 5 证明它同样只在容器创建阶段失败）。理由是同一条检查会变成「渲染层要解释 bind/volume 语义」的入口 —— 命名卷的 source 根本不是路径，判定要不要展开、按谁展开都需要第二套规则。v0.5.2 只覆盖 config / secret 的 =file:= 键 —— 它有明确语义（一个必须存在的路径），其余记技术债 #36。
+
+* 后果
+
+** 正面
+
+- *兼容写法不再阻断操作*：同一项目同一组的「旧 =:groups= + 1 份组侧配置」自动接管、零错误、位置不变；示例清单上「新建配置」从「必然回滚」变成「成功 + 可选的旧引用清理」。
+- *真正的冲突仍然报错且信息更准*：两份以上组侧配置指向同项目同组时点名 *第一份* 配置（=sources= 的语义被接管流程维护干净），用户能判断该删哪一份。
+- *旧写法有了退出路径*：=X= / =E= 命中旧引用时问一句，答 yes 就在写盘里一并清掉（=:groups= 只剩它时整个键消失，不留 =:groups nil=）；答 no 不阻断，下次再问。
+- *「校验通过、启动炸」的静默通路被堵住*：路径基准与预校验同源（同一个 =(ebasecamp-project-root OBJECT)=），缺失的顶层 =file:= 在 *写盘与派发之前* 就被拦下并给出可读消息与判定基准。
+- *零派发的失败语义保持*：预校验失败时一个生成物都不写、一个 docker 进程都不起（实测 =run-async= / =run-sync= / =check-compose= 三计数全 0，连 =network inspect= 都没执行）。
+
+** 负面
+
+- *加载层多了一次接管分支*：=legacy= 与 =sources= 的双簿记必须同步维护（替换后立刻 =remhash= + 更新 =sources=），写错一处就会退化成「静默丢掉第一份配置」。
+- *接管是「隐式修正」*：用户写的 =:groups= 元素在界面上会显示成配置形态（=:service-overrides= 取配置值），而磁盘上的旧写法仍在 —— 只有走 A-II 才会真正消失。文档与 ADR 必须说清这层「显示与磁盘不一致」。
+- *`.env` 行为变更*：=--project-directory= 让 docker 额外读取 =<root>/.env=，用户的插值结果可能与此前不同（AGENTS.md 已知特性表已登记）。
+- *预校验多一层 Elisp 判定*：文件存在性是插件自己的规则（不是 compose schema 的一部分），因此存在「插件说缺、docker 说不出话」的边界（例如 =file:= 指向符号链接、或路径在容器内挂载视图中另有一份）。
+- *跨文件迁移仍是两段式*：第二段失败靠恢复第一段备份回到原状；若恢复本身失败（磁盘满 / 权限变化），组文件可能停在「配置已加」状态 —— 备份路径会出现在错误信息里，需人工恢复。
+
+** 已知边界
+
+- *迁移只覆盖两个入口*：=add-config= 与 =update-config-project=。=move-config=（=M=）第一版不做迁移 —— 跨组移动不新增「同项目同组」关联，撞到旧写法由 A-I 兼容接管，因此不构成阻断。记技术债 #37。
+- *=--legacy-reference-file= 的多文件命中不裁决*：同一项目在多个 =projects/*.el= 里重名定义本身是加载错误（后加载文件整体回滚），写盘层只需要一个可删的位置，按 =ebasecamp-config--project-files= 的字典序返回第一个，不额外报错。
+- *导出场景的路径基准不受本 ADR 覆盖*：=ebasecamp-export--write= 调 =ebasecamp-docker-check-compose= 时 *不传 root*（导出目标由用户在 =completing-read= 里选，可能根本不在项目 root 下）。影响仅限于「生成物含相对 =env_file= 且导出到别处」时的校验基准误报（=config -q= 会校验 env_file）；顶层 config / secret 的 =file:= 不被 =config= 校验，故不受影响。记技术债 #35。
+- *`--project-directory` 不解决「清单里写绝对路径」*：绝对路径原样进生成物（不变量 6 只约束「不加绝对化」，不禁止用户手写），此时基准 flag 对它无效。
+- *=root= 为 nil 的项目仍然无基准*：不传 flag ⇒ 回到历史行为 + 一条 warning，不是修复。
+- *shared 生成物的顶层段与 =configs.secrets= 表达能力*：见技术债 #32 / #33，本 ADR 不涉及。
+
+* 备选方案与否决理由
+
+- *A. 写盘时无条件自动迁移旧 `:groups`*：否决。A-II 会 *改写用户手写的清单文件*（删掉一条他可能仍想保留的旧写法，例如他还在用老版本 Emacs 配置读同一份清单）。ADR-0005 起本项目对「写用户文件」的立场是「只在用户显式触发、且经事务内核可回滚」；把「顺便清理」做成默认行为，等于让 *任何一次新建配置* 都携带一个用户没要求的破坏性副作用 —— 而且跨文件时它是两段式非原子，失败还需人工恢复备份。因此改为 =y-or-n-p= 显式确认（默认 nil，程序化调用永不改写项目文件），并规定「答 no 仍走 A-I 兼容路径」——让「不迁移」是一个 *可用* 的选择，而不是被系统推着走。
+- *B. 渲染期把 `file:` 绝对化*：否决。相对路径原样保留是 *不变量 6* 的直接要求（清单只保存引用与相对路径，插件不落绝对路径），把 =./conf/app.conf= 渲染成 =<root>/conf/app.conf= 会让生成物依赖渲染时的宿主路径 —— 生成物从此不可搬运、不可 diff、不可在另一台机器上重建，而它本该是「随时可重建的派生产物」（不变量 4）。正解是让 *消费方*（docker）在解析时拿到基准，也就是根级 flag。
+- *C. 把生成物写到项目 root 下*：否决。生成物位置是 *不变量 4*（=~/.cache/ebasecamp/<project>/compose.yaml=）—— 写进用户项目目录等于让插件往用户仓库里丢文件，用户一 =git status= 就看到未跟踪的 =compose.yaml=，还会与用户自己的 compose 文件混淆（导入路径读的是项目自带的那个）。而且这只能解决「相对路径基准」，共享组（=ebc-shared=）根本没有对应项目 root 可写。
+- *D. 用 `--no-path-resolution` 当修法*：否决。实测（v0.5.1 X 段）该 flag 只影响 *输出归一化*（=config --format json= 输出里不把相对路径绝对化），不改变 docker 实际解析时的基准。把它当修法会得到「输出看起来对、启动还是炸」的假修复 —— 而 T3 / T4 已证明基准由 =--project-directory= 决定，与输出归一化无关。
+- *E. 在 `--move-config` 里也做迁移*：否决（本版范围外）。跨组移动不新增「同项目同组」关联，撞到旧写法时 A-I 兼容路径已经能正常加载，迁移纯属额外收益；而移动本身已经是「跨文件两段式」的第二层嵌套（源组移除 + 目标组追加 + 项目侧删引用），首版把三层写盘编排塞进一次用户确认里，失败面与回滚复杂度都不值得。记技术债 #37，后续版本在有用例的前提下再评估。
+
+* 状态
+
+*已接受*（2026-10-24，0.5.2）。
+
+三条 *扩展 / 修订注记*：
+
+- *扩展 ADR-0006*：ADR-0006 决策 3 把「启动前预校验」定义为「逐分支写盘 + =check-compose=」，其职责边界是 *compose 语法与引用完整性*。本 ADR 决策 3 把预校验的判据 *再向下扩一层* —— 到「顶层 config / secret 声明的 =file:= 在项目 root 下是否真的存在」。依据是 T2 / 补证 3 的实测：=config -q= 的校验范围不含这一层，靠它无法覆盖；而这一层的失败代价（容器创建阶段 =bind source path does not exist=，且此时网络已建、部分容器可能已启动）比语法错误更晚更贵。预校验的 *位置*（=ensure-network= 之前、零派发）与 *失败载荷形状*（=:failed t= + =:exit= + =:stderr=）沿用 ADR-0006，UI 无需改动。
+- *ADR-0003 决策 6 中「`e` → groups.el」的表述已过时*：ADR-0005 已把写入口扩展为界面表单（=S= / =E= / =M= / =X=），ADR-0006 已把「=e= 与所有写操作按组名跨文件定位」落地（=groups.el= 不再是固定写目标）。本 ADR 决策 1 的 A-II 又给「=E= / =X= 触发的写盘」加了一条 *用户确认后* 的跨文件迁移（组文件 + 项目文件两段）。因此凡涉及「=e= → =groups.el=」的历史表述，一律以 ADR-0005 / 0006 / 0007 为准，ADR-0003 决策 6 该句仅作 v0.4 历史记录保留。
+- *跨文件迁移仍是「两次事务 + 显式备份补偿，非单事务原子」*：沿用 ADR-0006 对 ADR-0005 决策 2 的口径 —— 不引入跨文件日志 / 两阶段提交，只用 =:keep-backup= 拿第一段的事务前备份做补偿。实现上是 =ebasecamp-config-write--migrate-across-files=（=GROUP-FILE EDITOR PROJECT GROUP=）：① 组文件 =(… editor t)= 拿备份 → ② =--migrate-legacy= 删项目侧旧引用 → ② 失败则 =--restore-backup= 恢复组文件原文并 =signal (car err) (cdr err)=，两段都成功才删备份。
+
+引用：ADR-0002（组内配置与加载期物化 —— 本 ADR 决策 1 处理其遗留的「旧写法未清理」形态，且不改变「关联只在组侧」的方向）、ADR-0004（项目 `:root` 与项目定位 —— 决策 2 把 =:root= 从「定位用」扩到「路径解析基准用」，同时保留 =:root= 可为 nil 的模型自由度）、ADR-0005（清单写盘 —— 决策 1 的 A-II 复用其局部写盘 + 事务内核；跨文件两段式对其决策 2 构成部分退化，已在 ADR-0006 记录并被本 ADR 再次沿用）、ADR-0006（预校验与跨文件定位 —— 本 ADR 扩展其决策 3 的校验范围，并沿用其跨文件补偿口径）、ADR-0001（分层与同步模型 —— 路径基准的修正落在 command / docker 两层，渲染层与 UI 层不参与，UI 仍不拼 docker 命令；导入读取用户 compose 的唯一合法方式不变）。相关技术债：[[file:../../openspec/tech-debt.md][#35]]（导出场景的路径基准）、[[file:../../openspec/tech-debt.md][#36]]（相对 volumes source 未检查）、[[file:../../openspec/tech-debt.md][#37]]（`--move-config` 不迁移）、[[file:../../openspec/tech-debt.md][#38]]（A-II 覆盖范围与用例缺口）、[[file:../../openspec/tech-debt.md][#39]]（`--legacy-reference-file` 多文件命中无专门用例）、[[file:../../openspec/tech-debt.md][#40]]（预校验警告的展示无单测）。实现记录与逐批次实测见 =openspec/active/2026-10-24-legacy-groups-and-project-directory.md=（批次 1–5）；机制说明见 =docs/architecture.org= 的「清单写盘」「加载期物化」「派发与预校验」节。
