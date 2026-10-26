@@ -1,7 +1,7 @@
 ;;; ebasecamp-compose.el --- ebasecamp compose 生成 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.5.3
+;; Version: 0.5.4
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -37,9 +37,10 @@
 ;; volumes / environment / extra 的列表结构与组内对象共享，因此本模块对这些
 ;; 字段一律只读，禁止 setcar / plist-put 就地修改（需要副本时自行复制 cons）。
 ;;
-;; YAML 输出约定：2 空格缩进、block style；标量按需加双引号并转义 `\\` 与
-;; `"'；image 属已知安全的镜像引用，按原样裸写；序列化器只覆盖清单可能出现的
-;; 类型（字符串/数字/布尔/列表/alist）。
+;; YAML 输出约定：2 空格缩进、block style；标量按需加双引号并转义 `\\` /
+;; `"' / `\n' / `\r'；多行标量走块标量（`|' / `|-' / `|+'）；image 属已知安全
+;; 的镜像引用，按原样裸写；序列化器只覆盖清单可能出现的类型（字符串/数字/
+;; 布尔/列表/alist）。
 ;;
 ;; 安全约定：environment 中的 ${VAR} 原样保留，不插值、不转义 `$'。
 
@@ -93,19 +94,30 @@ NAME 必须匹配 [a-z0-9_-]+，否则以 CONTEXT 报告 ebasecamp-compose-error
 
 (defun ebasecamp-compose--quote-required-p (string)
   "判断 STRING 作为 YAML 标量是否必须加双引号。
-含特殊字符、前后空格、空串，或形如数字/布尔（含 null、~）时需要加引号。"
+含特殊字符、换行或回车、前后空格、空串，或形如数字/布尔（含 null、~）时
+需要加引号。换行/回车必须加引号：含 `\\r' 的字符串不走块标量分支
+（`ebasecamp-compose--block-scalar-p' 返回 nil），不加引号会落到裸标量而损坏
+内容（D2 决策：保真转义，不把 CRLF 改写成 LF）。"
   (or (equal string "")
       (string-match-p "\\`[[:space:]]" string)
       (string-match-p "[[:space:]]\\'" string)
+      (string-match-p "[\n\r]" string)
       (ebasecamp-compose--has-special-character-p string)
       (string-match-p "\\`[-+]?[0-9]+\\(?:\\.[0-9]+\\)?\\'" string)
       (member (downcase string)
               '("true" "false" "yes" "no" "on" "off" "null" "~"))))
 
 (defun ebasecamp-compose--escape-string (string)
-  "转义 STRING 中的反斜线与双引号，供双引号标量使用。"
+  "转义 STRING 中的反斜线、双引号、换行与回车，供双引号标量使用。
+换行/回车必须转成字面 `\\n' / `\\r' 两字符 —— 直接拼反斜线会留下真实换行，
+YAML 解析时仍按 flow scalar 折叠（技术债 #33）。"
   (replace-regexp-in-string
-   "[\\\\\"]" (lambda (match) (concat "\\" match)) string t t))
+   "[\\\\\"\n\r]"
+   (lambda (match)
+     (cond ((equal match "\n") "\\n")
+           ((equal match "\r") "\\r")
+           (t (concat "\\" match))))
+   string t t))
 
 (defun ebasecamp-compose--yaml-string (string)
   "把 STRING 渲染为 YAML 标量，必要时加双引号。"
@@ -158,33 +170,81 @@ nil 输出 null，t 输出 true，数字原样，其余按字符串处理。"
   "把 ITEMS 渲染为 flow 序列，如 [\"sleep\",\"3600\"]。"
   (concat "[" (mapconcat #'ebasecamp-compose--yaml-flow-item items ",") "]"))
 
+(defun ebasecamp-compose--block-scalar-p (value)
+  "判断 VALUE 是否应渲染为块标量。
+含换行且不含回车的字符串才走块标量：含 `\\r' 时按双引号转义保真
+（D2 决策，不把 CRLF 改写成 LF）。"
+  (and (stringp value)
+       (string-match-p "\n" value)
+       (not (string-match-p "\r" value))))
+
+(defun ebasecamp-compose--yaml-block-scalar (string indent)
+  "把多行 STRING 渲染为块标量头 + 内容行，内容行缩进 INDENT 个空格。
+chomping 按末尾换行数选择：0 → `|-'、1 → `|'、≥2 → `|+'；空行输出空串
+（不加缩进，否则会留下尾随空格，往返时字节数变多）。
+调用方须先用 `ebasecamp-compose--block-scalar-p' 排除含回车（`\\r'）的字符串
+—— 本函数不做该判定（含回车时须走双引号转义保真，见 ADR-0009 决策 2 / D2）。"
+  (let* ((pad (make-string indent ?\s))
+         (n (if (string-match "\n+\\'" string)
+                (- (match-end 0) (match-beginning 0))
+              0))
+         (body (if (> n 0) (substring string 0 (- (length string) n)) string))
+         (padded (mapconcat (lambda (line)
+                              (if (string-empty-p line) "" (concat pad line)))
+                            (split-string body "\n")
+                            "\n"))
+         (header (cond ((= n 0) "|-") ((= n 1) "|") (t "|+"))))
+    (concat header "\n" padded (make-string n ?\n))))
+
+(defun ebasecamp-compose--yaml-join (items)
+  "把同层条目 ITEMS 拼成一段文本，条目之间按需补一个换行。
+与前一项以换行结尾时不补 —— 块标量（`|' / `|+'）的输出自带尾换行，无条件
+补分隔符会让 `|+'（keep）把多余空行计入内容（值末尾 ≥2 换行时多 1 个）。
+ITEMS 为空时返回空串。"
+  (let ((result ""))
+    (dolist (item items result)
+      (when (and (not (string-empty-p result))
+                 (not (string-suffix-p "\n" result)))
+        (setq result (concat result "\n")))
+      (setq result (concat result item)))))
+
 (defun ebasecamp-compose--yaml-value (value indent)
   "把 VALUE 渲染为 block 风格 YAML 文本，每行缩进 INDENT 个空格。
-映射逐键展开、列表渲染为 `- item'、其余按标量输出；嵌套值缩进 2 空格。"
+映射逐键展开、列表渲染为 `- item'、其余按标量输出；嵌套值缩进 2 空格。
+多行字符串（不含回车）渲染为块标量（`|' / `|-' / `|+'），头与键同行、
+内容行缩进 INDENT + 2。"
   (cond
    ((ebasecamp-compose--mapping-p value)
-    (mapconcat
-     (lambda (pair)
-       (let ((key (concat (make-string indent ?\s)
-                          (ebasecamp-compose--yaml-key (car pair))
-                          ":"))
-             (nested (cdr pair)))
-         (if (and (listp nested) nested)
-             (concat key "\n"
-                     (ebasecamp-compose--yaml-value nested (+ indent 2)))
-           (concat key " " (ebasecamp-compose--yaml-scalar nested)))))
-     value
-     "\n"))
+    (ebasecamp-compose--yaml-join
+     (mapcar
+      (lambda (pair)
+        (let ((key (concat (make-string indent ?\s)
+                           (ebasecamp-compose--yaml-key (car pair))
+                           ":"))
+              (nested (cdr pair)))
+          (cond
+           ((and (listp nested) nested)
+            (concat key "\n"
+                    (ebasecamp-compose--yaml-value nested (+ indent 2))))
+           ((ebasecamp-compose--block-scalar-p nested)
+            (concat key " "
+                    (ebasecamp-compose--yaml-block-scalar nested (+ indent 2))))
+           (t (concat key " " (ebasecamp-compose--yaml-scalar nested))))))
+      value)))
    ((and (listp value) value)
-    (mapconcat
-     (lambda (item)
-       (let ((pad (make-string indent ?\s)))
-         (if (and (listp item) item)
-             (concat pad "-\n"
-                     (ebasecamp-compose--yaml-value item (+ indent 2)))
-           (concat pad "- " (ebasecamp-compose--yaml-scalar item)))))
-     value
-     "\n"))
+    (ebasecamp-compose--yaml-join
+     (mapcar
+      (lambda (item)
+        (let ((pad (make-string indent ?\s)))
+          (cond
+           ((and (listp item) item)
+            (concat pad "-\n"
+                    (ebasecamp-compose--yaml-value item (+ indent 2))))
+           ((ebasecamp-compose--block-scalar-p item)
+            (concat pad "- "
+                    (ebasecamp-compose--yaml-block-scalar item (+ indent 2))))
+           (t (concat pad "- " (ebasecamp-compose--yaml-scalar item))))))
+      value)))
    (t (concat (make-string indent ?\s)
               (ebasecamp-compose--yaml-scalar value)))))
 

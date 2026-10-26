@@ -619,4 +619,154 @@ mysql 属 shared 组而 api、migrate 属 per-project 组，两批落在不同 c
         (should (= 1 (ebasecamp-compose-test--line-count "configs:" per-project)))
         (should (= 1 (ebasecamp-compose-test--line-count "secrets:" per-project)))))))
 
+;;; 17. 块标量与转义保真（v0.5.4 / tech-debt #33）
+
+(ert-deftest ebasecamp-compose-test-block-scalar-pipe-keeps-single-newline ()
+  "末尾恰 1 个换行的多行字符串渲染为 `|'（clip）块标量。
+块标量头与键同行，内容行缩进 = 键缩进 + 2，末尾保留 1 个换行。"
+  (let* ((rendered (ebasecamp-compose--yaml-value '(("content" . "a\nb\n")) 4))
+         (tail (if (string-match "\n+\\'" rendered)
+                   (- (match-end 0) (match-beginning 0))
+                 0)))
+    (should (equal rendered "    content: |\n      a\n      b\n"))
+    (should (= 1 tail))))
+
+(ert-deftest ebasecamp-compose-test-block-scalar-strip-drops-trailing-newline ()
+  "末尾无换行的多行字符串渲染为 `|-'（strip）块标量，末尾 0 个换行。"
+  (let* ((rendered (ebasecamp-compose--yaml-value '(("content" . "a\nb")) 4))
+         (tail (if (string-match "\n+\\'" rendered)
+                   (- (match-end 0) (match-beginning 0))
+                 0)))
+    (should (equal rendered "    content: |-\n      a\n      b"))
+    (should (= 0 tail))))
+
+(ert-deftest ebasecamp-compose-test-block-scalar-keep-preserves-trailing-newlines ()
+  "末尾 3 个换行的多行字符串渲染为 `|+'（keep），末尾换行数精确还原为 3。"
+  (let* ((rendered (ebasecamp-compose--yaml-value
+                    '(("content" . "a\nb\n\n\n")) 4))
+         (tail (if (string-match "\n+\\'" rendered)
+                   (- (match-end 0) (match-beginning 0))
+                 0)))
+    (should (equal rendered "    content: |+\n      a\n      b\n\n\n"))
+    (should (= 3 tail))))
+
+(ert-deftest ebasecamp-compose-test-block-scalar-blank-line-and-leading-spaces ()
+  "块标量保留空行（无缩进）与内容行原有的行首空格。
+空行加缩进会留下尾随空格，往返时字节数变多（技术债 #33 的伴生约束）。"
+  (let ((rendered (ebasecamp-compose--yaml-value
+                   '(("content" . "a\n\n  b\n")) 4)))
+    (should (equal rendered "    content: |\n      a\n\n        b\n"))
+    ;; 逐行核对：空行必须是空串（不带缩进），`  b' 行保留原有前导 2 空格
+    (should (equal (split-string rendered "\n")
+                   '("    content: |" "      a" "" "        b" "")))))
+
+(ert-deftest ebasecamp-compose-test-single-line-scalars-unchanged ()
+  "单行字符串不进块标量分支（回归保护）。
+渲染结果与「裸标量 / 双引号」规则逐字节一致，且不含 `|'。"
+  (should (equal (ebasecamp-compose--yaml-value '(("k" . "plain")) 0)
+                 "k: plain"))
+  (should (equal (ebasecamp-compose--yaml-value '(("k" . "has space")) 0)
+                 "k: has space"))
+  (should (equal (ebasecamp-compose--yaml-value '(("k" . "a: b")) 0)
+                 "k: \"a: b\""))
+  (should-not (string-match-p "|" (ebasecamp-compose--yaml-value
+                                   '(("k" . "plain")) 0))))
+
+(ert-deftest ebasecamp-compose-test-escape-string-escapes-newline-and-carriage-return ()
+  "`--escape-string' 把换行/回车转成两字符 `\\n' / `\\r'。
+转义结果必须是反斜线 + 字母（不是反斜线 + 真实换行 —— 后者 YAML 仍折叠）；
+`--quote-required-p' 对含换行或回车的字符串返回非 nil。"
+  (should (equal (ebasecamp-compose--escape-string "a\nb") "a\\nb"))
+  (should (ebasecamp-compose--quote-required-p "a\nb"))
+  (should (equal (ebasecamp-compose--escape-string "a\rb") "a\\rb"))
+  (should (ebasecamp-compose--quote-required-p "a\rb"))
+  ;; 转义后不得残留真实换行/回车
+  (should-not (string-match-p "[\n\r]"
+                              (ebasecamp-compose--escape-string
+                               "a\nb\rc"))))
+
+(ert-deftest ebasecamp-compose-test-flow-sequence-escapes-multiline-item ()
+  "flow 序列里的多行字符串走双引号转义：输出含 `\\n'、不含字面换行。"
+  (let ((rendered (ebasecamp-compose--yaml-flow-sequence (list "a\nb"))))
+    (should (equal rendered "[\"a\\nb\"]"))
+    (should (string-match-p "\\\\n" rendered))
+    (should-not (string-match-p "\n" rendered))))
+
+(ert-deftest ebasecamp-compose-test-file-declarations-indent-multiline-content ()
+  "顶层 configs 段的多行 content 渲染为块标量。
+缩进按「键缩进 / 内容行缩进 = 键缩进 + 2」推导（不硬编码 4/6）。"
+  (ebasecamp-compose-test--clean
+    (ebasecamp-define-group web :services ((web :image "nginx:1.27")))
+    (ebasecamp-define-project site
+      :groups ((web))
+      :file-configs (("app_cfg" ("content" . "line1\nline2\n"))))
+    (let* ((project (ebasecamp-model-project 'site))
+           (section (ebasecamp-compose--file-declarations-section
+                     "configs" (ebasecamp-project-file-configs project)))
+           (lines (split-string section "\n")))
+      ;; configs: 0 / app_cfg: 2 / content: | 4 / 内容行 6
+      (should (equal (nth 0 lines) "configs:"))
+      (should (equal (nth 1 lines) "  app_cfg:"))
+      (should (equal (nth 2 lines) "    content: |"))
+      (should (equal (nth 3 lines) "      line1"))
+      (should (equal (nth 4 lines) "      line2")))))
+
+(ert-deftest ebasecamp-compose-test-block-scalar-value-is-single-newline ()
+  "值恰为一个换行（n=1）时头为 `|'，渲染文本精确为 `content: |' + 2 个换行。
+（该值经 `--file-declarations-section' 上下文时键缩进为 4。）"
+  (should (equal (ebasecamp-compose--yaml-value '(("content" . "\n")) 4)
+                 "    content: |\n\n")))
+
+(ert-deftest ebasecamp-compose-test-block-scalar-value-is-blank-lines ()
+  "值只含换行（n=2）时头为 `|+'，渲染文本精确为 `content: |+' + 3 个换行。"
+  (should (equal (ebasecamp-compose--yaml-value '(("content" . "\n\n")) 4)
+                 "    content: |+\n\n\n")))
+
+(ert-deftest ebasecamp-compose-test-block-scalar-keep-in-mapping-does-not-add-newline ()
+  "映射内块标量后接同层键时不得多出夹层空行（`|+' 场景）。
+块标量自身已带 n 个尾换行，拼接触点若再无条件补分隔符，`|+'（keep）会把
+多出的空行计入内容（值末尾 2 换行 → 回读 3 换行）。期望块标量末尾恰 2 个
+换行：`y' 后 1 个结束内容行、另 1 个空行，`name' 行紧接其后。"
+  (should (equal (ebasecamp-compose--yaml-value
+                  '(("content" . "x\ny\n\n") ("name" . "cfg")) 4)
+                 "    content: |+\n      x\n      y\n\n    name: cfg")))
+
+(ert-deftest ebasecamp-compose-test-block-scalar-pipe-in-mapping-no-extra-blank ()
+  "映射内 `|'（clip，n=1）块标量后接同层键时不得多出空行。
+`y' 后恰 1 个换行，紧接 `name' 行（不依赖 clip 吞掉多余空行的偶然行为）。"
+  (should (equal (ebasecamp-compose--yaml-value
+                  '(("content" . "x\ny\n") ("name" . "cfg")) 4)
+                 "    content: |\n      x\n      y\n    name: cfg")))
+
+;; 批次 3.3 补测（code-reviewer 建议 1 / 2 / 3）：以下 4 项为既有实现的覆盖补强，
+;; 写完即绿（非红绿循环）。
+
+(ert-deftest ebasecamp-compose-test-escape-string-escapes-literal-backslash ()
+  "带字面反斜线的字符串只转义一次（`a\\nb' 是 4 个字符，不是换行）。
+多轮 `replace-regexp-in-string' 会把第一轮插入的反斜线再转义一遍
+（得到 `a\\\\nb'），ADR-0009 把「多轮转义」列为最易错点，此处用精确文本守住。"
+  (let ((out (ebasecamp-compose--escape-string "a\\nb")))
+    (should (equal out "a\\\\nb"))
+    (should-not (string-match-p "\n" out))))
+
+(ert-deftest ebasecamp-compose-test-sequence-block-scalar ()
+  "序列分支的多行项渲染为 `- |'（`-' 与 `|' 之间一个空格），
+内容行缩进 INDENT + 2（此处 2 + 2 = 4）。"
+  (should (equal (ebasecamp-compose--yaml-sequence '("a\nb\n") 2)
+                 "  - |\n    a\n    b\n")))
+
+(ert-deftest ebasecamp-compose-test-block-scalar-leading-blank-line ()
+  "首行为空的多行值：块标量首行输出空行（不加缩进，加了会留尾随空格）。"
+  (should (equal (ebasecamp-compose--yaml-value '(("content" . "\na\n")) 4)
+                 "    content: |\n\n      a\n")))
+
+(ert-deftest ebasecamp-compose-test-multiline-crlf-uses-quoted-scalar ()
+  "含回车（CRLF）的多行值不走块标量，走双引号 + 转义保真（D2，不改写为 LF）。
+输出不含 `|'、不含真实回车与换行；`\\r' / `\\n' 均为字面两字符。"
+  (let ((out (ebasecamp-compose--yaml-value '(("content" . "a\r\nb")) 4)))
+    (should (equal out "    content: \"a\\r\\nb\""))
+    (should-not (string-match-p "|" out))
+    (should-not (string-match-p "\r" out))
+    (should-not (string-match-p "\n" out))))
+
 ;;; ebasecamp-compose-tests.el ends here

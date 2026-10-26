@@ -423,7 +423,7 @@ compose 允许服务引用顶层声明的 config / secret。v0.5.1 之前这条�
 - *落盘*：=ebasecamp-manifest-project-form= 只在非空时追加 =:file-configs= / =:file-secrets= （值经 =--literal= 原样 =prin1= ，=${VAR}= 与相对路径不插值）；无顶层段时输出与历史实现 *逐字节一致* 。=ebasecamp-config-write--project-output-keys= 同步加入这两个键并改为「非空才写」，因此 =-update-project= 改 title / root 时两个槽保值。
 - *渲染*：=ebasecamp-compose--file-declarations-section= 用 =--yaml-map= 输出顶层段（键一层缩进 2、嵌套层 4），段顺序 =name= → =services= → =networks= → =volumes= → =configs= → =secrets= （与 docker 惯例一致）。是否输出由 refs 是否 *全为 shared* 决定：全 shared 时省略，故 =ebc-shared= 生成物 *不含* 顶层段；其余情况输出，于是 =ebasecamp-export--deployment-project= 的副本（只留 per-project refs）自然带上顶层段，导出侧无需改动。
 
-两条已知边界：=content:= 多行字符串 *不可表达* （=--yaml-map= 只有单行标量写法，双引号标量折行会静默改内容且 =config -q= 仍 exit 0），第一版只保证 =file:= / =external= / =name= 形态往返；=shared= 生成物不含顶层段（shared 组服务引用顶层 config / secret 需自行处理）。
+已知边界：=content:= 多行字符串 *已支持* （v0.5.4 起多行值走 YAML 块标量，chomping 按末尾换行数取 =|-= / =|= / =|+= ；双引号标量转义换行与回车），=file:= / =external= / =name= 形态行为不变 —— 判定保真须用 =config --format json= 对比 =content= 字符串，=config -q= 只校验语法不校验内容；=shared= 生成物不含顶层段（shared 组服务引用顶层 config / secret 需自行处理）。
 
 ** 字段映射（表单文本 ↔ 结构）
 

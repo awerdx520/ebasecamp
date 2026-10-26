@@ -1,7 +1,7 @@
 ;;; ebasecamp-config-write.el --- ebasecamp 清单写操作（字段映射 / 实体操作） -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.5.3
+;; Version: 0.5.4
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 

@@ -242,7 +242,7 @@ compose 的 =env_file= 合法形态是「字符串 / 字符串列表 / ={path, r
 
 两条已知边界：
 
-- =content:= 多行字符串 *不可表达* ：渲染层只有单行标量写法，双引号标量折行会静默改内容且 =config -q= 仍 exit 0。第一版只保证 =file:= / =external= / =name:= 形态往返。
+- =content:= 多行字符串 *已支持* （v0.5.4 起走 YAML 块标量，chomping 按末尾换行数取 =|-= / =|= / =|+= ；双引号标量转义换行与回车），=file:= / =external= / =name:= 形态行为不变。判定保真须用 =config --format json= 对比 =content= 字符串 —— =config -q= 只校验语法不校验内容。
 - =shared= 生成物不含顶层段（同上）：shared 组的服务若引用顶层 config / secret，需部署环境自行提供。
 
 导入侧对应地把 compose 顶层 =configs= / =secrets= 填进这两个槽（其余未知顶层键只给 warning 后忽略），落盘与读取口径见 [[file:architecture.org][架构]] 的「compose 顶层 =configs= / =secrets=（模型与渲染）」一节。
@@ -309,7 +309,7 @@ compose 的 =env_file= 合法形态是「字符串 / 字符串列表 / ={path, r
 
 ** 标量引号规则
 
-需要双引号的条件（任一命中）：空串、前后有空白、含 YAML 特殊字符 =:#{}[],&*!|>'\"%@`= 、形如整数/小数、形如布尔或 =null= （=true= / =false= / =yes= / =no= / =on= / =off= / =null= / =~= ，按 =downcase= 比较）。加引号时转义 =\\= 与 =\"= 。
+需要双引号的条件（任一命中）：空串、前后有空白、含 YAML 特殊字符 =:#{}[],&*!|>'\"%@`= 、形如整数/小数、形如布尔或 =null= （=true= / =false= / =yes= / =no= / =on= / =off= / =null= / =~= ，按 =downcase= 比较）。加引号时转义 =\\= 与 =\"= ，并转义换行 =\\n= 与回车 =\\r= （均转成字面两字符，不留真实换行 —— 否则 YAML 仍按 flow scalar 折叠）；block 上下文的多行标量走块标量（=|-= / =|= / =|+= ，按末尾换行数 chomping），不走双引号。
 
 - =${VAR}= 含 ={= 、=}= 、=:= ，于是一律带引号， *不插值、不转义 =$=* ；
 - =image= 是唯一裸写的字段（镜像引用属已知安全值）；

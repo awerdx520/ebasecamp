@@ -1,7 +1,7 @@
 ;;; ebasecamp-status.el --- ebasecamp 容器状态归一、聚合与轮询 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.5.3
+;; Version: 0.5.4
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 

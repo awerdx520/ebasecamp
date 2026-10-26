@@ -235,7 +235,7 @@ compose 允许服务引用顶层声明的 config / secret（服务级 =configs: 
 四条边界：
 
 - *老清单需要重新导入一次*：v0.5.1 之前导入的清单 *没有* =:file-configs= / =:file-secrets= —— 服务级 =configs:= 引用还在（走 =:extra= 原样透传），顶层段却已丢失，此时启动会报 =service "xxx" refers to undefined config=。修法是对 *原 compose 重新导入一次*（=M-x ebasecamp-import-file= 或界面底栏 =导入 compose= ），顶层段就补齐了；插件不会自动改写你的清单。
-- *只支持 =file:= / =external= / =name= 形态*：顶层 config / secret 的值为「字符串键的 alist」+ 单行标量。用 =content:= 写 *多行字符串* 目前 *不可表达* —— 渲染器只有单行标量写法，这类内容导入后会丢，且 =config -q= 仍可能 exit 0（静默错误，见 [[file:openspec/tech-debt.md][技术债]]）。
+- *支持 =file:= / =external= / =name= 与 inline =content:= （含多行）*：顶层 config / secret 的值为「字符串键的 alist」。多行 =content:= 以 YAML 块标量保真往返（chomping 按末尾换行数取 =|-= / =|= / =|+= ），双引号标量转义换行与回车；=config -q= 只校验语法，判据须用 =config --format json= 对比内容（见 [[file:openspec/tech-debt.md][技术债]] #33，已关闭）。
 - *shared 生成物不含顶层段*：=ebc-shared= 只渲染 shared 组服务，不带顶层 =configs: / secrets:= ；shared 组服务若引用顶层 config / secret，需要自行处理。
 - *界面不编辑顶层段*：第一版只保证「导入 → 渲染往返不丢」，界面里没有编辑 =:file-configs= / =:file-secrets= 的入口，需要时手写清单（=e=）。
 
@@ -495,7 +495,7 @@ point 落在某个配置段内时额外生效。段指右栏里的一份配置�
 - 服务 *增删与改名* 仍不支持：增删会让既有容器变孤儿，改名要迁移容器标签与命名，需先有配置维度（见 =openspec/tech-debt.md= #16 / #25 / 新增条目）。服务字段编辑、配置 / 项目 / 组的增删改已支持。
 - 端口冲突只在 =启动选中= 前检测；=unknown= 类探测失败只提示、不阻塞。
 - 组名与项目名只允许 =[a-z0-9_-]+=，其余字符在渲染时直接报错。
-- 顶层 =configs= / =secrets= 的 =content:= 多行字符串不可表达：只支持 =file:= / =external= / =name= 这类单行标量结构，带 =content:= 的顶层段导入后会丢且 =config -q= 仍可能 exit 0（静默错误）。
+- 顶层 =configs= / =secrets= 的 inline =content:= （含多行字符串）已支持：多行值以 YAML 块标量保真往返（chomping 按末尾换行数取 =|-= / =|= / =|+= ），=file:= / =external= / =name= 形态行为不变。判据须用 =config --format json= 对比 =content= 字符串，因为 =config -q= 只校验语法不校验内容。
 - shared 生成物（=ebc-shared=）不输出顶层 =configs= / =secrets= ：shared 组服务引用顶层 config / secret 时需自行处理。
 - v0.5.1 之前导入的清单缺 =:file-configs= / =:file-secrets= ：引用顶层 config 的服务启动会报 =refers to undefined config= ，需对原 compose *重新导入一次* 补齐（插件不自动改清单）。
 - 同一组名在多处定义是加载层硬错误：后加载的文件会 *整体回滚* ，其中项目不会出现在界面中；界面写操作遇到同名组直接拒绝。
@@ -543,6 +543,6 @@ make check EMACS=/path/to/emacs STRAIGHT_BUILD=/path/to/build-XX.X
 - [[file:docs/user-guide.org][用户指南]]：安装、清单写法、界面操作、常见任务、清单自检。
 - [[file:docs/compose-generation.org][compose 生成与导入导出规则]]：清单到 compose 的映射、导入映射表、导出物差异。
 - [[file:docs/troubleshooting.org][排障手册]]：命令不存在 / 界面空白 / 加载报错 / =config -q= 失败 / 导入导出异常 / 端口冲突 / 状态不刷新。
-- =docs/adr/0001-architecture.org= ~ =0007-legacy-groups-and-project-directory.org=：架构决策（ADR；0005 为清单写盘，扩展 0003 决策 6；0006 为跨文件定位与 compose 顶层 configs/secrets，扩展 0005 决策 1；0007 为旧 =:groups= 接管与迁移 + compose 路径基准，修订不变量 9）。
-- =openspec/completed/=：已归档计划（v0.2 / v0.3 / v0.4 与 M1–M3 四份）；=openspec/active/=：进行中计划（v0.5 清单写操作）；=openspec/decisions.md=：决策日志；=openspec/tech-debt.md=：技术债。
+- =docs/adr/0001-architecture.org= ~ =0009-yaml-block-scalar.org=：架构决策（ADR；0005 为清单写盘，扩展 0003 决策 6；0006 为跨文件定位与 compose 顶层 =configs= / =secrets=，扩展 0005 决策 1；0007 为旧 =:groups= 接管与迁移 + compose 路径基准，修订不变量 9；0008 为项目 =:root= 可选，新增不变量 16；0009 为多行字符串的 YAML 块标量渲染，补齐 0006 决策 3 的 =content:= 多行形态）。
+- =openspec/active/= ：进行中计划；=openspec/completed/= ：已归档计划（历代计划，含 M1–M3 与各版本）；=openspec/decisions.md= ：决策日志；=openspec/tech-debt.md= ：技术债（含已关闭条目的处置记录）。
 - =AGENTS.md=：仓库地图与不变量清单。

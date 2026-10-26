@@ -2,6 +2,21 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/) 与 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式。
 
+## [0.5.4] - 2026-10-26
+
+修掉一处**静默改配置内容**的缺陷：顶层 `configs` / `secrets` 的 inline 多行 `content:` 经「导入 → 渲染」后被折叠成单行，而 `docker compose config -q` 照样 exit 0 —— 校验通过但内容已变，直到容器启动读到被压平的 nginx.conf / 私钥片段才暴露。多行字符串现在走 YAML 块标量保真往返。
+
+### 修复
+
+- **顶层 `configs` / `secrets` 的 inline 多行 `content:` 经「导入 → 渲染」被折叠成单行**（实测 `prometheus_config` 896B / 35 行 → 762B / 4 行、`grafana_clickhouse_datasource` 340B / 14 行 → 282B / 0 行），而 `docker compose config -q` 仍 exit 0 —— 静默改配置内容，容器启动时才暴露。现在多行字符串走 YAML 块标量（`|-` / `|` / `|+` 按末尾换行数 chomping），双引号标量转义 `\n` / `\r`（字面两字符，否则 flow scalar 仍折叠），flow 序列内的多行值同样保真。
+- **`|+`（末尾 ≥2 换行）在同层还有其它键时多算 1 个空行**：块标量自带尾换行，`mapconcat` 又补了一个分隔符，于是 `"x\ny\n\n"` 回读成 `"x\ny\n\n\n"`。改为 `--yaml-join`（前项已以换行结尾则不补）。`|` / `|-` 此前「看起来没问题」只是 clip 恰好吞掉空行，属偶然而非正确。
+
+### 变更
+
+- **多行标量在 block 上下文渲染为块标量**：覆盖走 `--yaml-value` 的位置（顶层 `content:`、服务级 `environment` / `labels`）；`command` 等经 `--service-body` 的字段仍走双引号转义（它们不经 `--yaml-value`，加块标量会改变命令语义）。含 `\r` 的字符串（CRLF）**不走**块标量 —— 一律双引号 + 转义保真，不把 `\r\n` 静默改写成 `\n`。
+- **判据**：`config -q` 只校验语法与 schema，不校验 `content=` 的内容。判定往返保真必须用 `config --no-interpolate --no-env-resolution --no-path-resolution --format json` 取回字符串做等值比较。
+- **测试基线 452 → 468**（批次 1 +10、批次 2.3 +2、批次 3.3 补测 +4；补测覆盖 code-reviewer 建议的字面反斜线转义、序列分支块标量、首行为空白行、CRLF 走引号路径）。
+
 ## [0.5.3] - 2026-10-26
 
 把 v0.5.2 已经下沉到运行期的能力补齐到入口：项目 `:root` 变成真正可选的字段（写盘 / 界面 / 导出三处一起放开），并修掉目检暴露的「界面新建组 / 改组必失败」。
