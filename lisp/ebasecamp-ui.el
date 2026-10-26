@@ -1,7 +1,7 @@
 ;;; ebasecamp-ui.el --- ebasecamp 只读主界面（etaf / etaf-ui） -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.5.2
+;; Version: 0.5.3
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -2018,6 +2018,18 @@ COLLECTION 为 nil 时允许自由输入（新增实体名用）。事件上下�
       (user-error "%s不能为空" prompt))
     text))
 
+(defun ebasecamp-ui--read-optional-path (prompt &optional initial)
+  "收集一个可选路径（允许自由输入），返回去首尾空白的字符串或 nil。
+空输入与纯空白都返回 nil（表示「没有」）；非空时返回 `string-trim' 后的字符串。
+不做 `expand-file-name'、不访问文件系统 —— 与写盘层「清单只保存引用」一致
+（相对路径原样保留，`~' 不展开）。
+对比：`ebasecamp-ui--read-name' 空输入即 `user-error'（实体名必填），本函数专供
+可选路径（项目 `:root'）使用；`ebasecamp-ui--manifest-menu' 的两处项目分支据此
+把「留空」翻译成 nil。"
+  (let ((text (string-trim (ebasecamp-ui--prompt prompt nil nil initial))))
+    (unless (string-empty-p text)
+      text)))
+
 (defun ebasecamp-ui--group-name-strings ()
   "返回清单里全部组名（字符串），供 `completing-read' 使用。"
   (mapcar (lambda (group) (symbol-name (ebasecamp-group-name group)))
@@ -2182,6 +2194,14 @@ GROUP 为组名字符串：写后该组仍存在才恢复选中，否则清空�
   "组 scope 的可选值（字符串形态供 `completing-read'；与
 `ebasecamp-model--scopes' 一致）。")
 
+(defun ebasecamp-ui--read-scope (prompt &optional initial)
+  "读一个 scope，返回符号 `shared' 或 `per-project'。
+`--scope-choices' 是字符串表（`completing-read' 只接受字符串），而模型层与
+写盘层都用符号比对（`ebasecamp-model--scopes' + `memq'）—— 这一层转换只在
+此处做一次。`require-match' 恒为 t：把输入限制在 `--scope-choices' 内，否则
+`intern' 会造出任意符号。"
+  (intern (ebasecamp-ui--prompt prompt ebasecamp-ui--scope-choices t initial)))
+
 (defun ebasecamp-ui--manifest-menu ()
   "清单操作菜单（根级 `X'）：配置 / 项目 / 组的 CRUD 统一收在一个
 `completing-read' 里，逐项收集参数后调写盘层，成功后重载刷新。
@@ -2220,8 +2240,9 @@ GROUP 为组名字符串：写后该组仍存在才恢复选中，否则清空�
             ("新建项目"
              (let ((name (ebasecamp-ui--read-name "新项目名： "))
                    (title (ebasecamp-ui--read-name "项目标题： "))
-                   (root (ebasecamp-ui--read-name
-                          "项目根目录： "
+                   (root (ebasecamp-ui--read-optional-path
+                          (concat "项目根目录（可留空；留空则不参与目录定位、"
+                                  "导出需显式选路径）： ")
                           (directory-file-name default-directory))))
                (setq notice-group nil)
                (ebasecamp-config-write-add-project name title root)))
@@ -2230,12 +2251,23 @@ GROUP 为组名字符串：写后该组仍存在才恢复选中，否则清空�
                     (project (ebasecamp-model-project name))
                     (title (ebasecamp-ui--read-name
                             "新标题： " (or (ebasecamp-project-title project) "")))
-                    (root (ebasecamp-ui--read-name
-                           "新根目录： "
-                           (or (ebasecamp-project-root project)
-                               (directory-file-name default-directory)))))
+                    (current (ebasecamp-project-root project))
+                    (root (ebasecamp-ui--read-optional-path
+                           (concat "新根目录（可留空；留空即清空 :root —— 之后界面"
+                                   "不再按目录定位当前项目、导出须显式选路径、"
+                                   "相对路径校验降级为警告）： ")
+                           (or current (directory-file-name default-directory))))
+                    ;; 留空且原本有 root 才是「清空」（要确认）；原本无 root 时幂等，
+                    ;; 不弹确认（否则每次改 title 都会被问一次）
+                    (clear-root (and (null root) current t)))
                (setq notice-group nil)
-               (ebasecamp-config-write-update-project name title root)))
+               (when clear-root
+                 (ebasecamp-ui--confirm
+                  (format (concat "清空项目 %s 的 :root？清空后界面不再按目录定位"
+                                  "当前项目、导出须显式选路径、相对路径校验"
+                                  "降级为警告。")
+                          name)))
+               (ebasecamp-config-write-update-project name title root clear-root)))
             ("删除项目"
              (let ((name (ebasecamp-ui--require-project "要删除的项目： ")))
                (ebasecamp-ui--confirm
@@ -2245,8 +2277,7 @@ GROUP 为组名字符串：写后该组仍存在才恢复选中，否则清空�
             ("新建组"
              (let ((name (ebasecamp-ui--read-name "新组名： "))
                    (title (ebasecamp-ui--read-name "组标题： "))
-                   (scope (ebasecamp-ui--prompt "scope： "
-                                                ebasecamp-ui--scope-choices t)))
+                   (scope (ebasecamp-ui--read-scope "scope： ")))
                (ebasecamp-config-write-add-group name title scope)
                (setq notice-group name)))
             ("改组"
@@ -2257,10 +2288,9 @@ GROUP 为组名字符串：写后该组仍存在才恢复选中，否则清空�
                     (target-object (ebasecamp-model-group (intern target)))
                     (title (ebasecamp-ui--read-name
                             "新标题： " (or (ebasecamp-group-title target-object) "")))
-                    (scope (ebasecamp-ui--prompt
+                    (scope (ebasecamp-ui--read-scope
                             (format "scope（当前 %s）： "
                                     (ebasecamp-group-scope target-object))
-                            ebasecamp-ui--scope-choices t
                             (symbol-name (ebasecamp-group-scope target-object)))))
                (ebasecamp-config-write-update-group target title scope)
                (setq notice-group target)))

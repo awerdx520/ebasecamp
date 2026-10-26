@@ -1,7 +1,7 @@
 ;;; ebasecamp-export.el --- ebasecamp 导出（清单 → 部署用 compose） -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.5.2
+;; Version: 0.5.3
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -94,11 +94,60 @@ FORMAT-STRING 与 ARGS 组成人类可读的错误描述。"
        "项目 %s 既没有 :root 也没有 :export-file，无法推导导出路径；请设置 :root 或显式传入 :file"
        (ebasecamp-project-name project))))))
 
-(defun ebasecamp-export--target (project file)
-  "返回 PROJECT 的导出目标路径：FILE 非 nil 时用它，否则用默认路径。"
-  (if file
-      (expand-file-name file)
-    (ebasecamp-export-default-file project)))
+(defun ebasecamp-export--target-or-prompt (project file)
+  "返回 PROJECT 的导出目标路径；无 `:root' 也无 `:export-file' 时交互式提问。
+判定顺序（**精确前置判定**，不靠 `condition-case' 捕获
+`ebasecamp-export-error' —— 宽捕获会把 `ebasecamp-export-default-file' 将来
+新增的任何错误误判成「需要 prompt」）：
+
+1. FILE 非 nil → 按 `default-directory' 展开后返回；
+2. 项目有 `:root' 或 `:export-file' → 由 `ebasecamp-export-default-file'
+   正常推导（它 signal 就让它 signal，文案不变）；
+3. 两者都无且 `ebasecamp-export--prompt-p' 为真 → 用 `read-file-name' 让用户
+   显式选路径，起始目录 `default-directory'，默认名
+   `ebasecamp-export--default-file-name'；
+4. 其余（两者都无且非交互）→ 仍调 `ebasecamp-export-default-file'，由它
+   signal 原文案「既没有 :root 也没有 :export-file」。
+
+注意 `ebasecamp-export--prompt-p' 在 `emacs -Q --batch' 下恒为 nil
+（`(not noninteractive)' 恒假）：ERT 要覆盖第 3 条必须 `cl-letf' 打桩该函数，
+绑 `ebasecamp-export--interactive' 或 `called-interactively-p' 都无效。"
+  (cond
+   (file (expand-file-name file))
+   ((or (ebasecamp-project-root project)
+        (ebasecamp-project-export-file project))
+    (ebasecamp-export-default-file project))
+   ((ebasecamp-export--prompt-p)
+    (expand-file-name
+     (read-file-name "导出到文件："
+                     (file-name-as-directory (expand-file-name default-directory))
+                     nil ebasecamp-export--default-file-name)))
+   (t (ebasecamp-export-default-file project))))
+
+(defun ebasecamp-export--relative-path-notice (project target)
+  "返回「导出目录不是项目 root」的提示串；无需提示时返回 nil。
+判据（顺序有意义）：PROJECT 的 `:root' 为 nil、或它指向**不存在的目录**时一律
+返回 nil —— 清单里的 root 可能指向尚未创建的目录，此时 `file-truename' 只做
+尾部分规范化，与已 `make-directory' 的导出目录比较会恒判「不等价」而每次都
+误报。root 存在则把 `TARGET' 所在目录与 root 都用 `file-truename' +
+`file-name-as-directory' 归一等价比较，不等价时返回提示串。
+
+只负责生成文案：是否提示、何时提示由调用方决定（`ebasecamp-export--write'
+在 rename 成功后 `message' 一次），返回值与导出成败都不受影响。"
+  (let ((root (ebasecamp-project-root project)))
+    (when (and root (file-exists-p root))
+      (let* ((root-dir (file-name-as-directory
+                        (file-truename (expand-file-name root))))
+             (target-dir (file-name-as-directory
+                          (file-truename
+                           (or (file-name-directory (expand-file-name target))
+                               default-directory)))))
+        (unless (equal root-dir target-dir)
+          (format (concat "导出目录 %s 不是项目 root %s：生成物里的相对路径"
+                          "（env_file / bind 挂载）在部署时按导出目录解析，"
+                          "请确认相关文件随生成物一同部署。")
+                  (directory-file-name target-dir)
+                  (directory-file-name root-dir)))))))
 
 ;;; 渲染内容
 
@@ -199,7 +248,12 @@ per-project。"
 (defun ebasecamp-export--write (project target)
   "把 PROJECT 的导出内容原子写入 TARGET 并返回 TARGET。
 先写同目录的 `<TARGET>.tmp'，用 `ebasecamp-docker-check-compose' 校验；通过则
-rename 到 TARGET（原子替换），失败则删除临时文件并 signal（TARGET 不动）。"
+rename 到 TARGET（原子替换），失败则删除临时文件并 signal（TARGET 不动）。
+
+rename 成功后若导出目录不是项目 root（见
+`ebasecamp-export--relative-path-notice'），`message' 一条提示：返回值与成败
+都不受影响，提示也不进入文件内容。校验基准始终是导出目录本身（不传 root）——
+校验通过即部署通过，两者的相对路径基准必须一致。"
   (let* ((tmp (concat target ".tmp"))
          (text (ebasecamp-export--content project))
          (coding-system-for-write 'utf-8-unix))
@@ -210,6 +264,9 @@ rename 到 TARGET（原子替换），失败则删除临时文件并 signal（TA
       (if (plist-get result :ok)
           (progn
             (rename-file tmp target t)
+            (when-let* ((notice (ebasecamp-export--relative-path-notice
+                                project target)))
+              (message "%s" notice))
             target)
         (ebasecamp-export--delete-file tmp)
         (ebasecamp-export--fail
@@ -225,16 +282,22 @@ rename 到 TARGET（原子替换），失败则删除临时文件并 signal（TA
   "把 PROJECT 导出为部署用 compose 文件，返回目标绝对路径。
 取消导出时返回 nil。
 
-FILE 为目标路径，省略时用 `ebasecamp-export-default-file'。目标已存在时：
+FILE 为目标路径，省略时用 `ebasecamp-export-default-file'；项目**既无 `:root'
+也无 `:export-file'** 时，交互式改用 `read-file-name' 让用户显式选路径（非交互
+仍 signal，用于不带 `--project-directory' 的批处理与无根目录项目）。目标已存在时：
 FORCE 非 nil 直接覆盖；`noninteractive' 或非交互调用 signal
 `ebasecamp-export-error'；交互式则询问「换一个路径 / 覆盖 / 取消」，选「换
 一个路径」时递归让用户用 `read-file-name' 重新指定。
 
 导出内容为头注释 + 只含 per-project 组的 compose 正文（不声明 `ebasecamp'
 external network），先写临时文件并经 `docker compose config -q' 校验，通过才
-原子替换目标 —— 校验失败时目标路径不会出现半写文件。"
+原子替换目标 —— 校验失败时目标路径不会出现半写文件。
+
+目标是覆盖缓存生成物、供部署的产物：部署时 compose 以**文件所在目录**为基准
+解析相对路径，因此导出目录不是项目 root 时只 `message' 一条提示（见
+`ebasecamp-export--relative-path-notice'），不失败、不改返回值。"
   (ebasecamp-export--check-project project)
-  (let ((target (ebasecamp-export--target project file)))
+  (let ((target (ebasecamp-export--target-or-prompt project file)))
     (cond
      ((not (file-exists-p target))
       (ebasecamp-export--write project target))

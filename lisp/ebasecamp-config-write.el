@@ -1,7 +1,7 @@
 ;;; ebasecamp-config-write.el --- ebasecamp 清单写操作（字段映射 / 实体操作） -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.5.2
+;; Version: 0.5.3
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -1372,25 +1372,45 @@ ROLLBACK 是「撤掉本次新增 / 删除」的无参函数；它自己失败�
             ")\n")))
 
 (defun ebasecamp-config-write--check-root (project root)
-  "校验 ROOT 是项目 PROJECT 的非空字符串根目录，返回 ROOT。
-清单只保存引用（相对路径可原样保留），因此只做「非空字符串」检查：不解析、
-不展开 `~'、不访问文件系统。"
-  (unless (and (stringp root) (not (string-empty-p (string-trim root))))
-    (user-error "项目 %s 的根目录必须是非空字符串，得到 %S" project root))
+  "校验 ROOT 是项目 PROJECT 的根目录，返回 ROOT。
+**nil 是合法状态**（无根目录项目：不参与目录定位、不作路径基准、导出须显式选
+路径，见 AGENTS 不变量 16）；非 nil 时必须是去掉首尾空白后仍非空的字符串——
+空串与纯空白仍拒绝，否则「键存在但值为空」会与「键不存在」两种形态并存。
+清单只保存引用（相对路径可原样保留），因此只做形状检查：不解析、不展开 `~'、
+不访问文件系统。"
+  (unless (or (null root)
+              (and (stringp root) (not (string-empty-p (string-trim root)))))
+    (user-error "项目 %s 的根目录必须是非空字符串或 nil，得到 %S" project root))
   root)
+
+(defun ebasecamp-config-write--plist-remove (plist key)
+  "返回从 PLIST 去掉 KEY 之后的**新** plist，其余键保持原有顺序。
+不修改 PLIST 本身（`plist-remprop' 是破坏性操作，而调用方传入的 plist 可能被
+后续逻辑复用）；KEY 不存在时返回与 PLIST 等值的新列表。用于清空 `:root'：
+必须让键消失，不得写 `:root nil'（否则 `plist-member' 判定会失真）。"
+  (let ((result nil)
+        (rest plist))
+    (while rest
+      (unless (eq (car rest) key)
+        (setq result (append result (list (car rest) (cadr rest)))))
+      (setq rest (cddr rest)))
+    result))
 
 (defun ebasecamp-config-write-add-project (name title root)
   "新增项目 NAME（`:title' TITLE、`:root' ROOT），写 `projects/<NAME>.el'。
-NAME 必须是合法实体名（`[a-z0-9_-]+'）；TITLE 省略时取项目名；ROOT 必须是
-非空字符串。文件已存在即 `user-error'（新增不覆盖，改项目用
-`ebasecamp-config-write-update-project'）。`projects/' 不存在时一并创建。
+NAME 必须是合法实体名（`[a-z0-9_-]+'）；TITLE 省略时取项目名；ROOT 为 nil
+表示**无根目录项目**（不写 `:root' 键：不参与目录定位、不作路径基准、导出须
+显式选路径），非 nil 时必须是去空白后非空的字符串。文件已存在即 `user-error'
+（新增不覆盖，改项目用 `ebasecamp-config-write-update-project'）。`projects/'
+不存在时一并创建。
 
 写盘方式：快照当前加载错误集 → `ebasecamp-manifest--write-new-file' 落盘 →
 重新加载比较错误差集；出现新增错误时删除该文件并 signal
 `ebasecamp-config-write-error'。新增项目没有「原文」，所以错误集快照在写**之前**。
 成功返回写后的加载结果（`plist-get' 取 `:errors' 为 nil 表示无新增错误）。"
-  (let* ((project (ebasecamp-config-write--entity-name name "项目名"))
-         (root (ebasecamp-config-write--check-root project root)))
+  (let* ((project (ebasecamp-config-write--entity-name name "项目名")))
+    (when root
+      (ebasecamp-config-write--check-root project root))
     (when (and title (not (stringp title)))
       (user-error "项目 %s 的标题必须是字符串，得到 %S" project title))
     (let ((file (ebasecamp-config-project-file project)))
@@ -1404,19 +1424,32 @@ NAME 必须是合法实体名（`[a-z0-9_-]+'）；TITLE 省略时取项目名�
          file old-errors (ebasecamp-config-load)
          (lambda () (delete-file file)))))))
 
-(defun ebasecamp-config-write-update-project (name title root)
+(defun ebasecamp-config-write-update-project (name title root &optional clear-root)
   "改项目 NAME 的 `:title' / `:root'，写回它的清单文件。
-TITLE 与 ROOT 都为 nil 时不写盘，直接返回当前加载结果；ROOT 给了就校验非空
-字符串。项目定义里的其它键（`:shared-network' / `:export-file' / 手写的
-`:groups'）按**原文 plist** 原样保留；文件之外（其它项目文件）逐字节不变，
-目标文件经 `ebasecamp-manifest--write-transaction' 事务写盘（备份 → 原子写 →
-仅新增错误才回滚 → 写前检测外部修改）。
+TITLE 与 ROOT 都为 nil 且 CLEAR-ROOT 为 nil 时不改这两个键（文件内容不变即
+不写盘）；ROOT 给了就校验「非 nil 即非空字符串」。
 
-拒绝条件（`user-error'）：项目名非法、文件不存在、文件里没有该项目 form。"
+CLEAR-ROOT 非 nil 表示**清空根目录**：从项目 plist 里真正移除 `:root' 键
+（不是写 `:root nil'——键存在与键不存在必须可区分），使该项目变成无根目录
+项目（不参与目录定位、不作路径基准、导出须显式选路径）。
+CLEAR-ROOT 与 ROOT **互斥**：同时非 nil 即 `user-error'，不静默偏向任一方；
+互斥校验与 `--check-root' 都在 `ebasecamp-manifest--write-transaction' **之前**，
+因此参数错误不会产生任何写盘动作（连备份都不做）。
+
+项目定义里的其它键（`:shared-network' / `:export-file' / 手写的 `:groups'）按
+**原文 plist** 原样保留；文件之外（其它项目文件）逐字节不变，目标文件经
+`ebasecamp-manifest--write-transaction' 事务写盘（备份 → 原子写 → 仅新增错误
+才回滚 → 写前检测外部修改）。
+
+拒绝条件（`user-error'）：项目名非法、TITLE 非字符串、ROOT 与 CLEAR-ROOT 同时
+给出、ROOT 为空串 / 纯空白、文件不存在、文件里没有该项目 form。"
   (let* ((project (ebasecamp-config-write--entity-name name "项目名"))
          (file (ebasecamp-config-project-file project)))
     (when (and title (not (stringp title)))
       (user-error "项目 %s 的标题必须是字符串，得到 %S" project title))
+    (when (and root clear-root)
+      (user-error "项目 %s 的根目录参数互斥：ROOT 与 CLEAR-ROOT 不能同时给出（%S / %S）"
+                  project root clear-root))
     (when root
       (ebasecamp-config-write--check-root project root))
     (unless (file-exists-p file)
@@ -1434,6 +1467,9 @@ TITLE 与 ROOT 都为 nil 时不写盘，直接返回当前加载结果；ROOT �
            (setq updated (plist-put (copy-sequence updated) :title title)))
          (when root
            (setq updated (plist-put (copy-sequence updated) :root root)))
+         (when clear-root
+           ;; 去掉键本身，而不是置 nil；`--plist-remove' 返回新列表
+           (setq updated (ebasecamp-config-write--plist-remove updated :root)))
          (if (equal plist updated)
              text
            (ebasecamp-manifest--replace-form

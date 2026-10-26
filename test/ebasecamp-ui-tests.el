@@ -3260,5 +3260,266 @@ dialog 内容不落 buffer（W0.3 实测），因此断言只读 ref 值。"
             (should (nth 3 (car calls)))
             (should-not answers)))))))
 
+;;; 批次 2（v0.5.3 计划 B 节）：项目 `:root' 可选的界面入口
+;;
+;; 三条约束决定了断言形态：
+;; 1. `--read-name' 与 `--read-optional-path' 内部都调 `--prompt'，同一分支会
+;;    连续调 3 次（name / title / root）→ 打桩 `--prompt' 时按 **prompt 文案**取
+;;    答案（`ebasecamp-ui-test--prompt-reply'），不按调用序号（顺序会随实现微调漂移）；
+;; 2. 「新建项目」的后果说明写在 prompt 文案里，不用 `message'（`--after-write' 会
+;;    先发 success notice 再 `ebasecamp-reload'，`message' 会被覆盖）→ 断言落在
+;;    **收集到的 prompt 串**上；
+;; 3. `--confirm' 答 no 时抛 `user-error'，但 `--manifest-menu' 的
+;;    `condition-case' 会把它转成 error notice（docstring 明写的契约）→ 拒绝路径的
+;;    断言落在 notice 文案（含「取消」）与「写盘零调用」上，而不是 `should-error'。
+
+(defun ebasecamp-ui-test--prompt-reply (prompt table)
+  "按 PROMPT 文案从 TABLE 取一个答案。
+TABLE 是有序的 (正则 . 值) 列表：第一条正则匹配 PROMPT 者生效；`(t . 值)' 作兜底。
+未命中且无兜底时 `error' —— 避免打桩静默返回 nil 让用例误绿。"
+  (let ((pair (cl-find-if (lambda (cell)
+                            (or (eq t (car cell))
+                                (and (stringp (car cell))
+                                     (string-match-p (car cell) prompt))))
+                          table)))
+    (if pair
+        (cdr pair)
+      (error "未预期的 prompt：%s" prompt))))
+
+(ert-deftest ebasecamp-ui-test-read-optional-path ()
+  "`--read-optional-path'：空 / 纯空白输入 → nil，带首尾空白的输入 → 去空白字符串。
+与 `--read-name' 的「空即 user-error」形成对照（同一空输入 `--read-name' 会抛错），
+这是本批次放开 `:root' 必填的核心语义差异。"
+  (ebasecamp-ui-test--with-ui
+    (let ((answer ""))
+      (cl-letf (((symbol-function 'ebasecamp-ui--prompt)
+                 (lambda (&rest _) answer)))
+        (should-not (ebasecamp-ui--read-optional-path "项目根目录（可留空）： "))
+        (setq answer "   ")
+        (should-not (ebasecamp-ui--read-optional-path "项目根目录（可留空）： "))
+        (setq answer "  /tmp/x  ")
+        (should (equal "/tmp/x"
+                       (ebasecamp-ui--read-optional-path "项目根目录（可留空）： ")))
+        ;; 对照：同一空输入走 `--read-name' 必须 user-error（实体名仍必填）
+        (setq answer "")
+        (should-error (ebasecamp-ui--read-name "项目根目录： ") :type 'user-error)))))
+
+(ert-deftest ebasecamp-ui-test-x-new-project-allows-empty-root ()
+  "「新建项目」root 留空 → `-add-project' 第 3 参为 nil，且 root 的 prompt 文案
+同时含「留空」「不参与目录定位」「导出需显式选路径」（后果说明在输入前即可见）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--write-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40)
+            (prompts nil)
+            (calls nil))
+        (ebasecamp-ui-test--with-open-ui
+          (cl-letf (((symbol-function 'ebasecamp-ui--prompt)
+                     (lambda (prompt &rest _)
+                       (push prompt prompts)
+                       (ebasecamp-ui-test--prompt-reply
+                        prompt
+                        '(("清单操作" . "新建项目")
+                          ("新项目名" . "myapp")
+                          ("项目标题" . "我的应用")
+                          ("根目录" . "")))))
+                    ((symbol-function 'ebasecamp-config-write-add-project)
+                     (lambda (name title root)
+                       (push (list name title root) calls)))
+                    ((symbol-function 'ebasecamp-reload)
+                     (lambda () nil)))
+            (ebasecamp-ui--manifest-menu)
+            ;; 写盘第 3 参（root）为 nil
+            (should (= 1 (length calls)))
+            (should (equal '("myapp" "我的应用" nil) (car calls)))
+            (should-not (nth 2 (car calls)))
+            ;; 含「留空」的那一条 prompt 同时含后果说明
+            (let ((root-prompt (cl-find-if (lambda (p) (string-match-p "留空" p))
+                                           prompts)))
+              (should root-prompt)
+              (should (string-match-p "不参与目录定位" root-prompt))
+              (should (string-match-p "导出需显式选路径" root-prompt)))
+            ;; 写操作后不再用 `message' 提示（`--after-write' 的 notice 才是唯一通道）
+            (should (eq 'success
+                        (plist-get (ebasecamp-ui-test--notice) :kind)))))))))
+
+(ert-deftest ebasecamp-ui-test-x-edit-project-clears-root ()
+  "「改项目」：项目原本有 root、root 输入为空 → 先 `--confirm'（答 yes）→
+`-update-project' 收到 `(项目 title nil t)'（root nil + `clear-root' 非 nil）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--write-manifest)
+    (setf (ebasecamp-project-root (ebasecamp-model-project 'myapp)) "/srv/myapp")
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40)
+            (asked nil)
+            (calls nil))
+        (ebasecamp-ui-test--with-open-ui
+          (cl-letf (((symbol-function 'ebasecamp-ui--prompt)
+                     (lambda (prompt &rest _)
+                       (ebasecamp-ui-test--prompt-reply
+                        prompt
+                        '(("清单操作" . "改项目")
+                          ("要改的项目" . "myapp")
+                          ("新标题" . "示例项目")
+                          ("根目录" . "")))))
+                    ((symbol-function 'y-or-n-p)
+                     (lambda (prompt) (push prompt asked) t))
+                    ((symbol-function 'ebasecamp-config-write-update-project)
+                     (lambda (name title root &optional clear-root)
+                       (push (list name title root clear-root) calls)))
+                    ((symbol-function 'ebasecamp-reload)
+                     (lambda () nil)))
+            (ebasecamp-ui--manifest-menu)
+            ;; 问了一次，文案照抄计划（项目名 / :root / 三条后果）
+            (should (= 1 (length asked)))
+            (should (string-match-p "清空项目 myapp 的 :root" (car asked)))
+            (should (string-match-p "不再按目录定位" (car asked)))
+            (should (string-match-p "导出须显式选路径" (car asked)))
+            (should (string-match-p "降级为警告" (car asked)))
+            ;; 第 3 参 nil + 第 4 参非 nil
+            (should (= 1 (length calls)))
+            (should (equal '(myapp "示例项目" nil t) (car calls)))))))))
+
+(ert-deftest ebasecamp-ui-test-x-edit-project-clear-root-declined ()
+  "同上但答 no → 流程以 error notice「已取消」收尾，`-update-project' **零调用**。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--write-manifest)
+    (setf (ebasecamp-project-root (ebasecamp-model-project 'myapp)) "/srv/myapp")
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40)
+            (asked 0)
+            (calls nil))
+        (ebasecamp-ui-test--with-open-ui
+          (cl-letf (((symbol-function 'ebasecamp-ui--prompt)
+                     (lambda (prompt &rest _)
+                       (ebasecamp-ui-test--prompt-reply
+                        prompt
+                        '(("清单操作" . "改项目")
+                          ("要改的项目" . "myapp")
+                          ("新标题" . "示例项目")
+                          ("根目录" . "")))))
+                    ((symbol-function 'y-or-n-p)
+                     (lambda (_prompt) (cl-incf asked) nil))
+                    ((symbol-function 'ebasecamp-config-write-update-project)
+                     (lambda (name title root &optional clear-root)
+                       (push (list name title root clear-root) calls)))
+                    ((symbol-function 'ebasecamp-reload)
+                     (lambda () nil)))
+            (ebasecamp-ui--manifest-menu)
+            (should (= 1 asked))
+            ;; 确认在写盘前：答 no 时写盘零调用
+            (should-not calls)
+            ;; `--confirm' 的 user-error 被菜单的 condition-case 转成 error notice
+            (let ((notice (ebasecamp-ui-test--notice)))
+              (should (eq 'error (plist-get notice :kind)))
+              (should (string-match-p
+                       "取消"
+                       (or (plist-get notice :message)
+                           (plist-get notice :title)
+                           ""))))))))))
+
+(ert-deftest ebasecamp-ui-test-x-edit-project-empty-root-stays-empty ()
+  "项目原本就无 root、root 输入为空 → **不弹**确认（幂等），
+`-update-project' 收到 `(项目 title nil nil)'（第 4 参 nil，不触发清空分支）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--write-manifest)
+    (should-not (ebasecamp-project-root (ebasecamp-model-project 'myapp)))
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40)
+            (asked 0)
+            (calls nil))
+        (ebasecamp-ui-test--with-open-ui
+          (cl-letf (((symbol-function 'ebasecamp-ui--prompt)
+                     (lambda (prompt &rest _)
+                       (ebasecamp-ui-test--prompt-reply
+                        prompt
+                        '(("清单操作" . "改项目")
+                          ("要改的项目" . "myapp")
+                          ("新标题" . "示例项目")
+                          ("根目录" . "")))))
+                    ((symbol-function 'y-or-n-p)
+                     (lambda (_prompt) (cl-incf asked) t))
+                    ((symbol-function 'ebasecamp-config-write-update-project)
+                     (lambda (name title root &optional clear-root)
+                       (push (list name title root clear-root) calls)))
+                    ((symbol-function 'ebasecamp-reload)
+                     (lambda () nil)))
+            (ebasecamp-ui--manifest-menu)
+            (should (= 0 asked))
+            (should (= 1 (length calls)))
+            (should (equal '(myapp "示例项目" nil nil) (car calls)))
+            (should-not (nth 3 (car calls)))))))))
+
+;;; 批次 4.3（目检缺陷 A）：界面向写盘层传的 scope 必须是符号
+
+;; `ebasecamp-ui--scope-choices' 是字符串表（`completing-read' 只接受字符串），
+;; 而模型层与写盘层用符号比对（`ebasecamp-model--scopes' + `memq'）。界面若不转换，
+;; `memq' 恒 nil → 写盘前就报「组 scope 必须是 shared 或 per-project，得到
+;; \"per-project\"」，groups.el 永远建不出来。两个入口（新建组 / 改组）都必须转换。
+
+(ert-deftest ebasecamp-ui-test-x-new-group-passes-symbol-scope ()
+  "「新建组」：`completing-read' 返回的字符串 scope 必须先转成符号再进写盘层。
+断言 `-add-group' 第 3 参是符号 `shared'（不是字符串 \"shared\"），且流程以成功
+notice 收尾（即缺陷现象「写盘前报 scope 非法」已消失）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--write-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40)
+            (calls nil))
+        (ebasecamp-ui-test--with-open-ui
+          (cl-letf (((symbol-function 'ebasecamp-ui--prompt)
+                     (lambda (prompt &rest _)
+                       (ebasecamp-ui-test--prompt-reply
+                        prompt
+                        '(("清单操作" . "新建组")
+                          ("新组名" . "cache")
+                          ("组标题" . "Cache")
+                          ("scope" . "shared")))))
+                    ((symbol-function 'ebasecamp-config-write-add-group)
+                     (lambda (name title scope)
+                       (push (list name title scope) calls)))
+                    ((symbol-function 'ebasecamp-reload)
+                     (lambda () nil)))
+            (ebasecamp-ui--manifest-menu)
+            (should (= 1 (length calls)))
+            ;; 第 1、2 参仍是字符串（名字与标题不转换）
+            (should (equal '("cache" "Cache") (butlast (car calls))))
+            ;; 第 3 参：符号（`eq' 而非 `equal' —— 缺陷正是符号/字符串不匹配）
+            (should (eq 'shared (nth 2 (car calls))))
+            (should (symbolp (nth 2 (car calls))))
+            (should (eq 'success
+                        (plist-get (ebasecamp-ui-test--notice) :kind)))))))))
+
+(ert-deftest ebasecamp-ui-test-x-edit-group-passes-symbol-scope ()
+  "「改组」：scope 打桩返回字符串 \"per-project\" → `-update-group' 收到符号
+`per-project'。改组是另一条独立分支（含 `initial' 取当前 scope 的 `symbol-name'），
+必须与新建组同样转换。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--write-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40)
+            (calls nil))
+        (ebasecamp-ui-test--with-open-ui
+          (cl-letf (((symbol-function 'ebasecamp-ui--prompt)
+                     (lambda (prompt &rest _)
+                       (ebasecamp-ui-test--prompt-reply
+                        prompt
+                        '(("清单操作" . "改组")
+                          ("新标题" . "MySQL 8.4")
+                          ("scope" . "per-project")))))
+                    ((symbol-function 'ebasecamp-config-write-update-group)
+                     (lambda (name title scope)
+                       (push (list name title scope) calls)))
+                    ((symbol-function 'ebasecamp-reload)
+                     (lambda () nil)))
+            (ebasecamp-ui--manifest-menu)
+            (should (= 1 (length calls)))
+            ;; 选中组 mysql（`--with-open-ui' 已选中），名字仍是字符串
+            (should (equal '("mysql" "MySQL 8.4") (butlast (car calls))))
+            (should (eq 'per-project (nth 2 (car calls))))
+            (should (symbolp (nth 2 (car calls))))
+            (should (eq 'success
+                        (plist-get (ebasecamp-ui-test--notice) :kind)))))))))
+
 (provide 'ebasecamp-ui-tests)
 ;;; ebasecamp-ui-tests.el ends here

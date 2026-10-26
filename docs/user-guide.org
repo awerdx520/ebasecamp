@@ -630,9 +630,11 @@ M-x ebasecamp-export-compose     或界面底栏「导出 compose」
 | 配置不覆盖 scope | 同一组在不同项目需要不同 scope 时，拆成两个组或改用旧写法的引用级 =:scope= |
 | 顶层 =configs= / =secrets= 只支持单值形态 | 支持 =file:= / =external= / =name=；=content:= 多行字符串不可表达（会被静默丢，且 =config -q= 仍可能 exit 0） |
 | shared 生成物不含顶层段 | =ebc-shared= 不输出 =configs= / =secrets= ，shared 组服务引用顶层 config / secret 需自行处理 |
-| 老清单需重新导入一次 | v0.5.1 之前导入的清单缺 =:file-configs= / =:file-secrets= ，引用顶层 config 的服务启动会报 =refers to undefined config= ；对原 compose 重新导入即可补齐，插件不自动改清单 |
+| 老清单需重新导入一次 | v0.5.1 之前导入的清单缺 =:file-configs= / =:file-secrets= ，引用顶层 config 的服务启动会报 =refers to undefined config= ；对原 compose 重新导入即可补齐，插件不自动改清单。两点注意：①*重导入会 =--force= 覆盖界面对该项目的编辑*（导入是「按 compose 文件重建项目定义」，不是合并），依赖界面里加过的覆盖 / 端口时必须先备份清单；②inline 多行 =content:= 的顶层 config 目前会被 *折成单行*（渲染器只有单行标量写法，且 =config -q= 仍可能 exit 0 —— 静默错误，技术债 #33），建议改成 =file:= 形态（=./conf/x.conf=）再用 |
 | 同名组只能在一个文件里定义 | 同名组出现在多个文件时加载层报错「组 X 已定义」，*后加载的文件整体回滚* —— 其中项目不会出现在界面；界面写操作遇到同名组直接拒绝并列出文件 |
-| 导出的路径基准不由插件改写 | 导出到 *项目 =:root= 之外* 的目录时，导出物里顶层 =configs.file= 的相对路径会失效（导出物的基准是导出目标所在目录）。改法：导出到项目 root 下，或手写绝对路径 |
+| 导出的路径基准不由插件改写 | 导出到 *项目 =:root= 之外* 的目录时，导出物里顶层 =configs.file= 的相对路径会失效（导出物的基准是导出目标所在目录）。改法：导出到项目 root 下，或手写绝对路径。v0.5.3 起这种情形会 *提示一次*：「导出目录 … 不是项目 root …：生成物里的相对路径（env_file / bind 挂载）在部署时按导出目录解析，请确认相关文件随生成物一同部署。」提示只提示 —— 不改导出结果、不影响成败，也 *不会* 把校验基准换成项目 root（换基准等于「校验过、部署炸」） |
+| 项目 =:root= 可选（留空 = 无根目录项目） | 三条降级：①*界面不按目录定位* —— 站在该项目目录里 =M-x ebasecamp= 不会自动选中它的配置；②*不作路径基准* —— 派发不带 =--project-directory=，相对 =file:= 的预校验 *只给警告*（成功提示末尾「（N 条预校验警告）」），*不是启动失败*，真正的缺失要到容器创建阶段才有 =bind source path does not exist=；③*导出必须显式选路径* —— 无 =:root= 也无 =:export-file= 时交互式弹 =read-file-name=，非交互调用仍报错。界面「改项目」把根目录留空即 *清空* =:root=（会先弹确认，清单里该键真正消失，不会留 =:root nil=） |
+| 无 =:root= 但写了 =:export-file= | =:export-file= 是相对路径时按 *=default-directory=（导出调用时的当前目录）* 展开，而不是项目 root —— 这是既有语义（没有 root 就没有别的基准可用），v0.5.3 未改；需要稳定落点时写绝对路径或在界面里当场选 |
 | 相对 =volumes= 源不做存在性检查 | 预校验只覆盖顶层 =configs= / =secrets= 的 =file:= ；以 =.= 开头的 bind 源缺失要到容器创建阶段才报 =bind source path does not exist= |
 | =M=（移动配置）不迁移旧 =:groups= 引用 | 跨组移动不产生新的「同项目同组」关联，不做迁移；目标项目若仍用旧写法引用该组，由「原位接管」兼容 |
 | 预校验警告只显示条数 | 成功提示末尾的「（N 条预校验警告）」只是计数，界面不逐条列出；具体消息在 =ebasecamp-command-run= 返回值的 =:preflight-warnings=（batch 下可自行取） |

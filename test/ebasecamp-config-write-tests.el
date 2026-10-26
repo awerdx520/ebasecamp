@@ -1343,5 +1343,149 @@ MARKER 是 form 开头的唯一片段（例如 `(db'）；找不到时 `ert-fail
                      (ebasecamp-config-write-test--configs-of 'db)))
       (should-not (ebasecamp-config-write-test--leftovers)))))
 
+;;; v0.5.3 批次 1：项目 :root 可选（写盘层）
+
+(defconst ebasecamp-config-write-test--no-key-project
+  (concat "(ebasecamp-define-project extra\n"
+          "  :title \"extra\"\n"
+          "  :root \"/tmp/ebc-extra\"\n"
+          "  :shared-network nil\n"
+          "  :export-file \"compose.override.yaml\")\n")
+  "带无关键（`:shared-network' / `:export-file'）的项目文件内容。
+供清空 `:root' 时验证无关键被原样保留。")
+
+(ert-deftest ebasecamp-config-write-test-add-project-without-root ()
+  "新增项目 root 为 nil：允许成功、文件不写 `:root' 键、加载零错误、model root 为 nil。"
+  (ebasecamp-config-write-test--with-directory
+    (ebasecamp-config-write-test--write-manifest
+     ebasecamp-config-write-test--config-groups)
+    (should (null (plist-get (ebasecamp-config-load) :errors)))
+    (let ((file (ebasecamp-config-write-test--project-file "newproj")))
+      (should-not (file-exists-p file))
+      (let ((result (ebasecamp-config-write-add-project
+                     'newproj "新项目" nil)))
+        (should (null (plist-get result :errors)))
+        (should (file-exists-p file))
+        ;; 文件可被加载器读取：重新加载没有新增错误
+        (should (null (plist-get (ebasecamp-config-load) :errors)))
+        (let ((project (ebasecamp-model-project 'newproj)))
+          (should project)
+          (should (equal "新项目" (ebasecamp-project-title project)))
+          (should-not (ebasecamp-project-root project)))
+        ;; 落盘文本不含 `:root'（不是 `:root nil'）
+        (should-not (string-match-p ":root"
+                                    (ebasecamp-config-write-test--read file)))
+        (should-not (ebasecamp-config-write-test--leftovers))))))
+
+(ert-deftest ebasecamp-config-write-test-add-project-rejects-blank-root ()
+  "root 为空串或纯空白仍拒绝（只有 nil 表示无根目录），且不产生文件。"
+  (ebasecamp-config-write-test--with-directory
+    (ebasecamp-config-write-test--write-manifest
+     ebasecamp-config-write-test--config-groups)
+    (dolist (root '("" "   "))
+      (ebasecamp-config-write-test--error-matching
+       (lambda () (ebasecamp-config-write-add-project 'blankproj "空白" root))
+       "根目录")
+      (should-not (file-exists-p
+                   (ebasecamp-config-write-test--project-file "blankproj"))))
+    (should-not (ebasecamp-config-write-test--leftovers))))
+
+(ert-deftest ebasecamp-config-write-test-update-project-clear-root ()
+  "改项目传 clear-root：`:root' 键真正消失（不是 `:root nil'），无关键保留。"
+  (ebasecamp-config-write-test--with-directory
+    (ebasecamp-config-write-test--write-manifest
+     ebasecamp-config-write-test--config-groups)
+    (ebasecamp-config-write-test--write-flat
+     (ebasecamp-config-write-test--project-file "extra")
+     ebasecamp-config-write-test--no-key-project)
+    (should (null (plist-get (ebasecamp-config-load) :errors)))
+    ;; app 原本有 :root → 清空后 model root 为 nil，:title 取新值
+    (let ((result (ebasecamp-config-write-update-project 'app "应用" nil t)))
+      (should (null (plist-get result :errors)))
+      (let ((project (ebasecamp-model-project 'app)))
+        (should (equal "应用" (ebasecamp-project-title project)))
+        (should-not (ebasecamp-project-root project)))
+      (let* ((text (ebasecamp-config-write-test--read
+                    (ebasecamp-config-write-test--project-file "app")))
+             (plist (cddr (ebasecamp-config-write-test--read-form-at
+                           text "(ebasecamp-define-project app"))))
+        (should (equal "应用" (plist-get plist :title)))
+        ;; 键消失，而不是 `:root nil'
+        (should-not (plist-member plist :root))
+        (should-not (string-match-p ":root" text))))
+    ;; 无关键（:shared-network / :export-file）在清空 :root 时保留
+    (let ((result (ebasecamp-config-write-update-project
+                   'extra "extra 应用" nil t)))
+      (should (null (plist-get result :errors)))
+      (let ((plist (cddr (ebasecamp-config-write-test--read-form-at
+                          (ebasecamp-config-write-test--read
+                           (ebasecamp-config-write-test--project-file "extra"))
+                          "(ebasecamp-define-project extra"))))
+        (should (equal "extra 应用" (plist-get plist :title)))
+        (should-not (plist-member plist :root))
+        (should (plist-member plist :shared-network))
+        (should-not (plist-get plist :shared-network))
+        (should (equal "compose.override.yaml"
+                       (plist-get plist :export-file)))))
+    (should-not (ebasecamp-config-write-test--leftovers))))
+
+(ert-deftest ebasecamp-config-write-test-update-project-nil-root-keeps-file ()
+  "root 传 nil 且不传 clear-root：不改 `:root'，同参数再次调用文件逐字节不变。"
+  (ebasecamp-config-write-test--with-directory
+    (ebasecamp-config-write-test--write-manifest
+     ebasecamp-config-write-test--config-groups)
+    (should (null (plist-get (ebasecamp-config-load) :errors)))
+    (let ((file (ebasecamp-config-write-test--project-file "app")))
+      ;; 首次：把 :title 改成「应用」，root 传 nil 不改 root
+      (should (null (plist-get (ebasecamp-config-write-update-project
+                                'app "应用" nil)
+                              :errors)))
+      ;; 同参数第二次：无改动 → 文件逐字节不变
+      (let ((hash (ebasecamp-config-write-test--hash file)))
+        (should (null (plist-get (ebasecamp-config-write-update-project
+                                  'app "应用" nil)
+                                :errors)))
+        (should (equal hash (ebasecamp-config-write-test--hash file)))
+        ;; nil root 不等于清空：原 :root 仍在
+        (should (ebasecamp-project-root (ebasecamp-model-project 'app)))))
+    (should-not (ebasecamp-config-write-test--leftovers))))
+
+(ert-deftest ebasecamp-config-write-test-update-project-title-keeps-root-absent ()
+  "无 root 项目改 `:title'：文件仍不含 `:root'（不得写出 `:root nil'）。"
+  (ebasecamp-config-write-test--with-directory
+    (ebasecamp-config-write-test--write-manifest
+     ebasecamp-config-write-test--config-groups)
+    (should (null (plist-get (ebasecamp-config-load) :errors)))
+    (should (null (plist-get (ebasecamp-config-write-add-project
+                              'newproj "新项目" nil)
+                             :errors)))
+    (let* ((file (ebasecamp-config-write-test--project-file "newproj"))
+           (result (ebasecamp-config-write-update-project
+                    'newproj "改名" nil)))
+      (should (null (plist-get result :errors)))
+      (let* ((text (ebasecamp-config-write-test--read file))
+             (plist (cddr (ebasecamp-config-write-test--read-form-at
+                           text "(ebasecamp-define-project newproj"))))
+        (should (equal "改名" (plist-get plist :title)))
+        (should-not (plist-member plist :root))
+        (should-not (string-match-p ":root" text)))
+      (should (null (plist-get (ebasecamp-config-load) :errors)))
+      (should-not (ebasecamp-config-write-test--leftovers)))))
+
+(ert-deftest ebasecamp-config-write-test-update-project-rejects-root-with-clear ()
+  "root 与 clear-root 同时非 nil：`user-error'（参数互斥），文件逐字节不变。"
+  (ebasecamp-config-write-test--with-directory
+    (ebasecamp-config-write-test--write-manifest
+     ebasecamp-config-write-test--config-groups)
+    (should (null (plist-get (ebasecamp-config-load) :errors)))
+    (let* ((file (ebasecamp-config-write-test--project-file "app"))
+           (hash (ebasecamp-config-write-test--hash file)))
+      (ebasecamp-config-write-test--error-matching
+       (lambda ()
+         (ebasecamp-config-write-update-project 'app "应用" "/srv/app" t))
+       "互斥")
+      (should (equal hash (ebasecamp-config-write-test--hash file))))
+    (should-not (ebasecamp-config-write-test--leftovers))))
+
 (provide 'ebasecamp-config-write-tests)
 ;;; ebasecamp-config-write-tests.el ends here

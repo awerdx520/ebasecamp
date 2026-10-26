@@ -601,7 +601,9 @@ grep -n ':root' ~/.config/ebasecamp/projects/myapp.el
 
 ** 修法
 
-给项目补 =:root=（项目仓库路径，=~= 开头也可以），=M-x ebasecamp-reload= 后警告消失。补 =:root= 顺带修好所有相对路径的基准：顶层 =configs: /=secrets:= 的 =file:= 、以 =.= 开头的 bind 卷源、=env_file= 。项目 =:root= 的可选性是 v0.5.3 的范围，本版只做「回退 + warning」。
+给项目补 =:root=（项目仓库路径，=~= 开头也可以），=M-x ebasecamp-reload= 后警告消失。补 =:root= 顺带修好所有相对路径的基准：顶层 =configs: /=secrets:= 的 =file:= 、以 =.= 开头的 bind 卷源、=env_file= 。
+
+*v0.5.3 起 =:root= 是可选字段*：写盘层接受留空、界面「新建项目」可留空、「改项目」把根目录留空即 *清空* =:root=（会先弹确认，清单里该键真正消失）；无 root 项目交互式导出会弹 =read-file-name= 让你当场选路径。因此这条警告 *不再意味着清单写错了* —— 它只是告诉你「这条相对 =file:= 无法校验」。留空的完整代价（不参与目录定位 / 不作路径基准 / 导出须显式选路径）见 =docs/user-guide.org= 的「限制与注意事项」。
 
 * 16. 新建 / 改配置时报「项目 X 重复引用组 Y」
 

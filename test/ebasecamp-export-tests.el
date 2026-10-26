@@ -589,5 +589,102 @@ compose 读取由 `ebasecamp-docker--run-sync-function' 伪造为 fixture JSON�
       (should (plist-get result :ok))
       (should (eq 0 (plist-get result :exit))))))
 
+;;; 13. v0.5.3 批次 3：无 `:root' 项目的导出入口（计划 C 节）
+
+;; 计划 C 节给导出入口补两条能力：无 `:root' 也无 `:export-file' 时交互式改用
+;; `read-file-name' 让用户显式选路径（非交互仍 signal）；导出目录 ≠ 项目 root
+;; 时给一条可读提示（只 `message'，不改返回值与成败，不改校验基准）。
+
+(ert-deftest ebasecamp-export-test-project-without-root-signals ()
+  "无 `:root' 也无 `:export-file' 且非交互时仍 signal（回归保护）。
+`ebasecamp-export--prompt-p' 在 batch 下天然为 nil（`noninteractive' 为 t），
+本用例不打桩，断言的是第 4 条分支的原文案。"
+  (ebasecamp-export-test--with-root
+    ;; root 传 nil = 项目无 `:root'（批次 1 起写盘层与模型层都接受 nil）
+    (let ((project (ebasecamp-export-test--define-world nil)))
+      (should-not (ebasecamp-export--prompt-p))
+      (let ((error-data (should-error (ebasecamp-export-project project)
+                                      :type 'ebasecamp-export-error)))
+        (should (string-match-p "既没有 :root 也没有 :export-file"
+                                (format "%s" (cdr error-data))))))))
+
+(ert-deftest ebasecamp-export-test-project-without-root-prompts-for-path ()
+  "无 `:root' 也无 `:export-file' 时交互式经 `read-file-name' 选路径并写出。
+`ebasecamp-export--prompt-p' 在 batch 下恒 nil，故用 `cl-letf' 打桩该函数
+（绑 `ebasecamp-export--interactive' 无效：`(not noninteractive)' 恒假）。"
+  (ebasecamp-export-test--with-root
+    (let ((project (ebasecamp-export-test--define-world nil))
+          (target (expand-file-name "out.yaml" root-dir))
+          (checked-file nil)
+          (checked-root 'unspecified))
+      (cl-letf (((symbol-function 'ebasecamp-export--prompt-p)
+                 (lambda () t))
+                ((symbol-function 'read-file-name)
+                 (lambda (&rest _) target))
+                ((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (file &optional root)
+                   (setq checked-file file)
+                   (setq checked-root root)
+                   ebasecamp-export-test--ok-result)))
+        (should (equal target (ebasecamp-export-project project))))
+      (should (file-exists-p target))
+      (should (equal (concat target ".tmp") checked-file))
+      ;; D2：导出校验基准仍是导出目录（文件所在目录 = 部署基准），第二参为 nil
+      (should (null checked-root))
+      ;; 无 root 时不做目录比较，不该有「不是项目 root」的提示残留
+      (should (string-match-p "myapp/api:dev"
+                              (ebasecamp-export-test--read target))))))
+
+(ert-deftest ebasecamp-export-test-relative-path-notice ()
+  "导出目录 ≠ 项目 root 时 `ebasecamp-export--relative-path-notice' 返回提示串。
+四条断言：①两者都是真实目录且不等价 → 字符串含「不是项目 root」与两个目录；
+②目标就在 root 下（`file-truename' 等价）→ nil；③`--write' 成功路径确实把
+提示 `message' 一次；④root 指向不存在的目录 → nil（清单里的 root 可能尚未
+创建，不得每次误报）。"
+  (ebasecamp-export-test--with-root
+    (let* ((project (ebasecamp-export-test--define-world root-dir))
+           (other-dir (directory-file-name
+                       (make-temp-file "ebc-export-other-" t)))
+           (other-target (expand-file-name "out.yaml" other-dir)))
+      (unwind-protect
+          (progn
+            ;; ① 目标目录 ≠ root（两者都是真实目录）→ 有提示
+            (let ((notice (ebasecamp-export--relative-path-notice
+                           project other-target)))
+              (should (stringp notice))
+              (should (string-match-p "不是项目 root" notice))
+              (should (string-match-p
+                       (regexp-quote (directory-file-name (file-truename other-dir)))
+                       notice))
+              (should (string-match-p
+                       (regexp-quote (directory-file-name (file-truename root-dir)))
+                       notice)))
+            ;; ② 目标就在 root 下 → nil
+            (should-not (ebasecamp-export--relative-path-notice
+                         project
+                         (expand-file-name "docker-compose.ebasecamp.yaml"
+                                           root-dir)))
+            ;; ③ `--write' 成功路径把提示 `message' 一次（打桩捕获，不改返回值）
+            (let ((messages nil)
+                  (written nil))
+              (cl-letf (((symbol-function 'ebasecamp-docker-check-compose)
+                         (lambda (&rest _) ebasecamp-export-test--ok-result))
+                        ((symbol-function 'message)
+                         (lambda (format-string &rest args)
+                           (push (apply #'format format-string args)
+                                 messages))))
+                (setq written (ebasecamp-export-project project :file other-target)))
+              (should (equal other-target written))
+              (should (= 1 (length messages)))
+              (should (string-match-p "不是项目 root" (car messages))))
+            ;; ④ root 指向不存在的目录 → nil（本分支会 reset 注册表，放最后）
+            (let ((missing (ebasecamp-export-test--define-world
+                            (expand-file-name "does-not-exist" root-dir))))
+              (should-not (file-exists-p (ebasecamp-project-root missing)))
+              (should-not (ebasecamp-export--relative-path-notice
+                           missing
+                           (expand-file-name "out.yaml" other-dir)))))
+        (ignore-errors (delete-directory other-dir t))))))
+
 (provide 'ebasecamp-export-tests)
 ;;; ebasecamp-export-tests.el ends here

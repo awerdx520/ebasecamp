@@ -2,7 +2,7 @@
 #+author: Thomas
 #+options: toc:t
 
-ebasecamp 是 Emacs 里的 Docker 环境分组管理插件（版本 0.5.2）。
+ebasecamp 是 Emacs 里的 Docker 环境分组管理插件（版本 0.5.3）。
 
 * ebasecamp 是什么
 
@@ -10,7 +10,7 @@ ebasecamp 把 Docker 环境按「组 → 配置 → 项目」组织：
 
 - *组*（group）是可复用的基础组件集合（mysql、redis、应用栈……），是全局第一等对象，不依赖任何项目即可存在；组有 scope：=shared= 跨项目共用一套容器，=per-project= 每个项目一套。
 - *配置*（config）挂在组内（组的 =:configs= 槽），用 =:project= 指向一个项目，并可为该项目覆盖端口、环境变量与卷。一份配置 = 一个「组 × 项目」实例，界面右栏给每份配置渲染一段。
-- *项目*（project）是业务工程的容器，提供 =:title=、=:root=、=:shared-network=、=:export-file=。
+- *项目*（project）是业务工程的容器，提供 =:title=、=:root=、=:shared-network=、=:export-file=。=:root= *可选*（留空即「无根目录项目」，见「compose 生成物与路径基准」）。
 
 界面用 etaf / etaf-ui 在 Emacs buffer 内渲染：左栏「组 → 配置」树，右栏每份配置一段服务表，勾选服务即可批量启动 / 停止 / 重启。清单（组与项目定义）以 Elisp 形式保存在 =~/.config/ebasecamp/=，是唯一事实源；compose 文件只是由清单派生的生成物。插件还支持从已有 compose 文件导入清单，以及把项目导出为部署用 compose。
 
@@ -183,11 +183,19 @@ ebasecamp 把 Docker 环境按「组 → 配置 → 项目」组织：
 
 项目定义里的 =:root= *现在是路径基准*，不只是「在项目中打开」时的定位依据：生成物里的相对路径（顶层 =configs= / =secrets= 的 =file:=、以 =.= 开头的 =volumes= 源、=env_file=）都按它解析，见「compose 生成物与路径基准」一节。
 
+=:root= *是可选的*（v0.5.3 起写盘、界面、导出三处都已放开）：把整行删掉、或在界面里把根目录留空，就是一个「无根目录项目」。留空有 *三条后果*，界面与 =docs/user-guide.org= 都会提示：
+
+- *不参与项目定位*：界面打开时不会因为你站在该项目目录里就自动选中它的配置（不知道目录，就不猜）；
+- *不作路径基准*：派发不带 =--project-directory=，生成物里的相对路径退回「按缓存目录解析」；相对 =file:= 的预校验 *降级为警告*（成功提示末尾的「（N 条预校验警告）」），真正的缺失要到容器创建阶段才暴露；
+- *导出必须显式选路径*：无 =:root= 也无 =:export-file= 时，交互式导出会弹 =read-file-name= 让你当场选；脚本 / batch 调用仍会报错（必须自己传 =:file=）。
+
+反过来，*导入出来的项目通常自带 =:root=* —— 导入层取被导入 compose 文件所在目录作为项目根，恒非 nil。所以「无根目录项目」基本只出现在手写清单、从别处拷来的项目、或「只想把几个服务挂起来跑、暂不关心部署路径」的场景。也正因如此，*不要为了填空而写一个假路径*：它会成为派发基准，把相对路径解析到一个空目录里。
+
 ** 关键字表
 
 组定义 =ebasecamp-define-group= 支持 =:title=、=:scope=、=:services=、=:configs=；=:scope= 取 =shared= 或 =per-project=，缺省 =per-project=。
 
-项目定义 =ebasecamp-define-project= 支持 =:title=、=:root=、=:shared-network=、=:export-file=、=:groups=（旧写法）。=:shared-network= 缺省为 =t=，控制是否在生成物顶层把 =ebasecamp= 声明为 external network。
+项目定义 =ebasecamp-define-project= 支持 =:title=、=:root=（*可选*）、=:shared-network=、=:export-file=、=:groups=（旧写法）。=:shared-network= 缺省为 =t=，控制是否在生成物顶层把 =ebasecamp= 声明为 external network。
 
 配置项写在 =:configs= 里，格式 =(配置名 :project 项目名 [:services 覆盖...])=：
 

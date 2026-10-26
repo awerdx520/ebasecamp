@@ -181,7 +181,7 @@ ebasecamp 是 Emacs 里的 Docker 环境分组管理插件。v0.2 起，模型�
 
 以下每条都可机械检查（命令或断言），违反即视为缺陷而非风格问题。前 8 条沿用 v0.1（与 [[file:../AGENTS.md][AGENTS.md]] 对齐），第 9–11 条为 v0.2 新增，第 12 条为 v0.3 新增（ADR-0003）、第 13 条为 v0.4 新增（ADR-0004），第 10 条与第 12 条由 v0.5.2 修订、第 14 条为 v0.5.2 新增（ADR-0007）。
 
-*编号与 =AGENTS.md= 的清单不等价*（那边 1–15、本表 1–14，自 v0.2 起就分叉）：本表第 9 / 10 / 11 条分别对应 =AGENTS.md= 第 11 / 9 / 10 条（本表把「物化产物键名必须是 =:service-overrides=」一条提到第 9 位，=AGENTS.md= 里它是第 11 条），第 12 / 13 条与 =AGENTS.md= 同号，*第 14 条对应 =AGENTS.md= 第 15 条*；=AGENTS.md= 第 14 条「清单写盘必须经 =ebasecamp-manifest--write-transaction=」在本表内没有对应行（该要求写在下文「清单写盘」节的正文里）。
+*编号与 =AGENTS.md= 的清单不等价*（那边 1–16、本表 1–15，自 v0.2 起就分叉）：本表第 9 / 10 / 11 条分别对应 =AGENTS.md= 第 11 / 9 / 10 条（本表把「物化产物键名必须是 =:service-overrides=」一条提到第 9 位，=AGENTS.md= 里它是第 11 条），第 12 / 13 条与 =AGENTS.md= 同号，*第 14 条对应 =AGENTS.md= 第 15 条*、*第 15 条对应 =AGENTS.md= 第 16 条*；=AGENTS.md= 第 14 条「清单写盘必须经 =ebasecamp-manifest--write-transaction=」在本表内没有对应行（该要求写在下文「清单写盘」节的正文里）。
 
 | # | 不变量 | 违反后果 |
 |---+--------+----------|
@@ -199,6 +199,7 @@ ebasecamp 是 Emacs 里的 Docker 环境分组管理插件。v0.2 起，模型�
 | 12 | UI buffer 必须只读（=ebasecamp-ui-mode= 派生 =special-mode= + =buffer-read-only t=），最外层 Host 用 =:key-scope 'local= 吞未绑定 printing key；写只经界面表单（=S= / =E= / =M= / =X=）或 =e= 打开的 *组定义实际所在* 的清单文件（按组名跨文件定位，=groups.el= 与 =projects/*.el= 皆可；定位失败退 =groups.el= → 第一个项目文件，只 =message= 不 signal），两者都经 =ebasecamp-manifest--write-transaction= | 界面能打字 → 改动无处落地且误导；写能力脱离清单文件 |
 | 13 | UI 样式不得硬编码色值 —— 只允许出现在 palette / token 定义区与 =defcustom= 默认值，render 区一律走 =etaf-theme-token= | 硬编码色值在暗色主题下发白（v0.3 前的实际问题），且无法随 =load-theme= 切换 |
 | 14 | 预校验与派发必须用 *同一个* =--project-directory= 基准（都由 =ebasecamp-command--preflight= / =--dispatch= 从同一个项目对象的 =:root= 推导） | 校验按缓存目录、启动按项目 root（或反之）→ 重现「校验过、启动炸」：=config -q= 通过而 =create= 报 =bind source path does not exist= |
+| 15 | 项目 =:root= *可选*：为 nil 时不参与目录定位、不作路径基准（派发不带 =--project-directory=、相对 =file:= 预校验只给 warning）、导出须显式选路径（无 =:root= 无 =:export-file= 时交互式 =read-file-name=、非交互报错）；写盘 =update-project= 清空须用 =clear-root=（键真删，不留 =:root nil=） | 把 nil 当「不改」以外的东西 → 只改 =:title= 就删掉 root；写成 =:root nil= → =plist-member= 判定把「键存在」与「无根目录」混淆；让 nil 参与定位 → 所有无 root 项目争同一个「最长前缀」 |
 
 第 5 条的三个 flag 缺一不可，缺 =--no-interpolate= 时退出码仍为 0（静默失败），因此只能靠代码审查 + 密钥断言测试守住。
 
@@ -354,7 +355,7 @@ etaf *没有* 「跳到某个 group」的 API，可用的是 =etaf-focus-within=
 =ebasecamp-ui--project-for-directory= 按「最长 =:root= 前缀」找当前目录所属项目，三条要点：
 
 - *双归一*：DIR 与每个项目 =:root= 都先 =expand-file-name= 再 =file-truename=，然后统一成 =file-name-as-directory= 形态 —— =~=、=..=、软链因此等价，且只匹配 *整段目录*（=/tmp/a2= 不会被 root =/tmp/a= 命中）。
-- *大小写敏感*：=string-prefix-p= 不传第三参数也不绑 =case-fold-search=（=/tmp/A= 与 =/tmp/a= 是两个目录）。多个命中时取 root *最长* 者（=/a/b/c= 同时命中 =/a/b= 与 =/a= 时取 =/a/b=）；=:root= 为空串或目录不存在时跳过。
+- *大小写敏感*：=string-prefix-p= 不传第三参数也不绑 =case-fold-search=（=/tmp/A= 与 =/tmp/a= 是两个目录）。多个命中时取 root *最长* 者（=/a/b/c= 同时命中 =/a/b= 与 =/a= 时取 =/a/b=）；=:root= 为 *nil*（无根目录项目，v0.5.3 起写盘与界面均支持）、为空串、或目录不存在时 *跳过*。
 - *「第一份配置」的顺序契约*：按 =ebasecamp-model-groups= 的组顺序、组内 =:configs= 顺序，取首个 =:project= 命中的配置所在组 —— 只由清单的组定义顺序决定，不看项目 =groups= 槽（物化产物里也有该组，但物化顺序不是契约）。
 - *无匹配不选中*：命中不到项目、或该项目没有配置时，保持既有「无选中组」态（右栏显示「选择左侧的组」），*不是* 回退到第一个组 —— 自动选中会删掉未选中态。
 - *只算一次*：定位只在 =ebasecamp-ui-open= 建会话时算，=ebasecamp-ui-refresh= / =g= 都不覆盖用户手选的组；关闭后重开才重算。
@@ -465,8 +466,9 @@ compose -f FILE [--project-directory ROOT] -p NAME <subcmd> ...
 - *为什么需要注入*：生成物在 =<cache>/<project>/= ，而清单里的相对路径（顶层 =configs= / =secrets= 的 =file:=、以 =.= 开头的 =volumes= 源、=env_file=）属于 *项目根*；不注入时 docker 一律按生成物目录解析（探针 T3 实测 =configs.<n>.file= 被解析成缓存路径），缺失只在容器创建阶段以 =bind source path does not exist= 暴露；
 - *ROOT 从哪来*：=--preflight= 与 =--dispatch= 都取 =ebasecamp-command-run= 里的 *同一个* 项目对象（=ebasecamp-command--project=），即 *触发本次操作的项目*；=ebc-shared= 生成物也用它的 root —— shared 配置的 =:project= 只是渲染上下文，不参与推导；
 - *与预校验同基准*：=ebasecamp-docker-check-compose (FILE &optional ROOT)= 注入同一个 flag，否则重现「=config -q= 通过、=create= 炸」（不变量 14）；
+- *=:root= 为 nil 时的三条回退*（v0.5.3，不变量 16）：①本函数 =ROOT= 为 nil 分支 ⇒ *派发参数不含* =--project-directory=，退回「按生成物目录解析」的旧基准；②=--missing-file-declarations= 对相对 =file:= *只记 =:preflight-warnings=*（不判缺失、不失败），UI 在成功提示末尾追加「（N 条预校验警告）」；③导出走 =ebasecamp-export--target-or-prompt= —— 无 =:root= 也无 =:export-file= 时交互式弹 =read-file-name=、非交互仍 signal，且 =--relative-path-notice= 在 root 为 nil（或目录不存在）时不提示。三条都只是「没有基准时的降级」，*不* 改变「=:root= 是相对路径唯一基准」的语义（设计见 ADR-0008）；
 - *副作用*：注入后 docker 会读取 =<root>/.env=（compose 默认行为，探针补证 5），其中的变量参与生成物解析；插件既不读取也不写该文件；
-- *不注入的两处*：=ebasecamp-import.el= 读的是 *用户项目自身* 的 compose 文件，其所在目录即项目根，基准本就正确（ADR-0007 记明该理由）；=ebasecamp-export.el:209= 的 =check-compose= 不传 root —— 导出目标由用户选定，只影响 =env_file= 相对路径的判定基准（记入技术债，导出物中顶层 =configs.file= 的相对路径在非项目根目录下同样失效）。
+- *不注入的两处*：=ebasecamp-import.el= 读的是 *用户项目自身* 的 compose 文件，其所在目录即项目根，基准本就正确（ADR-0007 记明该理由）；=ebasecamp-export.el= 的 =check-compose= 也 *不传 root* —— 导出目标由用户选定，校验基准 = *导出文件所在目录* = 部署基准（v0.5.3 技术债 #35 按此结论处置：不改基准，改为在「导出目录 ≠ 项目 root 且 root 真实存在」时 =message= 一次提示，见 =ebasecamp-export--relative-path-notice=）。
 
 ** 启动前预校验（=ebasecamp-command--preflight=）
 

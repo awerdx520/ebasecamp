@@ -1,0 +1,102 @@
+#+title: ADR-0008 项目 :root 可选（写盘 / 界面 / 导出三处放开）
+#+date: 2026-10-26
+#+status: 已接受（Accepted）
+
+* 背景
+
+v0.5.2 把项目 =:root= 从「打开界面时定位用」提升为 *相对路径的解析基准* ：派发与预校验统一注入根级 flag =--project-directory <项目 root>= （ADR-0007 决策 2），顶层 =configs= / =secrets= 的 =file:= 存在性按该 root 判定（ADR-0007 决策 3）。同一批改动里就写明了「 =:root= 为 nil 是模型允许的状态」，三处都已按「无 root」分支实现：
+
+- =lisp/ebasecamp-model.el= 只在 *非 nil* 时校验 =:root= 的类型；
+- =ebasecamp-command-compose-args= 在 =ROOT= 为 nil 时 *不注入任何占位* ，参数序列退回 v0.5.1 形态；
+- =ebasecamp-command--missing-file-declarations= 在 =ROOT= 为 nil 且存在相对 =file:= 时 *只记一条 =:preflight-warnings=、不判缺失* （不阻塞启动）。
+
+于是出现一处明确的能力落差： *运行期已经完整支持「无根目录项目」，三个入口却都还堵着* 。
+
+- *写盘层* ： =ebasecamp-config-write--check-root= 的判据是「非空字符串」， =ebasecamp-config-write-add-project= 传 nil 被直接拒（实测原文案「项目 newproj 的根目录必须是非空字符串，得到 nil」）； =ebasecamp-config-write-update-project= *没有清空手段* —— 已经写了 =:root= 的项目永远无法取消该键，只能改成另一个非空值。
+- *界面层* ：新建 / 改项目的 root 走必填的 =ebasecamp-ui--read-name= ，空输入即 =user-error= ，界面因此不可能创建无根目录项目。
+- *导出层* ： =ebasecamp-export-default-file= 在「无 =:root= 且无 =:export-file= 」时 signal =ebasecamp-export-error= ，而 =ebasecamp-export--target= 没有 prompt 分支 —— 无 root 项目 *没有任何交互式导出路径* ，只能在 batch 里显式传 =:file= 。
+
+触发场景很具体：导入产生的项目自带 root（导入层取 compose 文件父目录，恒非 nil），但 *手写清单、从别处拷来的项目、以及「只想把几个服务挂起来跑、暂不关心部署路径」的项目* 不该被迫填一个假路径。要么允许留空，要么用户会填一个不存在的目录 —— 后者更糟：它会成为派发基准，把相对路径解析到一个空目录里。
+
+* 决策
+
+** 1. 写盘层： =:root= 可为 nil，清空必须让键消失（ =clear-root= ）
+
+- =ebasecamp-config-write--check-root (PROJECT ROOT)= 判据改为「 *nil，或去首尾空白后非空的字符串* 」（ =lisp/ebasecamp-config-write.el:1374= ）。 *空串与纯空白仍然拒绝* ：它们是「填了但填错」，与「有意不填」（nil）是两种意图，混为一谈会让用户的手误静默变成无根目录项目。
+- =ebasecamp-config-write-add-project (NAME TITLE ROOT)= 改为 =(when root (--check-root project root))= ：ROOT 为 nil 时 *不写 =:root= 键* 。渲染层零改动 —— =--project-form= 的 =:root= 分支本就 =(when root … push)= ，nil 时不产生该行，文件里出现的只有 =(ebasecamp-define-project x :title "…")= 。
+- =ebasecamp-config-write-update-project (NAME TITLE ROOT &optional CLEAR-ROOT)= 新增第 4 参：
+  - =CLEAR-ROOT= 非 nil → 从项目 plist 里 *真正移除* =:root= 键；
+  - =CLEAR-ROOT= nil 且 =ROOT= 非 nil → 现状行为（ =plist-put= ）；
+  - 两者都 nil → 不改 root（现状），因此「只改 =:title= 」不会误删 root；
+  - *两者同时非 nil → =user-error=* （参数互斥，不静默偏向任一方）。
+- *互斥校验与 =--check-root= 都放在 =ebasecamp-manifest--write-transaction= 之前* （二者都是 =ebasecamp-config-write-update-project= 函数体内的 =when= 语句：先 =user-error= 判 ROOT 与 CLEAR-ROOT 互斥，再调 =--check-root= ，之后才是 =--write-transaction= 调用。 *本 ADR 不记函数内部语句的行号* —— 语句位置随函数增删漂移，记了反而误导；定位语句请按符号名在本函数内检索）—— 放进事务 lambda 会变成「先备份、先写盘、再 signal 回滚」，多一次无谓写盘且会在备份目录留下垃圾。
+- *清空用 =plist-remprop= 语义* ：新增内部助手 =ebasecamp-config-write--plist-remove (PLIST KEY)= （ =:1386= ），返回去掉该键的 *新* plist 并保持其余键顺序。 *不得* =plist-put … nil= —— =:root nil= 会让「键存在但值空」与「键不存在」两种形态并存，后续任何 =plist-member= 判定都会误判（v0.5.2 的 =:groups nil= 是同一个坑）。不用破坏性的 =plist-remprop= 是因为 =--form-plist= 的返回值会被「相等则不写盘」的比较复用。
+
+** 2. 界面层：空输入 = nil，后果写进 prompt 文案
+
+- 新增 =ebasecamp-ui--read-optional-path (PROMPT &optional INITIAL)= （ =lisp/ebasecamp-ui.el:2021= ）： =string-trim= 后为空 → nil，否则返回 trim 后的字符串。与 =ebasecamp-ui--read-name= 的「空即 =user-error= 」形成刻意对照，两者 docstring 互相引用；同样 *不做* =expand-file-name= 、不访问文件系统（清单只保存引用，不变量 6）。
+- *新建项目* ：root 改用 =--read-optional-path= 。后果说明写在 *prompt 文案里* （「项目根目录（可留空；留空则不参与目录定位、导出需显式选路径）：」），让用户在输入前就看得到。 *刻意不用 =message=* ：写操作成功后 =--after-write= 先发 success notice 再 =ebasecamp-reload= ， =message= 会被覆盖成一闪而过。
+- *改项目* ：root 同样改 =--read-optional-path= ；输入为空且项目 *原本有* root → 先 =--confirm= 「清空项目 X 的 :root？…」再传 =CLEAR-ROOT= t（ =--confirm= 答 no 自带 =user-error= ，写盘零调用）；项目 *原本无* root 且输入为空 → *不弹确认* 、 =CLEAR-ROOT= 传 nil（幂等：否则每次只改 =:title= 都要被问一次）。
+- =--read-name= 不动：配置名、组名、新标题等实体名仍必填。
+
+** 3. 导出层：无 root 无 =:export-file= 时交互式选路径，校验基准仍是导出目录
+
+- 新增 =ebasecamp-export--target-or-prompt (PROJECT FILE)= （ =lisp/ebasecamp-export.el:97= ）， *四步精确前置判定* ：(1) =FILE= 非 nil → 展开；(2) 有 =:root= 或有 =:export-file= → =ebasecamp-export-default-file= （它 signal 就让它 signal，文案不变）；(3) 两者都无且 =(ebasecamp-export--prompt-p)= 为真 → =read-file-name= 从 =default-directory= 起选、默认名 =ebasecamp-export--default-file-name= ；(4) 其余（两者都无且 *非交互* ）→ 仍调 =default-file= 由它 signal 原文案「既没有 :root 也没有 :export-file」。
+- *不用 =condition-case= 捕获 =ebasecamp-export-error= 来「探测是否需要 prompt」* ：宽捕获会把 =default-file= 将来新增的任何错误都误判成「需要 prompt」，把真实缺陷藏进交互提问里。判据必须是 *前置事实* （有没有 root / 有没有 export-file），不是 *错误发生过* 。
+- =ebasecamp-export-project= 用 =--target-or-prompt= 取代 =--target= ；原 =--target= 已 *删除* （批次 5.3 代码审查后清理：仓库内零调用方、 =test/= 零引用，故为死代码）。 *修订说明* ：本 ADR 初版写「 =--target= 保留（纯语义函数，供既有调用与测试）」，与事实不符 —— 当时已无任何调用方，属记录错误，v0.5.3 收尾时改正并删除该函数。
+- *校验基准保持「导出文件所在目录」* ： =ebasecamp-export--write= 调 =ebasecamp-docker-check-compose= 时 *仍不传 root* 。理由见否决项 ②。
+- 新增 =ebasecamp-export--relative-path-notice (PROJECT TARGET)= （ =:127= ）：先判 =(file-exists-p root)= ，root 为 nil 或目录不存在 → 返回 nil；否则用 =file-truename= + =file-name-as-directory= 把导出目录与 root 归一等价比较，不等价时返回一条提示串， =--write= 在 =rename-file= 成功后 =message= 一次。 *返回值与导出成败都不变* 。
+
+* 否决项
+
+** ① 用 `root = nil` 表示「清空 `:root`」
+
+=update-project= 既有契约是「 =ROOT= 为 nil ⇒ 不改 root」（正是靠这条，只改 =:title= 时才不会顺手删掉 root）。把 nil 重定义为「清空」会让 *所有既有调用点* 语义反转 —— 写盘层内部调用、测试、以及任何脚本式调用（ =ebasecamp-config-write-update-project 'app "应用" nil= ）都会突然开始删键，而调用方完全看不出这一点。改为 *新增互斥的 =CLEAR-ROOT= 参数* ：清空变成一个必须显式写出来的意图，且「nil = 不改」的契约逐字保留。
+
+** ② 让导出校验改传项目 root，使「校验通过」
+
+=--write= 里 =check-compose= 的基准 *必须* 与部署时的基准一致，而部署时相对路径由 *导出文件所在目录* 解析 —— 用户把生成物拷到目标机器上的哪里，基准就在哪里。若为让校验通过而改传项目 root，就会得到「插件说校验通过、部署时炸」：这正是 ADR-0007 决策 2 刚堵掉的同一条静默通路（T2 / 补证 1 实测 =config -q= 只校验 =env_file= ，顶层 =configs.file= 的缺失要到 =create= 阶段才报）。因此选择「保持导出目录基准 + 给一条可读提示」，让用户自己判断相对路径是否随生成物一同部署；导出物里顶层 =configs.file= 在非 root 目录下同样失效，这一点由提示句覆盖，不假装校验通过。
+
+* 后果
+
+** 无根目录项目的三条降级（ =:root= 为 nil 时）
+
+1. *不参与项目定位* ： =ebasecamp-ui--project-for-directory= 对 =:root= 为 nil（或空串、或目录不存在）的项目直接跳过，因此从该项目目录里 =M-x ebasecamp= 不会自动选中它的配置 —— 「无 root」就是「不知道它在哪个目录」，不该猜。
+2. *不作路径基准* ：派发不带 =--project-directory= ，生成物里的相对路径退回「按 compose 文件（缓存目录）解析」的历史行为；预校验对相对 =file:= 只记 =:preflight-warnings= （成功提示末尾追加「（N 条预校验警告）」）， *不失败* 。真正的缺失要到容器创建阶段以 =bind source path does not exist= 暴露。
+3. *导出必须显式选路径* ：无 =:root= 且无 =:export-file= 时交互式弹 =read-file-name= ；非交互调用仍 signal 原文案（脚本必须自己传 =:file= ，否则无从推导）。
+
+** 正面
+
+- *「模型允许、入口不放」的落差消除* ：无根目录项目可以被创建、被改名、被导出，也能被 *清空回* 无根目录状态；写盘层与运行期口径一致，不再出现「文档说可选、界面必填」。
+- *清空是显式意图* ： =CLEAR-ROOT= + 二次确认 + 键真正消失，三件套让「删 root」既不误触也无可歧义。
+- *导出不再有死路* ：无 root 项目在界面里也能导出，路径由用户当场决定。
+- *校验基准与部署基准对齐* ：提示只提示、不改变成败，避免为了「让校验过」而制造新的静默通路。
+
+** 负面
+
+- *写盘层参数变多* ： =update-project= 从 3 参变 4 参，多一条互斥校验；调用方必须理解「ROOT 与 CLEAR-ROOT 不是同一个开关」。
+- *无 root 项目的相对路径事实上不可校验* ：warning 只是「我判不了」，用户可能忽略最后那条计数提示，把失败推迟到 =create= 阶段（与 v0.5.2 相比这是 *退化* ，只是把「硬失败」换成了「可用的降级」）。
+- *导出基准分叉的提示是 best-effort* ：只在 root 真实存在且导出目录 ≠ root 时出现；root 指向尚未创建的目录时静默不提示（见「已知边界」）。
+
+** 已知边界
+
+- *=--relative-path-notice= 在 root 为 nil 或目录不存在时不提示* ：清单里的 root 可能指向尚未创建的项目目录，此时 =file-truename= 对它只做尾部分规范化，与已 =make-directory= 的导出目录比较会 *恒判不等价* ，于是每次导出都误报一条提示 —— 高频噪声会把真正需要注意的场景淹掉。宁可漏报这一种（root 不存在时其实也无从谈「部署基准」）。
+- *无 root 但 =:export-file= 为相对路径时按 =default-directory= 展开* ：这是 =ebasecamp-export-default-file= 的既有语义（root 为 nil ⇒ 以 =default-directory= 为基准），本期 *未改* 。因此「有 =:export-file= 、无 =:root= 」的项目导出到 *调用时的当前目录* ，而不是项目目录 —— 文档里写明，避免用户以为它按项目 root 展开。
+- *=--prompt-p= 在 batch 下恒为 nil* ： =(and (not noninteractive) …)= 使「交互式」在 =emacs -Q --batch= 里永假。任何「交互式才 prompt」的用例必须 =cl-letf= 打桩该函数，绑 =ebasecamp-export--interactive= 或 =called-interactively-p= 都无效。
+- *界面新建项目不校验目录是否存在* ： =--read-optional-path= 不做 =expand-file-name= 、不访问文件系统（清单只保存引用），因此填一个不存在的路径是合法的 —— 它会成为派发基准，缺失要到容器创建阶段才暴露。这是不变量 6 的直接后果，不是新增缺陷。
+
+** 不变量
+
+=AGENTS.md= 新增 *不变量 16* （本次一并落地）：
+
+#+begin_quote
+项目 =:root= 可选：为 nil 时不得参与项目定位（ =ebasecamp-ui--project-for-directory= 跳过）、不得作为路径基准（派发不带 =--project-directory= ，预校验对相对 =file:= 只给 warning 不失败）、导出必须显式选路径（无 =:root= 且无 =:export-file= 时交互式弹 =read-file-name= ，非交互仍报错）。写盘层 =add-project= 接受 nil、 =update-project= 用 =clear-root= 显式清空（ =:root= 键真删，不得留 =:root nil= ），空串与纯空白仍拒。
+#+end_quote
+
+* 状态
+
+*已接受* （2026-10-26，0.5.3）。
+
+实现记录与逐批次实测（红 / 绿灯证据、用例分摊、与计划的偏差）见 =openspec/completed/2026-10-26-project-root-optional.md= 的「批次 1 记录」～「批次 5 记录」；其中批次 4.1 用 =/tmp= 隔离清单 + =emacs -Q --batch= 脚本做了真实 docker 闭环（37 条断言 0 失败，唯一真实 docker 调用是 =compose config -q= ），批次 4.3 修掉了目检暴露的界面 scope 类型缺陷（与本 ADR 的 =:root= 主线无关，但同批次落地）。测试基线 436 → 452（批次 1 +6 / 批次 2 +5 / 批次 3 +3 / 批次 4.3 +2）。
+
+引用：ADR-0004（项目 =:root= 与项目定位 —— 本 ADR 决策 2 的「root 为 nil 跳过」是其定位规则的延伸）、ADR-0005（清单写盘 —— 决策 1 的 =clear-root= 复用其局部写盘 + 事务内核，互斥校验置于事务之前）、ADR-0006（跨文件定位与预校验口径）、ADR-0007（路径基准 =--project-directory= 与顶层 =configs= / =secrets= 文件存在性 —— 本 ADR 决策 3 明确 *不* 为导出改基准，沿用其否决项 D 的同一理由）、ADR-0001（分层与同步模型 —— =:root= 的放开落在 model 允许的既有自由度内，不新增槽）。相关技术债：[[file:../../openspec/tech-debt.md][#35]]（导出场景路径基准 —— 本 ADR 以「保持导出目录基准 + 提示」处置）、[[file:../../openspec/tech-debt.md][#36]]（相对 =volumes= source 未检查）、[[file:../../openspec/tech-debt.md][#40]]（预校验警告的展示无单测）。
