@@ -2,6 +2,26 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/) 与 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式。
 
+## [0.6.0] - 2026-10-26
+
+界面从「功能都在，但看不见也走不到」补齐到可发现、可达：按钮上直接显示键、vim 手感的方向导航、按一个键跳到任意可见的组 / 配置 / 服务行。三处改动都 *没有* 引入新的强制依赖（avy 是可选依赖，未装时自动降级）。
+
+### 新增
+
+- **底栏与段头按钮直接显示键提示**：`导入 compose` / `导出 compose` / `销毁环境` 变成 `[I] 导入 compose` / `[o] 导出 compose` / `[D] 销毁环境` ，段头三个按钮变成 `[s] 启动选中` / `[x] 停止选中` / `[r] 重启选中` 。提示与 `?` 帮助 *同源*：键位的唯一事实源仍是根级 / 段级两张键表，新增的 `ebasecamp-ui--button-key-hints` 只作渲染索引，测试断言「键必须存在于键表」+「键表 LABEL 按序包含按钮文案」。
+- **`j` / `k` 移动焦点、`h` / `l` 在树内折叠展开**：`j` / `k` 只移动焦点，*选中组不变*（换组仍是 `n` / `p` ）；`h` / `l` 走 `etaf-tree` 既有的 `:on-direction` 折叠逻辑，到边界才落回焦点左移 / 右移。四个键都以零参命令转交 etaf 的方向链路（不设 `etaf-set-direction-scheme 'vim` 那个全局方案）。
+- **`f` 跳转到组 / 配置 / 服务行**：有 avy 时按提示字母选；未装 avy 时降级 `completing-read` 列表。只跳 *可见* 目标（视口外、未展开的条目不在候选里，全不可见时只提示不移动）。跳转期间暂停 3 秒状态轮询、跳完恢复（只在原本运行中时恢复），`f` 只搬焦点、不改选中组、不切换勾选。
+
+### 修复
+
+- **勾选列定位改用 ref 自校验**：测试助手原先用裸 `search-forward "["` 找勾选列，键提示引入 `[s]` / `[x]` 之后会先命中段头按钮提示，`--checkbox-ref-at-point` 解出 nil（既有用例 `checkbox-refs-are-stable` / `spc-activates-checkbox` 变红）。只认 mark 字形也不行 —— `[x]` 同时是勾选态 mark 与「停止选中」的键提示。现在逐个尝试 `[ ]` / `[x]` 候选并用 ref 自校验，与按钮文案彻底解耦。
+- **`f` 的跳转类型判别改用事实源，不再猜 key 前缀**：`--target-position` 原按 `group/` / `config/` 前缀判断「树 key 还是服务行 key」，而组名只受 `[a-z0-9_-]` 约束、没有保留字 —— 组名叫 `group` 或 `config` 时，它的服务行 key（如 `config/redis`）会被误判成树 key，跳转静默失效。改为「key 是否属于当前可见树 key 集合」，并从行 ref 定位里抽出 `--target-row-position` 使两条路径各自可测。
+
+### 变更
+
+- **测试基线 468 → 481**（批次 1 按钮键提示 +4 / 批次 2 hjkl +2 / 批次 3 avy 跳转 +5 / 批次 4.4 补测 +2）。`root-keys-complete` / `root-keys-final-set` 的精确集合与长度随批次同步 16 → 20 → 21，未放宽成「包含」断言。
+- **文档**：新增 `docs/adr/0010-ui-observability.org`；`Readme.org` / `docs/user-guide.org` 键位表补 `f` / `j` / `k` / `h` / `l` 与按钮方括号提示；`docs/architecture.org` 补「键位来源：事实源 → 渲染索引 → 按钮文案」与勾选列 ref 自校验；`docs/troubleshooting.org` 同步陈旧计数与吞键说明。
+
 ## [0.5.4] - 2026-10-26
 
 修掉一处**静默改配置内容**的缺陷：顶层 `configs` / `secrets` 的 inline 多行 `content:` 经「导入 → 渲染」后被折叠成单行，而 `docker compose config -q` 照样 exit 0 —— 校验通过但内容已变，直到容器启动读到被压平的 nginx.conf / 私钥片段才暴露。多行字符串现在走 YAML 块标量保真往返。

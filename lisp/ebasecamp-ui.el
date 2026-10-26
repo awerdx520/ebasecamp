@@ -1,7 +1,7 @@
 ;;; ebasecamp-ui.el --- ebasecamp 只读主界面（etaf / etaf-ui） -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.5.4
+;; Version: 0.6.0
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 
@@ -1342,25 +1342,48 @@ GROUP-NAME 为组名（段内 key 的组部分）。列 `:key' 用关键字，�
 ;; compose / 导出 compose / 销毁环境三个 ghost 按钮。三者都不是生命周期动作，
 ;; 故**不参与** busy 判定（busy 期间仍可点）；销毁的危险性由二次确认
 ;; （`ebasecamp-ui-confirm-dialog'）承担。
+;;
+;; 按钮文案里的键提示（v0.6）：键名由调用方显式传入，`label' 参数值保持不变
+;; ——「文案」与「键名」分离，`--goto-section' 之类按文案定位的代码不受影响。
 
-(defun ebasecamp-ui--footer-button (label function)
-  "返回底栏按钮：文案 LABEL，按下调用 FUNCTION。纯视图，不参与 busy 判定。"
+(defconst ebasecamp-ui--button-key-hints
+  '(("导入 compose" . "I")
+    ("导出 compose" . "o")
+    ("销毁环境" . "D")
+    ("启动选中" . "s")
+    ("停止选中" . "x")
+    ("重启选中" . "r"))
+  "按钮文案 → 键名的索引，供按钮渲染显示键提示。
+这是**渲染索引**，键位的唯一事实源仍是 `ebasecamp-ui--root-keys' /
+`ebasecamp-ui--section-keys'；测试断言两边的 KEY 一致、且命中条目的 LABEL
+按序包含按钮文案（底栏两者逐字相同，段级键表在文案里插入了「该段」：
+`启动选中' → `启动该段选中'）。新增带键按钮时必须同步此表。")
+
+(defun ebasecamp-ui--button-label (label key)
+  "给按钮文案 LABEL 加键提示前缀 `[KEY] '；KEY 为 nil 时原样返回 LABEL。"
+  (if key (format "[%s] %s" key label) label))
+
+(defun ebasecamp-ui--footer-button (label function &optional key)
+  "返回底栏按钮：文案 LABEL，按下调用 FUNCTION。纯视图，不参与 busy 判定。
+KEY 非 nil 时文案前置键提示（`[I] 导入 compose'）；为 nil 时输出与原 LABEL
+逐字节一致，只传两参的既有调用方行为不变。KEY 只是显示用的渲染参数，
+**不**在这里绑定按键（键位的唯一事实源是 `ebasecamp-ui--root-keys'）。"
   (etaf-view
    (etaf-button
-    :label label
+    :label (ebasecamp-ui--button-label label key)
     :variant 'ghost
     :on-press (lambda () (funcall function)))))
 
 (defun ebasecamp-ui--footer-view ()
-  "返回主界面底栏：导入 compose / 导出 compose / 销毁环境。"
+  "返回主界面底栏：导入 compose / 导出 compose / 销毁环境（各带键提示）。"
   (etaf-view
    (row :width 'stretch :cross-align 'center :item-gap '(ch 2)
      (expr (ebasecamp-ui--footer-button
-            "导入 compose" #'ebasecamp-ui-import-compose))
+            "导入 compose" #'ebasecamp-ui-import-compose "I"))
      (expr (ebasecamp-ui--footer-button
-            "导出 compose" #'ebasecamp-ui-export-compose))
+            "导出 compose" #'ebasecamp-ui-export-compose "o"))
      (expr (ebasecamp-ui--footer-button
-            "销毁环境" #'ebasecamp-ui-destroy-environment)))))
+            "销毁环境" #'ebasecamp-ui-destroy-environment "D")))))
 
 (defun ebasecamp-ui--confirm-message (project)
   "返回销毁 PROJECT 的确认文案：点名项目、不删卷、shared 组不受影响。纯函数。"
@@ -1510,15 +1533,19 @@ SCOPE 为 scope 字符串（如 \"per-project\"）。"
              (ebasecamp-ui--conflict-summary soft)))
           (ebasecamp-ui--dispatch session action project keys)))))))
 
-(defun ebasecamp-ui--section-button (label action variant instance disabled)
+(defun ebasecamp-ui--section-button (label action variant instance disabled
+                                          &optional key)
   "返回段内生命周期按钮：文案 LABEL、语义 VARIANT，按下对 INSTANCE 派发 ACTION。
 INSTANCE 为 state 的段项 plist（`:config' / `:project' / `:records'）—— 按钮
 只绑定该段自己的项目。
 DISABLED 为真时禁用 —— `etaf-button' 的 `:disabled' 只接受布尔值，调用方
-必须在渲染期从 busy ref 取当前值传入（不能传 ref 对象）。"
+必须在渲染期从 busy ref 取当前值传入（不能传 ref 对象）。
+KEY 非 nil 时文案前置键提示（`[s] 启动选中'）；为 nil 时输出与原 LABEL 逐字节
+一致。KEY 只是显示用的渲染参数，键位仍由段 Host 的 `:keys'（见
+`ebasecamp-ui--section-keys'）绑定。"
   (etaf-view
    (etaf-button
-    :label label
+    :label (ebasecamp-ui--button-label label key)
     :variant variant
     :disabled (and disabled t)
     :on-press (lambda () (ebasecamp-ui--section-action action instance)))))
@@ -1539,11 +1566,11 @@ DISABLED 为真时禁用 —— `etaf-button' 的 `:disabled' 只接受布尔值
                      :variant (ebasecamp-ui--ratio-variant running total)))
        (row :width 'stretch :cross-align 'center :item-gap '(ch 1)
          (expr (ebasecamp-ui--section-button
-                "启动选中" 'start 'primary instance disabled))
+                "启动选中" 'start 'primary instance disabled "s"))
          (expr (ebasecamp-ui--section-button
-                "停止选中" 'stop 'secondary instance disabled))
+                "停止选中" 'stop 'secondary instance disabled "x"))
          (expr (ebasecamp-ui--section-button
-                "重启选中" 'restart 'secondary instance disabled)))))))
+                "重启选中" 'restart 'secondary instance disabled "r")))))))
 
 (defun ebasecamp-ui--service-table (session group-name instance)
   "返回段的服务表：列见 `ebasecamp-ui--columns'，行为实例的 `:records'。
@@ -2448,6 +2475,247 @@ REGION 取 `tree'（左树）/ `detail'（右栏）/ `footer'（底栏），映�
   (interactive)
   (ebasecamp-ui--focus-region 'footer))
 
+;; vim 方向导航（v0.6 批次 2，计划「设计决策 B」）。`:keys' 的 COMMAND 槽要求
+;; `commandp' + 零参调用（框架按 `call-interactively' 分发），而 `etaf-direction'
+;; 带 `(interactive)' 且会 `completing-read' 询问方向（`etaf-keys.el' 的
+;; `:direction' 分支），因此**不能**直接绑进键表 —— 按键时会弹一个方向提示。
+;; 折中：一个非交互 helper 承载方向，四个零参命令薄包装。
+;;
+;; `h' / `l' 在树内会先被 `etaf-tree' 分支节点的 `:on-direction' 消费
+;; （`right' 展开、`left' 收起，均返回 `handled'），到边界（已展开按 `right' /
+;; 已收起按 `left'）才 `release' 回落到焦点移动 —— 这是框架既有语义，插件侧
+;; **不重复实现折叠**，也不设 `etaf-set-direction-scheme 'vim'`（全局变量，
+;; 与已有 Host 键位冲突即 `user-error'）。
+
+(defun ebasecamp-ui--move-focus (direction)
+  "把焦点按 DIRECTION（`up' / `down' / `left' / `right'）移动一格。
+非交互 helper：`:keys' 的 COMMAND 槽只接受零参命令，故由下面四个包装调用。
+`left' / `right' 会先由 `etaf-tree' 的 `:on-direction' 消费（折叠/展开），
+到边界才落回焦点移动 —— 这是框架既有语义，不要在这里重复实现折叠。
+返回移动后的 Host ref；无处可移时返回 nil（例如已收起的分支上再按 `left'
+且左侧没有可进入的区域）。"
+  (etaf-direction direction))
+
+(defun ebasecamp-ui--move-focus-down ()
+  "焦点下移一格（`j'）。语义见 `ebasecamp-ui--move-focus'。"
+  (interactive)
+  (ebasecamp-ui--move-focus 'down))
+
+(defun ebasecamp-ui--move-focus-up ()
+  "焦点上移一格（`k'）。语义见 `ebasecamp-ui--move-focus'。"
+  (interactive)
+  (ebasecamp-ui--move-focus 'up))
+
+(defun ebasecamp-ui--move-focus-left ()
+  "折叠焦点所在的分支（`h'）；已收起时焦点左移一格。
+树内由 `:on-direction' 消费，见 `ebasecamp-ui--move-focus'。"
+  (interactive)
+  (ebasecamp-ui--move-focus 'left))
+
+(defun ebasecamp-ui--move-focus-right ()
+  "展开焦点所在的分支（`l'）；已展开时焦点右移一格。
+树内由 `:on-direction' 消费，见 `ebasecamp-ui--move-focus'。"
+  (interactive)
+  (ebasecamp-ui--move-focus 'right))
+
+;; avy 跳转（v0.6 批次 3，计划「设计决策 C」）。`f' 把组 / 配置 / 服务行收集成
+;; 候选，每个候选映射到 buffer 位置后交给 avy 显示字母提示；avy 未安装时降级
+;; `completing-read'。三个环节各自成函数，便于测试打桩：
+;; `--avy-targets'（纯函数，只读 state）→ `--target-position'（位置解析，唯一
+;; 碰 buffer 的地方）→ `--jump-to'（goto + 焦点）。
+;;
+;; 位置解析为什么分「树项」与「服务行」两条路：服务行有显式 ref（`--row-ref'，
+;; 由 key 派生），可直接 `etaf-runtime-host-node' 取节点；树项**没有** ref ——
+;; `etaf-tree' 是 etaf-ui 组件，不为条目生成 ref，因此按渲染顺序把「可见条目
+;; key」与「树 Host 内的按钮节点」一一对齐是唯一不依赖文本的办法（探针实测：
+;; 窄栏里树标签会被截断，截断后的绘制区间还会与右栏文本粘连，按文本匹配不可靠）。
+;;
+;; avy 是**可选依赖**：`--avy-available-p' 是唯一的判定入口，测试据此打桩，
+;; 不要求 `make test' 的 load-path 里有 avy。
+
+(declare-function avy-process "avy" (candidates &optional overlay-fn cleanup-fn))
+
+(defun ebasecamp-ui--avy-available-p ()
+  "判断 avy 是否可用（可选依赖）。未安装时返回 nil，调用方降级为 `completing-read'。"
+  (and (require 'avy nil t) t))
+
+(defun ebasecamp-ui--avy-targets ()
+  "返回跳转候选 `((NAME . KEY) …)`：组、配置、服务行。
+只读会话 state，**不访问 buffer**（位置解析在 `ebasecamp-ui--target-position'）。
+NAME 是给 `completing-read' 与字母提示看的人类可读名：组用组名，配置用
+\"组名/配置名\"（跨组同名配置不混淆），服务行用段内 key \"组名/服务名\"。
+KEY 是跳转身份：组 / 配置为树 key（`--group-key' / `--config-key'），服务行为
+`--instance-key'（位置解析据此派生行 ref）。
+同组多份配置下的同名服务共享同一个 key（见 `ebasecamp-ui--instance-key'），
+因此按 KEY 去重后每个服务只留一个候选。"
+  (let* ((session ebasecamp-ui--session)
+         (state (and session (etaf-value (ebasecamp-ui-session-state session))))
+         targets)
+    (when state
+      (dolist (group (plist-get state :groups))
+        (let ((name (plist-get group :name)))
+          (push (cons name (ebasecamp-ui--group-key name)) targets)))
+      (dolist (group (plist-get state :groups))
+        (let ((name (plist-get group :name)))
+          (dolist (config (plist-get group :configs))
+            (let ((config-name (plist-get config :name)))
+              (push (cons (format "%s/%s" name config-name)
+                          (ebasecamp-ui--config-key name config-name))
+                    targets)))))
+      (dolist (group (plist-get state :groups))
+        (let ((name (plist-get group :name)))
+          (dolist (instance (plist-get group :instances))
+            (dolist (record (plist-get instance :records))
+              (let ((key (ebasecamp-ui--instance-key name record)))
+                (push (cons key key) targets)))))))
+    (cl-remove-duplicates (nreverse targets) :key #'cdr :test #'equal)))
+
+(defun ebasecamp-ui--tree-visible-keys ()
+  "按树渲染顺序返回可见条目的 key 列表（组，展开时紧跟其配置）。
+展平规则与 `etaf-tree' 一致：组总是可见，配置仅在所属组的 key 在会话
+`expanded' 里时可见。纯函数（只读会话 ref）。"
+  (let* ((session ebasecamp-ui--session)
+         (state (and session (etaf-value (ebasecamp-ui-session-state session))))
+         (expanded (and session
+                        (etaf-value (ebasecamp-ui-session-expanded session))))
+         keys)
+    (dolist (group (plist-get state :groups))
+      (let ((group-key (ebasecamp-ui--group-key (plist-get group :name))))
+        (push group-key keys)
+        (when (member group-key expanded)
+          (dolist (config (plist-get group :configs))
+            (push (ebasecamp-ui--config-key (plist-get group :name)
+                                            (plist-get config :name))
+                  keys)))))
+    (nreverse keys)))
+
+(defun ebasecamp-ui--tree-button-nodes (runtime)
+  "返回 RUNTIME 左树 Host 内条目按钮节点列表（渲染顺序）。
+`etaf-tree' 为每个可见条目渲染一个 `etaf-button'，顺序与
+`ebasecamp-ui--tree-visible-keys' 一致 —— 这是树项「按顺序对齐」的基础。"
+  (let ((host (and runtime (etaf-runtime-host-node runtime 'ebasecamp-ui-tree))))
+    (when host
+      (let (nodes)
+        (ebox-node-walk
+         host
+         (lambda (node)
+           (when (member "etaf-button" (ebox-node-classes node))
+             (push node nodes))))
+        (nreverse nodes)))))
+
+(defun ebasecamp-ui--tree-target-position (key)
+  "返回树条目 KEY 在 buffer 中的位置；不可见或无法对齐时返回 nil。
+对齐前提是「可见条目数 = 树内按钮数」：数量不一致说明渲染形态变了（例如多出
+非条目按钮），此时**全部放弃**（返回 nil）比按错误对应关系跳到别的条目更安全。"
+  (let* ((runtime (etaf-runtime-for-buffer (current-buffer)))
+         (visible (ebasecamp-ui--tree-visible-keys))
+         (nodes (ebasecamp-ui--tree-button-nodes runtime)))
+    (when (and nodes (= (length nodes) (length visible)))
+      (when-let* ((index (cl-position key visible :test #'equal)))
+        (ebox-node-position (nth index nodes))))))
+
+(defun ebasecamp-ui--target-row-position (key)
+  "返回服务行 KEY 在 buffer 中的位置；行未渲染 / 视口外时返回 nil。
+走行 ref（`--row-ref'）—— 它是插件自己声明的 Host ref，与渲染顺序无关，
+因此不受「树项按序对齐」那套脆弱前提影响。"
+  (let* ((runtime (etaf-runtime-for-buffer (current-buffer)))
+         (node (and runtime
+                    (etaf-runtime-host-node
+                     runtime (ebasecamp-ui--row-ref key)))))
+    (and node (ebox-node-position node))))
+
+(defun ebasecamp-ui--target-position (key)
+  "返回跳转身份 KEY 对应的 buffer 位置；不可见（视口外 / 未展开 / 未渲染）时 nil。
+KEY 属于当前可见树 key（`ebasecamp-ui--tree-visible-keys'）时按树定位，否则按
+服务行（ref）定位 —— 不要用 KEY 的字符串前缀判断类型：组名只受
+`[a-z0-9_-]' 约束、没有保留字，名为 `group' 或 `config' 的组会让它的服务行
+key（如 `config/redis'）被误判成树 key，从而静默不可跳。判据取「是否属于可见
+树 key 集合」这个事实源，与 KEY 长什么样无关。
+`ebox-node-position' 对未绘制节点返回 nil，调用方据此跳过。"
+  (when (stringp key)
+    (if (member key (ebasecamp-ui--tree-visible-keys))
+        (ebasecamp-ui--tree-target-position key)
+      (ebasecamp-ui--target-row-position key))))
+
+(defun ebasecamp-ui--focus-at-position (position)
+  "把 POSITION 处最近的、可接收焦点的节点设为焦点，返回该节点或 nil。
+先 `goto-char'（avy 自己只移动 point，不动 ebox 焦点），再沿祖先链上溯：
+服务行的位置往往命中 `text' / `flex' 子节点，而 `ebox-focus' 对不可聚焦节点
+`user-error'，因此逐级向上直到某个祖先能接收焦点。"
+  (when (integer-or-marker-p position)
+    (goto-char position)
+    (let ((node (ignore-errors (ebox-node-at position))))
+      (while (and node
+                  (not (condition-case nil
+                           (progn (ebox-focus node) t)
+                         (user-error nil))))
+        (setq node (ebox-node-parent node)))
+      node)))
+
+(defun ebasecamp-ui--jump-to (key &optional position)
+  "跳到跳转身份 KEY 对应的节点，返回落点位置或 nil。
+POSITION 省略时由 `ebasecamp-ui--target-position' 解析。
+跳转只移动 point 与焦点：**不改**选中组、**不改**勾选集合 —— 写状态会触发
+重渲染（位置立刻失效），而且导航键不该带这些副作用。"
+  (let ((target (or position (ebasecamp-ui--target-position key))))
+    (when target
+      (ebasecamp-ui--focus-at-position target)
+      target)))
+
+(defun ebasecamp-ui--avy-jump-visible (visible)
+  "在候选 VISIBLE（plist 列表，含 :name / :key / :position）中选一个并跳转。
+avy 可用时把位置列表交给 `avy-process'（它对选中者执行 `avy-action-goto'，
+返回选中位置）；否则用 `--prompt' 选名字。返回落点位置或 nil。"
+  (if (ebasecamp-ui--avy-available-p)
+      (let* ((positions (mapcar (lambda (entry) (plist-get entry :position))
+                                visible))
+             (chosen (avy-process positions))
+             (entry (and (integerp chosen)
+                         (cl-find chosen visible
+                                  :test #'eql
+                                  :key (lambda (item) (plist-get item :position))))))
+        (when entry
+          (ebasecamp-ui--jump-to (plist-get entry :key) chosen)))
+    (let* ((names (mapcar (lambda (entry) (plist-get entry :name)) visible))
+           (chosen (ebasecamp-ui--prompt "跳转到：" names t))
+           (entry (cl-find chosen visible
+                           :test #'equal
+                           :key (lambda (item) (plist-get item :name)))))
+      (when entry
+        (ebasecamp-ui--jump-to (plist-get entry :key)
+                               (plist-get entry :position))))))
+
+(defun ebasecamp-ui-avy-jump ()
+  "按字母跳转到组 / 配置 / 服务行（根级 `f'）。
+候选见 `--avy-targets'，位置见 `--target-position'：视口外 / 未展开 / 未渲染的
+条目拿不到位置，直接跳过。avy 可用时显示字母提示，否则降级 `completing-read'
+选名字（候选名列表）。
+跳转期间暂停状态轮询，结束后按原状恢复：3 秒一次的刷新会重渲染整棵树，overlay
+与落点都会失效。恢复必须把**先前保存的** tick-function 传回
+`ebasecamp-status-start'（`ebasecamp-status-stop' 会清空它），且只在原本 running
+时才恢复（原本已停止就不要启动，`start' 会立刻跑一次 `docker ps'）。
+无可见目标时不跳转，只 `message' 说明後返回 nil。"
+  (interactive)
+  (let ((targets (ebasecamp-ui--avy-targets)))
+    (if (null targets)
+        (progn (message "没有可跳转的目标（清单里还没有组）") nil)
+      (let (visible)
+        (dolist (target targets)
+          (let ((position (ebasecamp-ui--target-position (cdr target))))
+            (when position
+              (push (list :name (car target) :key (cdr target) :position position)
+                    visible))))
+        (setq visible (nreverse visible))
+        (if (null visible)
+            (progn (message "没有可见的跳转目标（先滚动视口或展开组）") nil)
+          (let ((was-running (ebasecamp-status-running-p))
+                (tick-function ebasecamp-status--tick-function))
+            (when was-running (ebasecamp-status-stop))
+            (unwind-protect
+                (ebasecamp-ui--avy-jump-visible visible)
+              (when was-running
+                (ebasecamp-status-start tick-function)))))))))
+
 (defun ebasecamp-ui--root-keys ()
   "返回根宿主的 `:keys' 列表，每条为 (KEY COMMAND LABEL)。
 这是根级键位的单一事实源：`ebasecamp-ui-app' 的根 Host 直接消费它，
@@ -2461,7 +2729,17 @@ char-property keymap 先于 etaf 键层，写进来也收不到事件（它由 e
 等价于「激活当前控件」= `RET'）；行级切换勾选用 `t'。
 `1' / `2' / `3' 是区域跳转（左栏 / 右栏 / 底栏的首个停靠点）。它们是
 printing key，绑定后 evil 的数字前缀在界面内失效 —— 与 `q' / `g' 同理，
-可接受。"
+可接受。
+`h' / `j' / `k' / `l' 是 vim 方向导航：`j' / `k' 移动**焦点**（选中组不变，
+换组仍是 `n' / `p'），`h' / `l' 折叠 / 展开焦点所在的树分支。四者都走
+`etaf-direction' 的方向链路（见 `ebasecamp-ui--move-focus'）：在树内
+`h' / `l' 先被 `etaf-tree' 分支节点的 `:on-direction' 消费（`right' 展开、
+`left' 收起），到边界才落回焦点移动 —— 插件侧不重复实现折叠，也不设
+`etaf-set-direction-scheme' 的 vim 方案（那是全局变量，与已有 Host 键位冲突即
+`user-error'）。四个键**追加在表尾**：插到前面会挤掉 `?' 帮助首屏的键位清单。
+`f' 是按字母跳转（`ebasecamp-ui-avy-jump'）：avy 可用时对组 / 配置 / 服务行显示
+字母提示，未安装 avy 时降级 `completing-read'。它同样是 printing key，绑定后
+evil 的 `f'（char motion）在界面内失效 —— 界面内 `f' 是跳转。"
   (list (list "q" #'ebasecamp-ui-close "关闭界面")
         (list "g" #'ebasecamp-ui--reload-and-refresh "重载清单并刷新")
         (list "n" #'ebasecamp-ui--next-group "下一个组")
@@ -2477,7 +2755,12 @@ printing key，绑定后 evil 的数字前缀在界面内失效 —— 与 `q' /
         (list "t" #'ebasecamp-ui--toggle-at-point "切换勾选")
         (list "I" #'ebasecamp-ui-import-compose "导入 compose")
         (list "o" #'ebasecamp-ui-export-compose "导出 compose")
-        (list "D" #'ebasecamp-ui-destroy-environment "销毁环境")))
+        (list "D" #'ebasecamp-ui-destroy-environment "销毁环境")
+        (list "j" #'ebasecamp-ui--move-focus-down "焦点下移")
+        (list "k" #'ebasecamp-ui--move-focus-up "焦点上移")
+        (list "h" #'ebasecamp-ui--move-focus-left "折叠（焦点左移）")
+        (list "l" #'ebasecamp-ui--move-focus-right "展开（焦点右移）")
+        (list "f" #'ebasecamp-ui-avy-jump "跳转到组/配置/服务")))
 
 ;;; 编辑入口（界面唯一的写入口）
 

@@ -469,7 +469,7 @@ etaf 键层确实装在 =emulation-mode-map-alists= 最前面（本可遮住 evi
 
 三条机制，都不是故障：
 
-1. *未绑定的 printing key 被吞*：根 Host 的 =:key-scope 'local= 在边界内吞掉所有未绑定的 printing key（含 =i= ），按下去就是「无反应」。这是刻意的 —— 界面 buffer 只读，不该对随机字母有反应。
+1. *未绑定的 printing key 被吞*：根 Host 的 =:key-scope 'local= 在边界内吞掉所有未绑定的 printing key（含 =i= ），按下去就是「无反应」。这是刻意的 —— 界面 buffer 只读，不该对随机字母有反应。v0.6 起 =f= / =j= / =k= / =h= / =l= 已 *绑定* （跳转 / 焦点移动 / 折叠展开），按它们不会再被吞；=i= 仍未绑定。
 2. *=SPC= 是 ebox 的激活键，不是勾选键*：=[32]= 在 =ebox--activation-keys= 里（与 =RET= 同义），以节点级 char-property keymap 安装，查找顺序先于 etaf 键层，所以 =SPC= 永远走「激活当前控件」：checkbox 上勾选、按钮上按下。它 *不能* 被 =:keys= 重绑。
 3. *段级键只在段内生效*：=s= / =x= / =r= / =a= / =A= 声明的宿主是「该配置段」，point 在左树或顶栏时按键被吞、无提示（不引入「当前段」全局状态，避免同组多实例串段）。另外段级键跟随 *焦点* ：有焦点时从焦点起算键链，焦点在 A 段而 point 在 B 段会命中 A 段。
 
@@ -481,12 +481,13 @@ etaf 键层确实装在 =emulation-mode-map-alists= 最前面（本可遮住 evi
 (etaf--keys-binding [??])        ; ? → 帮助
 #+end_src
 
-界面里直接按 =?= 更省事：它按 point 所在键链列出根级 9 条 + 段内再加 5 条段级，每条都有中文 LABEL。
+界面里直接按 =?= 更省事：它按 point 所在键链列出根级 21 条 + 段内再加 5 条段级，每条都有中文 LABEL。
 
 ** 修法
 
 - 勾选服务用 =t= （行内任意位置都生效），或点 =[ ]= 复选框、或在行上按 =RET= ；不要在按钮上按 =SPC= ，那等于按下按钮。
 - 段级动作先把 point 移到目标配置段内（或直接把焦点 =TAB= 到该段按钮上），再按 =s= / =x= / =r= / =a= / =A= 。
+- v0.6 起 =j= / =k= 移动 *焦点*（选中组不变）、=h= / =l= 在树内折叠 / 展开、=f= 按字母跳转（不装 avy 时降级 =completing-read= ）。按这几个键 *不该* 再是「无反应」—— 若无反应，先确认加载的是 0.6.0 以上的代码（按 =?= 看帮助里有没有「跳转到组/配置/服务」这条）。注意界面内 =f= 是跳转、不是 evil 的 char motion。
 - =C-x= / =M-x= / =C-g= / =ESC= 不受影响；=SPC= 在界面内不能当 leader 前缀，需要 general 的 =SPC t e e= 时先 =q= 关闭界面。
 - 键位全表见 [[file:../Readme.org][Readme]] 的「界面键位」节与 [[file:user-guide.org][用户指南]]。
 

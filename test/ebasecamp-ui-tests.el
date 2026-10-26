@@ -808,10 +808,15 @@ dev → myapp（服务全 running）、prod → other（mysql-ro 未启动）。
         (cl-labels ((capture ()
                       (let (seen)
                         ;; C4 起 `--section-button' 多收一个 INSTANCE 参数
-                        ;; （按钮要把实例带进派发），这里记录 disabled 与实例
+                        ;; （按钮要把实例带进派发），这里记录 disabled 与实例；
+                        ;; v0.6 起再多收一个**可选** KEY（按钮文案前置键提示），
+                        ;; 替身因此放宽为 `&optional _key' —— 不写成 6 个必填参数，
+                        ;; 否则 1.1 阶段（生产代码仍是 5 参调用）会引入计划外的
+                        ;; `wrong-number-of-arguments' 红。
                         (cl-letf (((symbol-function
                                     'ebasecamp-ui--section-button)
-                                   (lambda (label action variant inst disabled)
+                                   (lambda (label action variant inst disabled
+                                            &optional _key)
                                      (push (list label action disabled inst) seen)
                                      (etaf-view (etaf-label :text label)))))
                           (ebasecamp-ui-test--mount-text
@@ -1490,16 +1495,17 @@ open 走全新会话（不残留上一次的选中集合、提示与确认状态
   (etaf-value (ebasecamp-ui-session-selected-group (ebasecamp-ui-session))))
 
 (ert-deftest ebasecamp-ui-test-root-keys-complete ()
-  "`--root-keys' 的键集合恰为 q g n p e t I o D 1 2 3 S E M X，每条带非空 LABEL 且能通过校验。
+  "`--root-keys' 的键集合恰为 q f g h j k l n p e t I o D 1 2 3 S E M X，每条带非空 LABEL 且能通过校验。
 `SPC` 不在本表：它被 ebox 内建的激活键（`[32]`）占用，见
 `spc-activates-checkbox'。
 `e`（编辑清单）在 U5 加入，`t`（切换勾选）在 U4 加入，`1`/`2`/`3`（区域跳转）
-在 N1 加入，`S`/`E`/`M`/`X`（写操作）在 W4 加入 —— 本用例守护「当前阶段已有的键
-一个不少、一个不多」。"
+在 N1 加入，`S`/`E`/`M`/`X`（写操作）在 W4 加入，`h`/`j`/`k`/`l`（vim 方向
+导航）在 v0.6 批次 2 加入，`f`（avy 跳转）在 v0.6 批次 3 加入 —— 本用例守护
+「当前阶段已有的键一个不少、一个不多」。"
   (ebasecamp-ui-test--with-ui
     (let ((keys (ebasecamp-ui--root-keys)))
       (should (equal '("1" "2" "3" "D" "E" "I" "M" "S" "X"
-                       "e" "g" "n" "o" "p" "q" "t")
+                       "e" "f" "g" "h" "j" "k" "l" "n" "o" "p" "q" "t")
                      (sort (mapcar (lambda (entry)
                                      (key-description (etaf--keys-event (car entry))))
                                    keys)
@@ -1740,10 +1746,24 @@ redis 的 key 原样保留（段级全不选必须只作用于 point 所在段�
 落点必须在 mark 内部：探针实测 point 在 `[ ]' 之后的单元格边界上时最近的 Host
 已不属于该 checkbox；而落在 mark 内时最近的 Host 是 mark 自己的生成 ref，
 `--checkbox-ref-at-point' 需要沿父节点向上才能取到 checkbox 的显式 ref —— 这也正是
-真实使用中（点选 mark 本身）会走的路径。"
+真实使用中（点选 mark 本身）会走的路径。
+
+定位**不能**用裸 `search-forward \"[\"'，也不能只认 mark 字形：v0.6 起段头按钮
+文案前置键提示（`[s] 启动选中' / `[x] 停止选中'），而 `[x]' 同时是勾选状态的
+mark 字形（`etaf-ui' 的 checkbox 只产出 `[ ]' 与 `[x]'）。因此这里逐个尝试
+`[ ]' / `[x]' 候选，**用 `--checkbox-ref-at-point' 自校验**：只有真正落在
+checkbox mark 内（能解出 ref）才算命中，按钮提示里的 `[x]' 因解不出 ref 被跳过。
+这样以后改按钮文案或键提示格式都不必再动本函数。"
   (goto-char (point-min))
-  (search-forward "[")
-  (backward-char 1))
+  (let ((found nil))
+    (while (and (not found)
+                (re-search-forward "\\[\\(?: \\|x\\)\\]" nil t))
+      (backward-char 2)                     ; mark 内部（`[' 处）
+      (if (ebasecamp-ui--checkbox-ref-at-point)
+          (setq found t)
+        (forward-char 2)))                  ; 不是勾选框 → 从 mark 之后继续找
+    (unless found
+      (error "界面里找不到服务勾选框的 mark"))))
 
 (defun ebasecamp-ui-test--goto-service-cell ()
   "把 point 移到服务表第二行（mysql-ro）的「服务」单元格上（**非** checkbox 单元格）。
@@ -2036,22 +2056,24 @@ LABEL 是可发现性的唯一来源（`etaf-help' 跳过无 LABEL 的条目）�
           (should (equal keys (etaf--keys-validate keys))))))))
 
 (ert-deftest ebasecamp-ui-test-root-keys-final-set ()
-  "根级键的**最终集合**恰为 q g n p e t I o D 1 2 3 S E M X（16 条），一个不多一个不少。
+  "根级键的**最终集合**恰为 q f g h j k l n p e t I o D 1 2 3 S E M X（21 条），一个不多一个不少。
 用 `key-description' 把每条 KEY 归一后再 `sort' + `equal' 做**精确等值**比较
 （不用「包含」断言，否则多绑/少绑都发现不了）。`SPC` **不在**本表：`[32]` 属于
 ebox 的 `ebox--activation-keys'（节点级 char-property keymap，按键查找中先于
 etaf 键层），写进 `:keys' 也收不到事件 —— 它由 ebox 内建处理，等价于
 「激活当前控件」（= `RET'）；行级切换勾选因此用 `t'（见 `t-toggles-row-at-point'）。
 `1`/`2`/`3` 是 N1 加的区域跳转键（跳到左栏 / 右栏 / 底栏）；`S`/`E`/`M`/`X`
-是 W4 加的写操作键（编辑服务 / 编辑配置 / 移动配置 / 清单操作）。"
+是 W4 加的写操作键（编辑服务 / 编辑配置 / 移动配置 / 清单操作）；`h`/`j`/`k`/`l`
+是 v0.6 批次 2 加的 vim 方向导航键（焦点移动 + 树折叠展开，**不改**选中组）；
+`f` 是 v0.6 批次 3 加的 avy 跳转键（组 / 配置 / 服务行）。"
   (ebasecamp-ui-test--with-ui
     (let* ((keys (ebasecamp-ui--root-keys))
            (descriptions (mapcar (lambda (entry)
                                    (key-description (etaf--keys-event (car entry))))
                                  keys)))
-      (should (= 16 (length keys)))
+      (should (= 21 (length keys)))
       (should (equal '("1" "2" "3" "D" "E" "I" "M" "S" "X"
-                       "e" "g" "n" "o" "p" "q" "t")
+                       "e" "f" "g" "h" "j" "k" "l" "n" "o" "p" "q" "t")
                      (sort (copy-sequence descriptions) #'string<)))
       ;; `SPC` 由 ebox 内建激活处理，不得出现在本表
       (should-not (member "SPC" descriptions))
@@ -2059,9 +2081,9 @@ etaf 键层），写进 `:keys' 也收不到事件 —— 它由 ebox 内建处�
 
 (ert-deftest ebasecamp-ui-test-help-data-includes-labels ()
   "`etaf-help-data' 能收集到根级与段级的全部 LABEL（`?` 帮助的端到端核对）。
-point 在顶栏区时键链只到根 Host，收集到 16 条根级 LABEL（含 N1 加的三个区域跳转
-键）；point 落到某个配置段内时段 Host 的 5 条段级 LABEL 一并进入快照
-（段键与根键不重叠，不会互相 shadow）。"
+point 在顶栏区时键链只到根 Host，收集到 21 条根级 LABEL（含 N1 加的三个区域
+跳转键，以及 v0.6 新增的 `f`/`j`/`k`/`h`/`l`）；point 落到某个配置段内时段 Host
+的 5 条段级 LABEL 一并进入快照（段键与根键不重叠，不会互相 shadow）。"
   (ebasecamp-ui-test--with-ui
     (ebasecamp-ui-test--section-manifest)
     (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
@@ -2722,6 +2744,20 @@ ref 变化自然驱动 splitter 重渲染（`etaf-splitter' 的 `:ratio' 经
   "返回主界面 buffer 当前的焦点节点（`ebox-focused-node'，无焦点时为 nil）。"
   (with-current-buffer (get-buffer ebasecamp-ui-buffer-name)
     (ebox-focused-node)))
+
+(defun ebasecamp-ui-test--focused-ref ()
+  "返回主界面当前焦点节点的 Host ref（无焦点 / 无 runtime 时 nil）。
+比对「焦点是否移动」一律用它，**不要**直接 `equal' 两个 `ebox-node' 节点对象：
+节点带 parent 指针（圆形结构），`equal' 在大结构上既慢又不可靠；ref 形如
+`(etaf-host N M)' 是普通列表，`equal' 语义稳定。"
+  (with-current-buffer (get-buffer ebasecamp-ui-buffer-name)
+    (when-let* ((node (ebox-focused-node))
+                (runtime (etaf-runtime-for-buffer (current-buffer))))
+      (etaf-runtime-node-host-ref runtime node))))
+
+(defun ebasecamp-ui-test--expanded ()
+  "返回会话的 `expanded' 值（树折叠状态的 key 列表）。"
+  (etaf-value (ebasecamp-ui-session-expanded (ebasecamp-ui-session))))
 
 (defun ebasecamp-ui-test--focused-within-p (ref)
   "返回非 nil 当焦点节点落在 REF 的子树内（含 REF 节点自身）。
@@ -3520,6 +3556,450 @@ notice 收尾（即缺陷现象「写盘前报 scope 非法」已消失）。"
             (should (symbolp (nth 2 (car calls))))
             (should (eq 'success
                         (plist-get (ebasecamp-ui-test--notice) :kind)))))))))
+
+;;; 批次 1（v0.6 计划「设计决策 A」）：按钮旁显示键
+;;
+;; 键提示在 `--footer-button' / `--section-button' **内部**拼接，`label' 参数
+;; 值不变 —— 因此 `--goto-section' 的 `search-forward "启动选中"' 锚点与段内
+;; 替身的 label 断言都不破。这里分开守护两件事：
+;; 1. 渲染：底栏 / 段头六个按钮的文本里出现 `[KEY] ' 前缀且原文案仍在；
+;; 2. 不漂移：`--button-key-hints' 的每个 KEY 都真存在于键表，且按钮文案与
+;;    键表 LABEL 指向同一动作（不是两处各写一遍、互不相干）。
+
+(defun ebasecamp-ui-test--label-subsequence-p (short long)
+  "SHORT 的每个字符都按顺序出现在 LONG 中时返回 t，否则返回 nil。
+用来表达「按钮文案与键表 LABEL 指向同一动作」：底栏两者逐字相同，段级键表
+则在按钮文案中间**插入**了「该段」（`启动选中' → `启动该段选中'），所以关系
+不是 `string-prefix-p'（`启动该段选中' 的第三个字符是「该」而非「选」），
+而是「按序包含」。"
+  (let ((start 0)
+        (ok t))
+    (dotimes (n (length short))
+      (let ((pos (cl-position (aref short n) long :start start :test #'eq)))
+        (if pos
+            (setq start (1+ pos))
+          (setq ok nil))))
+    ok))
+
+(ert-deftest ebasecamp-ui-test-footer-buttons-show-keys ()
+  "底栏三个按钮的渲染文本同时含 `[I]' / `[o]' / `[D]' 与原文案。
+键名取自 `--root-keys'（`I' 导入 compose / `o' 导出 compose / `D' 销毁环境），
+每对断言都是「键提示存在 + 原文案仍在」两项——只断言键提示会让「文案被键
+替换掉」也蒙混过关。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let ((text (cdr (ebasecamp-ui-test--render "group/mysql"))))
+        (should (ebasecamp-ui-test--contains-p text "[I]"))
+        (should (ebasecamp-ui-test--contains-p text "导入 compose"))
+        (should (ebasecamp-ui-test--contains-p text "[o]"))
+        (should (ebasecamp-ui-test--contains-p text "导出 compose"))
+        (should (ebasecamp-ui-test--contains-p text "[D]"))
+        (should (ebasecamp-ui-test--contains-p text "销毁环境"))))))
+
+(ert-deftest ebasecamp-ui-test-section-buttons-show-keys ()
+  "段头三个按钮的渲染文本同时含 `[s]' / `[x]' / `[r]' 与原文案。
+键名取自 `--section-keys'（段级 `s' / `x' / `r' → start / stop / restart）。
+只挂载 `--instance-section'（不动主界面 buffer），断言对象是按钮行的实际
+渲染文本。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let* ((session (ebasecamp-ui-session))
+             (_state (progn (ebasecamp-ui-refresh
+                             (ebasecamp-status-last-records) t)
+                            nil))
+             (group (car (plist-get
+                          (etaf-value (ebasecamp-ui-session-state session))
+                          :groups)))
+             (instance (car (plist-get group :instances)))
+             (text (ebasecamp-ui-test--mount-text
+                    (ebasecamp-ui--instance-section session "mysql" instance))))
+        (should (ebasecamp-ui-test--contains-p text "[s]"))
+        (should (ebasecamp-ui-test--contains-p text "启动选中"))
+        (should (ebasecamp-ui-test--contains-p text "[x]"))
+        (should (ebasecamp-ui-test--contains-p text "停止选中"))
+        (should (ebasecamp-ui-test--contains-p text "[r]"))
+        (should (ebasecamp-ui-test--contains-p text "重启选中"))))))
+
+(ert-deftest ebasecamp-ui-test-button-key-nil-keeps-label ()
+  "KEY 省略（nil）时两个按钮的输出与原 LABEL **逐字节一致**（回归保护）。
+既有调用方（以及第三方视图代码）可以继续只传原有参数；键提示只在显式传 KEY
+时出现。`string-trim' 只去掉按钮渲染的横向留白，标签内部的空格（`导入 compose'）
+原样保留。"
+  (ebasecamp-ui-test--with-ui
+    (let ((footer (string-trim
+                   (ebasecamp-ui-test--mount-text
+                    (ebasecamp-ui--footer-button "导入 compose" #'ignore))))
+          (section (string-trim
+                    (ebasecamp-ui-test--mount-text
+                     (ebasecamp-ui--section-button "启动选中" 'start 'primary
+                                                   nil nil)))))
+      (should (equal "导入 compose" footer))
+      (should-not (ebasecamp-ui-test--contains-p footer "["))
+      (should (equal "启动选中" section))
+      (should-not (ebasecamp-ui-test--contains-p section "[")))))
+
+(ert-deftest ebasecamp-ui-test-button-key-hints-match-key-tables ()
+  "`--button-key-hints' 的每个键都存在于键表，且按钮文案指向同一动作。
+两条判据（防「键绑错」与「文案漂移」）：
+① KEY 必须能在 `--root-keys' 或 `--section-keys' 里找到 —— 例如把导出写成
+   `I'（与导入撞键）会在这里红；
+② 命中条目的 LABEL 必须按序包含按钮文案 —— 按钮用短形式（`启动选中'），
+   段级键表用长形式（`启动该段选中'），两者不是前缀关系，判据见
+   `ebasecamp-ui-test--label-subsequence-p'。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let* ((instance (car (ebasecamp-ui-test--instances)))
+             (tables (list (cons 'root (ebasecamp-ui--root-keys))
+                           (cons 'section (ebasecamp-ui--section-keys
+                                           "mysql" instance)))))
+        (should ebasecamp-ui--button-key-hints)
+        (dolist (hint ebasecamp-ui--button-key-hints)
+          (let* ((label (car hint))
+                 (key (cdr hint))
+                 (hits (cl-loop for (scope . entries) in tables
+                                append (cl-loop for entry in entries
+                                                when (equal key (car entry))
+                                                collect (cons scope (nth 2 entry))))))
+            (should (stringp label))
+            ;; 兜底：LABEL 非空 —— `--label-subsequence-p' 对空串恒真，
+            ;; 空 LABEL 会让判据 ② 变成永远通过的空壳断言
+            (should-not (string-empty-p label))
+            (should (stringp key))
+            ;; ① KEY 必须在某张键表里
+            (should hits)
+            ;; ② 每个命中条目的 LABEL 都要指向同一动作
+            (dolist (hit hits)
+              (should (ebasecamp-ui-test--label-subsequence-p
+                       label (cdr hit))))))))))
+
+;;; 批次 2（v0.6 计划「设计决策 B」）：hjkl 方向导航
+;;
+;; `j' / `k' 移动**焦点**（`etaf-direction' 的方向链路），选中组不变；
+;; `h' / `l' 在树内先被 `etaf-tree' 分支节点的 `:on-direction' 消费
+;; （left 收起 / right 展开），到边界才落回焦点移动。因此这里的断言分两类：
+;; 1. 焦点移动：比较 `--focused-ref'（ref 是普通列表，`equal' 可靠）；
+;; 2. 折叠状态：比较会话的 `expanded' ref。
+;;
+;; 焦点起点用 `--focus-region 'tree'：它落到树内第一个停靠点（实测是组节点的
+;; 按钮），既保证 `h'/`l' 作用在分支节点上，也保证「焦点真的从别处移过来」。
+
+(ert-deftest ebasecamp-ui-test-j-k-move-focus-not-selection ()
+  "`j' 下移、`k' 上移焦点，且**选中组不变**。
+这与 `n'/`p'（换组）是两套语义：`j'/`k' 只动焦点，不动 selected-group。
+先 `--focus-region 'tree'` 把焦点送进树内第一个停靠点，再按 `j'：焦点 ref 必须
+变化、选中组必须仍是 mysql；再按 `k' 回到原焦点（`up' 与 `down' 在同一列上
+可逆，实测 ref 回到原值）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let ((ebox-viewport-height 40))
+        (ebasecamp-ui-test--with-open-ui
+          (ebasecamp-ui--focus-region 'tree)
+          (let ((before (ebasecamp-ui-test--focused-ref))
+                (group-before (ebasecamp-ui-test--selected-group)))
+            (should before)
+            (should (eq 'mysql group-before))
+            (execute-kbd-macro (kbd "j"))
+            (let ((after (ebasecamp-ui-test--focused-ref)))
+              (should after)
+              (should-not (equal before after))
+              ;; `j' 不是换组键：选中组一个都不能变
+              (should (eq group-before (ebasecamp-ui-test--selected-group))))
+            (execute-kbd-macro (kbd "k"))
+            (should (equal before (ebasecamp-ui-test--focused-ref)))
+            (should (eq group-before (ebasecamp-ui-test--selected-group)))))))))
+
+(ert-deftest ebasecamp-ui-test-h-l-toggle-tree-expansion ()
+  "`h' 收起焦点所在的组、`l' 重新展开，折叠状态写回会话的 `expanded' ref。
+默认清单里全部组默认展开（`--default-expanded'），因此断言顺序是
+`h'（展开 → 收起）再 `l'（收起 → 展开）。折叠由 `etaf-tree' 分支节点的
+`:on-direction' 消费（`left' → 收起 + `handled'、`right' → 展开 + `handled'），
+焦点在折叠动作中**不动**；已展开时按 `l' 才外溢成焦点右移（下一用例之外，
+本用例只守护树内折叠语义）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--section-manifest)
+    (ebasecamp-ui-test--with-ps (ebasecamp-ui-test--section-containers)
+      (let ((ebox-viewport-height 40))
+        (ebasecamp-ui-test--with-open-ui
+          (ebasecamp-ui--focus-region 'tree)
+          (let ((focused (ebasecamp-ui-test--focused-ref)))
+            (should focused)
+            (should (equal '("group/mysql") (ebasecamp-ui-test--expanded)))
+            ;; h：组节点已展开 → 收起（焦点不动）
+            (execute-kbd-macro (kbd "h"))
+            (should-not (member "group/mysql" (ebasecamp-ui-test--expanded)))
+            (should (equal focused (ebasecamp-ui-test--focused-ref)))
+            ;; l：组节点已收起 → 重新展开（焦点仍不动）
+            (execute-kbd-macro (kbd "l"))
+            (should (equal '("group/mysql") (ebasecamp-ui-test--expanded)))
+            (should (equal focused (ebasecamp-ui-test--focused-ref)))))))))
+
+;;; 批次 3（v0.6 计划「设计决策 C」）：avy 跳转（`f'）
+;;
+;; `f' 收集三类候选（组 / 配置 / 服务行），每个候选映射到 buffer 位置后交给 avy
+;; 显示字母提示；未安装 avy 时降级 `completing-read'。本组用例把三个环节都切开
+;; 打桩，因此**不依赖 avy 是否安装**、也不依赖真实按键提示：
+;; 1. 候选收集：`--avy-targets' 是纯函数（只读会话 state），断言名字与 key；
+;; 2. avy 路径：打桩 `--avy-available-p' / `avy-process' / `--target-position'，
+;;    断言候选是位置列表、选中后跳到对应 key；
+;; 3. 降级路径：`--avy-available-p' 为 nil 时打桩 `--prompt'，断言问一次且跳转；
+;; 4. 轮询暂停：打桩 `ebasecamp-status-stop' / `-start'，断言顺序与实参；
+;; 5. 无可见目标：全部位置为 nil 时只 `message'，不 signal。
+;;
+;; 注意 `avy-process' 在 `make test' 的 load-path 里**不存在**（Makefile 的
+;; load-path 不含 avy），所以打桩不能写成 `cl-letf' + `(symbol-function ...)'
+;; —— 取旧值时 `cl-letf' 会对未定义函数 `void-function'。用
+;; `ebasecamp-ui-test--stub'。
+
+(defmacro ebasecamp-ui-test--stub (symbol function &rest body)
+  "把 SYMBOL 的函数定义临时设为 FUNCTION 后执行 BODY，结束后恢复原状。
+与 `cl-letf' + `(symbol-function SYMBOL)' 的差别：SYMBOL 原本**没有**函数定义
+（例如未安装 avy 时的 `avy-process'）时也能用 —— `cl-letf' 保存旧值时会对
+未定义符号 `void-function'。"
+  (declare (indent 2) (debug (symbolp form body)))
+  `(let ((had (fboundp ',symbol))
+         (old (and (fboundp ',symbol) (symbol-function ',symbol))))
+     (unwind-protect
+         (progn (fset ',symbol ,function) ,@body)
+       (if had (fset ',symbol old) (fmakunbound ',symbol)))))
+
+(defun ebasecamp-ui-test--avy-manifest ()
+  "批次 3 夹具：2 组 / 1 份配置 / 2 个服务行。
+mysql（per-project，2 服务 + 1 份配置 dev → myapp）与 redis（per-project，
+1 服务、未关联）。选中 mysql 后右栏只有一段、2 个服务行；redis 没有配置因此
+不贡献服务行 —— 候选恰为「2 组 + 1 配置 + 2 行」。"
+  (ebasecamp-define-group mysql
+    :title "MySQL"
+    :scope per-project
+    :services ((mysql :image "mysql:8.4" :ports ((3306 . 3306)))
+               (mysql-ro :image "mysql:8.4"))
+    :configs ((dev :project myapp)))
+  (ebasecamp-define-group redis
+    :title "Redis"
+    :scope per-project
+    :services ((redis :image "redis:7")))
+  (ebasecamp-define-project myapp :title "示例项目" :groups nil))
+
+(ert-deftest ebasecamp-ui-test-avy-targets-collect ()
+  "`--avy-targets' 收集 2 组 + 1 配置 + 2 服务行，NAME 与 KEY 都是非空字符串。
+NAME 是给 `completing-read' 与字母提示看的人类可读名：组用组名，配置用
+\"组名/配置名\"（跨组同名配置不混淆），服务行用段内 key \"组名/服务名\"。
+KEY 是跳转身份：组 / 配置为树 key（`--group-key' / `--config-key'），服务行为
+`--instance-key'（`--target-position' 据此派生行 ref）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--avy-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40))
+        (ebasecamp-ui-test--with-open-ui
+          (let ((targets (ebasecamp-ui--avy-targets)))
+            (should (= 5 (length targets)))
+            (should (equal '("mysql" "redis" "mysql/dev"
+                             "mysql/mysql" "mysql/mysql-ro")
+                           (mapcar #'car targets)))
+            (should (equal '("group/mysql" "group/redis" "config/mysql/dev"
+                             "mysql/mysql" "mysql/mysql-ro")
+                           (mapcar #'cdr targets)))
+            (dolist (target targets)
+              (should (stringp (car target)))
+              (should-not (string-empty-p (car target)))
+              (should (stringp (cdr target)))
+              (should-not (string-empty-p (cdr target))))))))))
+
+(ert-deftest ebasecamp-ui-test-f-uses-avy-when-available ()
+  "`f' 在 avy 可用时调一次 `avy-process'，候选是非空的位置列表；选中后按 key 跳转。
+位置由 `--target-position' 解析，这里打桩成 100/110/…（确定性）；`avy-process'
+打桩成「选第一个候选」，`--jump-to' 打桩成记录 (KEY . POSITION)。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--avy-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40))
+        (ebasecamp-ui-test--with-open-ui
+          (let (calls jumped)
+            (ebasecamp-ui-test--stub
+                avy-process
+                (lambda (candidates &optional _overlay-fn _cleanup-fn)
+                  (push (copy-sequence candidates) calls)
+                  (car candidates))
+              (cl-letf (((symbol-function 'ebasecamp-ui--avy-available-p)
+                         (lambda () t))
+                        ((symbol-function 'ebasecamp-ui--target-position)
+                         (let ((counter 100))
+                           (lambda (_key)
+                             (prog1 counter (setq counter (+ counter 10))))))
+                        ((symbol-function 'ebasecamp-ui--jump-to)
+                         (lambda (key &optional position)
+                           (push (cons key position) jumped)
+                           position)))
+                (execute-kbd-macro (kbd "f"))))
+            (should (= 1 (length calls)))
+            (let ((candidates (car calls)))
+              (should candidates)
+              (should (= 5 (length candidates)))
+              (should (cl-every #'integerp candidates))
+              (should (equal '(100 110 120 130 140) candidates)))
+            ;; avy 选中的是第一个候选位置 → 第一个候选（组 mysql）
+            (should (equal '(("group/mysql" . 100)) jumped))))))))
+
+(ert-deftest ebasecamp-ui-test-f-falls-back-to-completing-read ()
+  "avy 不可用时降级 `completing-read'：问一次、候选为全部名字，选中后跳到对应 key。
+打桩 `--prompt'（界面统一输入入口）返回第二类候选 \"mysql/dev\"，断言
+`--jump-to' 收到配置的树 key —— 证明「名字 → key」的映射没有错位。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--avy-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40))
+        (ebasecamp-ui-test--with-open-ui
+          (let (prompts jumped)
+            (cl-letf (((symbol-function 'ebasecamp-ui--avy-available-p)
+                       (lambda () nil))
+                      ((symbol-function 'ebasecamp-ui--prompt)
+                       (lambda (prompt &optional collection _require-match _initial)
+                         (push (list prompt collection) prompts)
+                         "mysql/dev"))
+                      ((symbol-function 'ebasecamp-ui--target-position)
+                       (lambda (_key) 200))
+                      ((symbol-function 'ebasecamp-ui--jump-to)
+                       (lambda (key &optional position)
+                         (push (cons key position) jumped)
+                         position)))
+              (execute-kbd-macro (kbd "f")))
+            (should (= 1 (length prompts)))
+            (should (string-match-p "跳转" (car (car prompts))))
+            (should (equal '("mysql" "redis" "mysql/dev"
+                             "mysql/mysql" "mysql/mysql-ro")
+                           (cadr (car prompts))))
+            (should (equal '(("config/mysql/dev" . 200)) jumped))))))))
+
+(ert-deftest ebasecamp-ui-test-jump-pauses-status-polling ()
+  "跳转期间暂停状态轮询，结束后按原状恢复。
+`ebasecamp-status-stop' 会清空 `--tick-function'、`ebasecamp-status-start' 会立即
+tick 一次（跑 `docker ps'），所以恢复必须把**先前保存的** tick-function 传回，
+且只在原本 running 时才恢复。两条断言：①原本 running → 顺序 stop → start，
+start 收到原 tick-function；②原本未 running → 既不 stop 也不 start。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--avy-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40))
+        (ebasecamp-ui-test--with-open-ui
+          (let (calls)
+            (ebasecamp-ui-test--stub
+                avy-process
+                (lambda (candidates &optional _overlay-fn _cleanup-fn)
+                  (car candidates))
+              ;; ① 原本在轮询
+              (cl-letf (((symbol-function 'ebasecamp-status-running-p)
+                         (lambda () t))
+                        ((symbol-function 'ebasecamp-status-stop)
+                         (lambda () (push 'stop calls)))
+                        ((symbol-function 'ebasecamp-status-start)
+                         (lambda (function)
+                           (push (list 'start function) calls)
+                           t))
+                        ((symbol-function 'ebasecamp-ui--avy-available-p)
+                         (lambda () t))
+                        ((symbol-function 'ebasecamp-ui--target-position)
+                         (lambda (_key) 100))
+                        ((symbol-function 'ebasecamp-ui--jump-to)
+                         (lambda (_key &optional position) position)))
+                (let ((ebasecamp-status--tick-function
+                       'ebasecamp-ui-test--tick))
+                  (ebasecamp-ui-avy-jump)))
+              (should (equal '(stop (start ebasecamp-ui-test--tick))
+                             (nreverse calls)))
+              ;; ② 原本未轮询 → 不恢复（既不 stop 也不 start）
+              (setq calls nil)
+              (cl-letf (((symbol-function 'ebasecamp-status-running-p)
+                         (lambda () nil))
+                        ((symbol-function 'ebasecamp-status-stop)
+                         (lambda () (push 'stop calls)))
+                        ((symbol-function 'ebasecamp-status-start)
+                         (lambda (function)
+                           (push (list 'start function) calls)
+                           t))
+                        ((symbol-function 'ebasecamp-ui--avy-available-p)
+                         (lambda () t))
+                        ((symbol-function 'ebasecamp-ui--target-position)
+                         (lambda (_key) 100))
+                        ((symbol-function 'ebasecamp-ui--jump-to)
+                         (lambda (_key &optional position) position)))
+                (let ((ebasecamp-status--tick-function
+                       'ebasecamp-ui-test--tick))
+                  (ebasecamp-ui-avy-jump)))
+              (should-not calls))))))))
+
+(ert-deftest ebasecamp-ui-test-jump-reports-when-no-visible-target ()
+  "没有可见跳转目标时 `message' 说明、返回 nil、不 signal。
+两种成因都覆盖：①有候选但位置全为 nil（视口外 / 树未对齐）；
+②根本没有候选（会话未建立 / 清单为空）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--avy-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40))
+        (ebasecamp-ui-test--with-open-ui
+          (let (messages)
+            (cl-letf (((symbol-function 'message)
+                       (lambda (format-string &rest arguments)
+                         (push (apply #'format format-string arguments) messages)))
+                      ((symbol-function 'ebasecamp-ui--avy-available-p)
+                       (lambda () t))
+                      ((symbol-function 'ebasecamp-ui--target-position)
+                       (lambda (_key) nil)))
+              ;; ① 候选存在但都不可见
+              (should-not (ebasecamp-ui-avy-jump))
+              (should (= 1 (length messages)))
+              (should (string-match-p "没有" (car messages)))
+              (should (string-match-p "可见" (car messages)))
+              ;; ② 没有候选
+              (setq messages nil)
+              (cl-letf (((symbol-function 'ebasecamp-ui--avy-targets)
+                         (lambda () nil)))
+                (should-not (ebasecamp-ui-avy-jump)))
+              (should (= 1 (length messages)))
+              (should (string-match-p "没有" (car messages))))))))))
+
+(ert-deftest ebasecamp-ui-test-tree-target-safety-valve-rejects-mismatch ()
+  "树项「按序对齐」的数量安全阀：可见 key 数与按钮节点数不等时全部放弃。
+数量相等时 `--tree-target-position' 必须给出位置（正常路径），把
+`--tree-button-nodes' 打桩成少一个节点后必须返回 nil —— 宁可不跳，也不按
+错位的对应关系跳到别的条目。同一 key 经 `--target-position' 也只能得到 nil：
+它按「key 是否属于可见树 key」判别类型，树定位失败时不会退回服务行路径
+（`group/mysql' 也确实是行 ref 解不出的 key）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--avy-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40))
+        (ebasecamp-ui-test--with-open-ui
+          (should (integer-or-marker-p
+                   (ebasecamp-ui--tree-target-position "group/mysql")))
+          (let ((original (symbol-function 'ebasecamp-ui--tree-button-nodes)))
+            (cl-letf (((symbol-function 'ebasecamp-ui--tree-button-nodes)
+                       (lambda (runtime) (butlast (funcall original runtime)))))
+              (should-not (ebasecamp-ui--tree-target-position "group/mysql"))
+              (should-not (ebasecamp-ui--target-position "group/mysql")))))))))
+
+(ert-deftest ebasecamp-ui-test-jump-does-not-change-selection ()
+  "`--jump-to' 只移动 point 与焦点：选中组与勾选集合都不变。
+跳转若写状态会触发整树重渲染、让刚落的位置立刻失效，而且导航键不该带写副作用。
+先预置一个勾选项（空集合无法证明「没被清空」），再跳到另一个组，断言两者与
+调用前完全相同。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--avy-manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (let ((ebox-viewport-height 40))
+        (ebasecamp-ui-test--with-open-ui
+          (ebasecamp-ui--toggle-selected (ebasecamp-ui-session) "mysql/mysql" t)
+          (let ((group-before (ebasecamp-ui-test--selected-group))
+                (keys-before (copy-sequence (ebasecamp-ui-selected-keys)))
+                (position (ebasecamp-ui--tree-target-position "group/redis")))
+            (should (eq 'mysql group-before))
+            (should (equal '("mysql/mysql") keys-before))
+            (should (integer-or-marker-p position))
+            (should (ebasecamp-ui--jump-to "group/redis" position))
+            (should (eq group-before (ebasecamp-ui-test--selected-group)))
+            (should (equal keys-before (ebasecamp-ui-selected-keys)))))))))
 
 (provide 'ebasecamp-ui-tests)
 ;;; ebasecamp-ui-tests.el ends here

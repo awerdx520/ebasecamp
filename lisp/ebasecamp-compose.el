@@ -1,7 +1,7 @@
 ;;; ebasecamp-compose.el --- ebasecamp compose 生成 -*- lexical-binding: t; -*-
 
 ;; Author: Thomas
-;; Version: 0.5.4
+;; Version: 0.6.0
 ;; Keywords: tools, convenience
 ;; Package-Requires: ((emacs "27.1"))
 

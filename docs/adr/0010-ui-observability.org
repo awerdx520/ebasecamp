@@ -1,0 +1,148 @@
+#+title: ADR-0010 界面观测能力（按钮显示键 / hjkl 导航 / 按字母跳转）
+#+date: 2026-10-26
+#+status: 已接受（Accepted）
+
+* 背景
+
+到 v0.5 为止界面的 *可发现性* 与 *可达性* 都没跟上功能增长，三处缺口同源 —— 「能力都在，但用户看不见也走不到」：
+
+- *键位只存在于 =?= 帮助里*。根级键从 16 条涨到 21 条（含新增的 =f= / =j= / =k= / =h= / =l= 之前是 16 条），段级 5 条，全部只在 =?= 弹出的帮助页里列出。底栏的 =导入 compose= / =导出 compose= / =销毁环境= 与段头的 =启动选中= / =停止选中= / =重启选中= 六个按钮 *没有任何键提示* —— 用户要么记住 =I= / =o= / =D= / =s= / =x= / =r= ，要么每次都开帮助页对照。
+- *导航只有「换组」与「跳区域」两档*。=n= / =p= 换组、=1= / =2= / =3= 跳区域，中间 *没有焦点级移动* 。vim 用户的肌肉记忆（=j= / =k= 上下、=h= / =l= 折叠展开）全部落空，只能靠 =TAB= 线性遍历或方向键。
+- *组多时只能在树里翻*。组数一多，从「当前组」到「某个配置的服务行」要一路 =TAB= 或方向键；清单大到几十个组时，翻树比敲命令还慢。
+
+* 决策
+
+** 1. 按钮直接显示键提示，键位事实源不动
+
+=ebasecamp-ui--footer-button= 与 =ebasecamp-ui--section-button= 各新增一个可选参数 =KEY= ，内部经 =ebasecamp-ui--button-label= 拼成 =[KEY] LABEL= （=KEY= 为 nil 时 *逐字节* 返回原 label，既有两参调用的输出不变）。底栏传 =I= / =o= / =D= ，段头传 =s= / =x= / =r= ，渲染结果形如 =[I] 导入 compose= 、 =[s] 启动选中= 。
+
+*调用方的 =label= 参数值保持不变* ，这是本决策的硬约束：=ebasecamp-ui--goto-section= 用 =(search-forward "启动选中")= 定位段头（锚点是文案本身），测试 =header-buttons-disabled-when-busy= 断言的是 label 参数（不是渲染文本）。键提示只发生在 *渲染* 一步，参数层零变更，两处锚点都不破。
+
+新增常量 =ebasecamp-ui--button-key-hints= （=((LABEL . KEY) …)= ，6 条）作为 *渲染索引* 。它 *不是* 键位事实源 —— 键位的唯一事实源仍是 =ebasecamp-ui--root-keys= / =ebasecamp-ui--section-keys= 。索引存在的唯一目的是「按钮文案（短形式）→ 键名」的查表：底栏三条两者逐字相同，段级键表用的是更长形式（=启动该段选中= ）。
+
+** 1a. 一致性判据与其局限
+
+测试 =button-key-hints-match-key-tables= 断言两件事：
+
+1. 每个 =(LABEL . KEY)= 的 *KEY 必须存在于* 某张键表（=--root-keys= 或 =--section-keys= ）；
+2. 命中条目的 *键表 LABEL 必须「按序包含」按钮 LABEL* （subsequence：按钮文案的字符顺序出现在键表文案里，不要求连续）。
+
+第 2 条 *不是* 前缀判据，这一点是实测推翻计划假设的结果：计划原写 =(string-prefix-p "启动选中" "启动该段选中")= ，实测返回 *nil* —— 「启动该段选中」的第三个字符是「该」，「选中」被插在中间。前缀判据在段级根本不成立，写进测试会立刻红。
+
+「按序包含」是 *弱一些* 但可机械检查的约束：它拦得住「键绑错」（KEY 不在表里）与「文案换成不相干措辞」（字符顺序不满足），又不要求两处逐字相同。代价记在「已知边界」。
+
+** 1b. 连带修复：勾选列定位与文案解耦
+
+键提示引入 =[s]= 与 =[x]= 之后，测试助手 =ebasecamp-ui-test--goto-first-checkbox= 原先的 =(search-forward "[")= 立刻抢先命中 *段头按钮的键提示* （段头在服务表上方），随后 =--checkbox-ref-at-point= 解出 nil，既有用例 =checkbox-refs-are-stable= 与 =spc-activates-checkbox= 变红（实测 2 项）。
+
+「只认 mark 字形」同样不行：=etaf-ui= 的 checkbox 只产出 =[ ]= 与 =[x]= 两种 mark，而 =[x]= 恰好也是「停止选中」的键提示 —— 两种语义在文本层不可区分。
+
+最终实现改为 *候选 mark + ref 自校验*：逐个尝试 =[ ]= / =[x]= 候选，用 =--checkbox-ref-at-point= 判断是否真的落在 checkbox mark 内（能解出 ref 才算命中），按钮提示里的 =[x]= 因解不出 ref 被跳过。这样以后改按钮文案或键提示格式都不必再动定位函数。
+
+** 2. hjkl：焦点移动 + 树内折叠，不设全局方向方案
+
+新增 4 个 *零参* 交互命令 =--move-focus-up= / =-down= / =-left= / =-right= ，每个只转交非交互 helper =--move-focus= 到 =(etaf-direction DIRECTION)= 。
+
+*不能直接把 =etaf-direction= 绑进 =:keys=* ：它有 =(interactive)= 且会 =completing-read= 问方向（=etaf-keys.el:695= 附近），按键时会先弹提示；而 =:keys= 的 COMMAND 槽要求 =commandp= 且走 =call-interactively= ，零参包装是唯一干净写法。这与 ADR-0004「区域跳转绑零参命令而非 =--focus-region= 」是同一类约束。
+
+语义分工：
+
+| 键 | 动作 | 选中组 | 树内实际路径 |
+|---+---+---+---|
+| =j= / =k= | 移动 *焦点* 下 / 上 | *不变* | 方向链路 |
+| =h= / =l= | 折叠 / 展开 | 不变 | 先由 =etaf-tree= 分支节点的 =:on-direction= 消费（展开态 =h= 收起、收起态 =l= 展开），到边界才落回方向移动 |
+| =n= / =p= | 换组 | 变更 | 既有，语义未动 |
+
+=j= / =k= 移动的是 *焦点* 而非选中组 —— 换组仍由 =n= / =p= / =RET= / 鼠标负责。理由：把 =j= / =k= 做成换组会让「在服务表里上下移动」变成「切走整栏」。
+
+=h= / =l= 的折叠 *不新增任何树代码* ：折叠完全由 =etaf-ui= 的 =etaf-tree= 承担（=etaf-ui-advanced.el= 里分支节点 =right= 未展开则 =toggle= 并返回 =handled= 、=left= 已展开则 =toggle= 并返回 =handled= ，其余 =release= ）。展开态按 =l= 会 =release= 到方向移动并*外溢到右栏*（实测焦点 ref 从树的首个停靠点跳到右栏首个停靠点），属框架既有行为，接受。
+
+四个键 *追加到 =--root-keys= 表尾*：插到前面会挤掉 =help-surface-mentions-keys= 首屏的 4 条断言（帮助页按视口裁剪，前几条才是必现的）。精确集合用例 =root-keys-complete= / =root-keys-final-set= 随之从 16 更新到 20（本批次）→ 21（批次 3 加 =f= ）。
+
+** 3. =f= 按字母跳转：avy 是可选依赖
+
+=f= 绑 =ebasecamp-ui-avy-jump= 。avy 走 *可选依赖* ：=--avy-available-p= 是唯一判定入口（=(require 'avy nil t)= ），未装 avy 时降级 =completing-read= 选候选名。仓库的「零外部依赖（除 etaf / etaf-ui）」约束因此不破 —— avy 缺席只是少一个提示样式，功能仍在。
+
+分层实现（每个环节可单独打桩，测试不依赖真实 avy）：
+
+| 函数 | 职责 |
+|---|---|
+| =--avy-available-p= | =(and (require 'avy nil t) t)= |
+| =--avy-targets= | *纯函数* ，从会话 state 产出 =((NAME . KEY) …)= （组 / 配置 / 服务行），按 KEY 去重 |
+| =--target-position= | KEY → buffer 位置（唯一碰 buffer 的环节） |
+| =--jump-to= | 位置 + 搬焦点 |
+| =--avy-jump-visible= | avy 分支 / =--prompt= 降级分支 |
+| =ebasecamp-ui-avy-jump= | 命令本体：收集 → 暂停轮询 → 选一个 → 恢复 |
+
+*轮询暂停规则*：跳转前保存 =(ebasecamp-status-running-p)= 与 =ebasecamp-status--tick-function= ，=unwind-protect= 中 *仅当原本 running 时* 才 =start= 回去，并把保存的 tick-function 传回。两个接口细节必须遵守（=lisp/ebasecamp-status.el=）：=ebasecamp-status-stop= 会 *清空* =--tick-function= ，=ebasecamp-status-start= 会 *立即 tick 一次* （跑 =docker ps= ）。不暂停轮询的话，3 秒刷新会重渲染并重写行，avy 的 overlay 可能错位或残留。
+
+** 3a. 树项位置解析：计划假设被实测推翻
+
+计划原写「ref → =etaf-runtime-host-node= → =ebox-node-position= 取位置」。实测 *对树 key 恒 nil* ：
+
+- =etaf-tree= 是 =etaf-ui= 组件， *不为条目生成 ref* ，条目节点也没有 =id= / =key= / =data= / =:help-echo= / =:aria-label= （=etaf= 把 =:aria-label= 从 fallthrough 里滤掉，见 =etaf-view.el= 的 =etaf--owned-semantic-property-p= ）。
+- 按 *绘制文本* 匹配同样不可行：窄栏里树标签被截断，且截断后的绘制区间会 *与右栏文本粘连* —— 实测配置条目节点的 bounds 文本是 ="     dev → 示例项  MySQL"= ，尾部粘上了右栏内容。
+
+因此改用「 *可见条目顺序 ↔ 树内 =etaf-button= 顺序* 对齐」+ *数量必须相等* 的安全阀（=--tree-target-position= ）：两者数量不等就返回 nil，放弃全部树类候选。「宁可跳不了，也不跳错」—— 服务行候选仍走可靠的 ref 路径（=--row-ref= 是插件自己声明的 Host ref），所以数量不等时界面不会整体失效。
+
+** 3b. =f= 只搬焦点，不写状态
+
+=f= 只做「移动 point + 把 ebox 焦点搬到同一节点」， *不改选中组、不切勾选* 。计划曾提「降级分支用 =--select-key= 或 =--toggle-row= 」，实测两者都不合适：
+
+- =--select-key= 会重建 state 并触发整树重渲染 → 刚落点的位置立刻失效（跳完即失焦）；
+- =--toggle-row= 把 *导航键变成写操作* —— 按个跳转键就把某服务的勾选翻转了。
+
+选中组仍由 =n= / =p= / =RET= / 鼠标负责。
+
+** 3c. 视口外目标
+
+=ebox-node-position= 对未绘制节点返回 nil。这类候选 *跳过* ；全部候选都不可见时 =message= 说明「没有可见的跳转目标」， *不 goto 到错误位置* 。
+
+* 已知边界
+
+| 边界 | 说明 | 触发条件 |
+|---|---|---|
+| 树项对齐依赖渲染顺序 | =--tree-target-position= 假定「可见条目顺序 ↔ 树内按钮顺序」。=etaf-ui= 升级若给树加额外按钮或改分段渲染，数量校验会让 *所有组 / 配置候选静默失效* （跳不了但不会跳错，服务行候选仍可用） | 升级 =etaf-ui= 后必须回归 =f= 用例 |
+| avy 真实路径无 ERT | =Makefile= 的 =ELPA_LOAD_PATH= 不含 avy（刻意保持零依赖），ERT 里一律打桩 =--avy-available-p= / =avy-process= 。真实 avy 交互（提示字母、overlay 生命周期、与 etaf 键层叠加）只有 batch 探针 + 目检覆盖 | 见技术债 #44 |
+| 按钮文案与键表 LABEL 的判据是弱约束 | 「按序包含」拦得住不相干措辞与键绑错，但若将来把段级键表 LABEL 改成完全无关的短形式，可能仍通过或误报 | 见技术债 #45 |
+| =f= 与 evil 的 char motion 心智冲突 | 界面内 =f= 是跳转，不是 evil 的 =f= 。根 Host 的 =:key-scope 'local= 优先，实测无冲突；但用户从 evil 带过来的肌肉记忆会短暂错位 | 文档已注明 |
+| 展开态 =l= 外溢到右栏 | =etaf-tree= 在 =l= 且已展开时 =release= ，落回方向移动 → 焦点跳到右栏首个停靠点 | 框架行为，不修 |
+
+* 否决项
+
+** ① =etaf-set-direction-scheme 'vim=
+
+它把 vim 方向方案设成 *全局变量* ，而本插件已有大量既有 Host 键位（=:keys= 里显式绑的方向语义）；两者冲突时 etaf 直接 =user-error= ，且影响同一 Emacs 内所有 etaf 应用。为一个插件的键位偏好改全局框架状态，代价与收益不对等。改为在插件侧绑 *自己* 的零参命令，走同一条 =etaf-direction= 链路。
+
+** ② 为树条目改 =etaf-ui= 组件加 ref
+
+给 =etaf-tree= 的条目节点加稳定 ref 能根治「按序对齐」的脆弱性，但那是 *改框架组件* ，超出插件边界：要改 =etaf-ui-advanced.el= 的树渲染、承担上游版本的合并成本，且上游未必接受。当前方案用数量校验把风险限制在「跳不了」（可用性降级）而非「跳错」（正确性缺陷），在插件边界内已达可接受水平。若 etaf 未来自己提供稳定 ref / 位置 API，改回 ref 路径并删掉对齐逻辑（见技术债 #43）。
+
+** ③ 把 =f= 做成「选中并切换勾选」
+
+看似「一步到位」，实则把导航键变成写操作：用户想「跳到第 5 个服务看看」却顺手改了它的勾选状态，下次 =启动选中= 的范围与预期不符，且这种误写 *没有撤销入口* （勾选状态不进 undo）。导航与写操作必须是两类键。
+
+* 验证证据
+
+- *ERT*： =make check= 全绿 —— =Ran 479 tests, 479 results as expected, 0 unexpected= ；=compile= 零 warning；=check-parens OK (26 files)= 。基线 468 → 479（批次 1 +4 / 批次 2 +2 / 批次 3 +5）。
+- *真实界面* （batch 探针 + 目检，avy 加入 load-path 后走 =execute-kbd-macro (kbd "f a")= 真实路径）：按 =f= → 出现字母提示 → 按 =a= 选中第一个候选 → =point= 与 ebox 焦点落在同一位置（组 =mysql= 的树按钮，位置 46）→ =overlay-lists= 前后都是 0（ *无 overlay 残留* ）→ 状态轮询暂停后恢复（=running-p= 仍为 =t= 、=--tick-function= 仍在）。
+- *avy 与 etaf 键层 / 只读 buffer 无冲突*：未走「自实现字母提示」的降级方案。
+- *=h= / =l= 折叠*（探针实测，单组 =mysql= 默认展开）：展开态 =h= → =expanded= 由 =("group/mysql")= 变为 =nil= ，焦点 ref 不变；收起态 =l= → 恢复 =("group/mysql")= ；展开态 =l= → 外溢到右栏。
+
+* 与既有 ADR 的关系
+
+- *扩展 ADR-0003*：ADR-0003 决策 3 的「未绑定 printing key 一律被吞」不变，本 ADR 只是把 =f= / =j= / =k= / =h= / =l= 从「被吞」变成「已绑定」；键位仍只声明在 Host =:keys= （=--root-keys= ），未回退到 mode-map。
+- *沿用 ADR-0004*：=:keys= 的 COMMAND 槽必须零参 + =commandp= 这一约束（ADR-0004 决策 4 在 =1= / =2= / =3= 上踩过），本 ADR 的 4 个 =--move-focus-*= 与 =ebasecamp-ui-avy-jump= 同样遵守。
+- *补充 ADR-0004 的焦点语义*：=j= / =k= 是 *区域内* 焦点移动，与 =1= / =2= / =3= 的 *跨区域* 跳转互补，两者都不改选中组。
+
+* 不变量
+
+*无新增不变量* 。不变量 12（UI buffer 只读 + 键位经 Host =:keys= ）与不变量 13（渲染区不硬编码色值）均不受影响：按钮键提示是纯文本前缀、不引入新色值；avy 只用 overlay、不改 buffer。既有 16 条精确集合断言（=root-keys-complete= / =root-keys-final-set= ）已随批次更新到 21 条，继续充当键表漂移防线。
+
+* 状态
+
+*已接受* （2026-10-26，0.6.0）。
+
+实现记录与逐批次实测（用例分摊、红 / 绿灯证据、探针结论、与计划的偏差）见 =openspec/completed/2026-10-26-ui-observability.md= 的「批次记录」一节。测试基线 468 → 479。
+
+引用：ADR-0003（UI buffer 只读化与 etaf Host 键位 —— 本 ADR 扩展其键位来源，不改边界语义）；ADR-0004（UI 布局、主题与导航 —— 沿用其「=:keys= 绑零参命令」约束，补充焦点级移动）。相关技术债：[[file:../../openspec/tech-debt.md][#43]]（树项对齐依赖渲染顺序）、[[file:../../openspec/tech-debt.md][#44]]（avy 真实路径无 ERT）、[[file:../../openspec/tech-debt.md][#45]]（按钮文案与键表 LABEL 的判据是弱约束）。

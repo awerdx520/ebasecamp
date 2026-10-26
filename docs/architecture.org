@@ -235,11 +235,31 @@ ebasecamp 是 Emacs 里的 Docker 环境分组管理插件。v0.2 起，模型�
 
 | 层 | 内容 | 效果 |
 |----+------+------|
-| etaf Host =:keys= | 根 Host 9 条由 =ebasecamp-ui--root-keys= 提供，段 Host 5 条由 =ebasecamp-ui--section-keys= 提供；此外有框架默认的 =?= 帮助 / =TAB= 与 =S-TAB= 焦点移动 / =RET= 激活 / 方向键 | 装在 =emulation-mode-map-alists= 最前面，因此能遮住 evil |
+| etaf Host =:keys= | 根 Host 21 条由 =ebasecamp-ui--root-keys= 提供，段 Host 5 条由 =ebasecamp-ui--section-keys= 提供；此外有框架默认的 =?= 帮助 / =TAB= 与 =S-TAB= 焦点移动 / =RET= 激活 / 方向键 | 装在 =emulation-mode-map-alists= 最前面，因此能遮住 evil |
 | evil emulation map | =i= 进 insert state 等 | 未装 evil 时不存在；装了也被上一层的 local 边界吞掉 |
 | =ebox-buffer-mode= 的 =suppress-keymap= | 未绑定键的兜底抑制 | 优先级最低，挡不住 evil |
 
 结论：界面内 evil 的 =i= 之所以不进 insert，靠的是 *etaf 键层把它吞掉* 这个机制，而不是 =special-mode= 或 =suppress-keymap= 。
+
+** 键位来源：事实源 → 渲染索引 → 按钮文案
+
+键位信息在实现里分三层，方向是单向的（渲染层只能读事实源，不能反过来定义键位）：
+
+| 层 | 载体 | 角色 |
+|---+---+---|
+| 事实源 | =ebasecamp-ui--root-keys= （21 条）/ =ebasecamp-ui--section-keys= （5 条） | *唯一* 键位定义：键名 + COMMAND + 中文 LABEL；=etaf--keys= 从这里取，=?= 帮助也从这里取 |
+| 渲染索引 | =ebasecamp-ui--button-key-hints= （=((按钮文案 . 键名) …)= ，6 条） | 只回答「这个按钮该显示哪个键」，*不* 定义键位、不参与按键分派 |
+| 渲染结果 | 按钮的 =[KEY] LABEL= 前缀（=ebasecamp-ui--button-label= 拼接） | 纯显示层产物，=KEY= 为 nil 时逐字节等于原 label |
+
+- *拼接发生在渲染层*：=--footer-button= / =--section-button= 各接受一个可选 =KEY= ，而 *调用方传的 =label= 参数值不变* 。这是硬约束：=--goto-section= 用 =(search-forward "启动选中")= 定位段头（锚点就是文案），测试 =header-buttons-disabled-when-busy= 断言的是 label 参数而非渲染文本 —— 参数层零变更，两处锚点都不破。
+- *一致性判据*：测试 =button-key-hints-match-key-tables= 断言 ① 索引里的每个 KEY 必须存在于某张键表；② 命中条目的键表 LABEL 必须 *按序包含* 按钮文案（subsequence）。第 2 条 *不是前缀判据* —— =(string-prefix-p "启动选中" "启动该段选中")= 实测为 nil（第三个字符是「该」），前缀判据在段级不成立；按序包含是弱一些但可机械检查的约束，局限记在 ADR-0010 的「已知边界」与技术债 #45。
+- *为什么不合并成一张表*：把按钮文案直接当键表 LABEL 会破坏「帮助文案可独立演进」与「按钮文案短于帮助文案」这两个既有约定。索引表只承载两者之间的 *翻译* ，漂移由测试兜住。
+
+** 勾选列定位改用 ref 自校验
+
+测试助手 =ebasecamp-ui-test--goto-first-checkbox= 原先用裸 =(search-forward "[")= 找勾选列。v0.6 给段头按钮加了键提示（=[s]= / =[x]= ）后，它先命中 *段头按钮的提示* （段头在服务表上方），=--checkbox-ref-at-point= 解出 nil，既有用例随之变红。
+
+「只认 mark 字形」也不行：=etaf-ui= 的 checkbox 只产出 =[ ]= 与 =[x]= ，而 =[x]= 同时是「停止选中」的键提示，文本层不可区分。现在的做法是 *候选 mark + ref 自校验* —— 逐个尝试 =[ ]= / =[x]= ，只有能解出 checkbox ref 的才算命中，按钮提示里的 =[x]= 因解不出 ref 被跳过。定位因此与按钮文案、键提示格式完全解耦。
 
 ** 吞键条件
 

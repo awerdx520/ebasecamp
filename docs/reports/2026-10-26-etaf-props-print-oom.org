@@ -1,0 +1,215 @@
+#+title: etaf batch 探针 OOM 排查报告
+#+subtitle: host props 的 =%S= 打印导致内存耗尽
+#+date: 2026-10-26
+#+options: toc:t
+
+* 摘要
+
+*结论*：探针里的 =(message "… %S" (etaf--keys-props rt ref))= 打印 host props，其中 =:on-press= 是一个 =byte-code-function= 闭包，其环境捕获 etaf runtime / ebox 节点图；=print-circle= 默认为 =nil= 时，Emacs 打印器对共享子结构（DAG）不去重、完整重复展开，输出按指数增长。
+
+- 加 =ulimit -v 3000000=（3 GB）后：26 秒耗尽 3 GB，报 =Memory exhausted=，退出码 255。
+- 原始运行没有任何内存上限：最终耗尽整机内存（anon 约 14.3 GiB），8 GiB swap 归零。
+- 单变量对照即可定性：只打印 ref → 292 ms 正常；打印 props → 26055 ms 后爆；同一路径加 =print-circle= → 329 ms 正常。
+
+两点边界必须明确：
+
+1. *不是* ebasecamp 的代码缺陷 —— =base= / =dir= 两个变体证明界面构建与方向链路正常，既有 474 个 ERT 用例全绿、未被波及。
+2. *不是* =etaf-direction= 或渲染链路的问题 —— 同一夹具、同一序列，唯一改动是「打印什么」，结果从 292 ms 变成 26 s + 内存耗尽。
+
+* 1. 事件概述
+
+- 触发场景：为 v0.6（=openspec/active/2026-10-26-ui-observability.md= 批次 2）核实 =etaf-direction= 实际行为而写的 batch 探针（脚本快照为用户留存的 =1.log=），执行命令形如：
+
+#+begin_src text
+cd /home/thomas/Workspace/ebasecamp && emacs -Q --batch -L . -L lisp \
+  -L "$HOME/thomas-emacs/.local/straight/build-31.1/etaf" \
+  -L "$HOME/thomas-emacs/.local/straight/build-31.1/etaf-ui" \
+  -L "$HOME/thomas-emacs/.local/straight/build-31.1/ebox" \
+  -L "$HOME/thomas-emacs/.local/straight/build-31.1/ecss" \
+  --eval '(setq load-prefer-newer t)' \
+  -l test/ebasecamp-ui-tests.el -l /tmp/ebc-hjkl-probe.el \
+  2>&1 | grep -E "PROBE|error|Error" | head -40
+#+end_src
+
+- 观察到的症状：命令以 180 s 超时结束，日志里几乎没有任何 PROBE 输出。
+- *观测通道本身的问题（重要，先说）*：=grep= 在管道中全缓冲，进程被强杀时缓冲不 flush；=head -40= 还会提前关管道。因此「无输出」不能作为「脚本没跑到」的证据 —— 本报告的定位全部来自重新设计过观测通道的对照实验。
+- 环境：WSL2 + Arch Linux，Emacs 31.1（straight =build-31.1= 目录），RAM 20002 MB，swap 8192 MB，16 核；实测日期 2026-10-26。
+- 影响面：仅影响调试期探针，不影响插件运行时；既有 474 个 ERT 用例全绿未被波及。
+
+* 2. 结论（根因）
+
+因果链： =%S= 打印 props → 打印到 =:on-press= 的 =byte-code-function= → 展开其闭包环境 → 环境里的 ebox 节点图含大量共享子结构 → =print-circle= 为 =nil= 时不去重 → 输出指数膨胀 → 内存耗尽。
+
+三条判别依据（每条都是单变量对照）：
+
+1. 同一夹具、同一序列，只改「打印什么」，结果从 292 ms 变成 26 s + =Memory exhausted=；
+2. 只加一行 =(setq print-circle t)=（其余不变）即恢复到 329 ms；
+3. 只跑 =etaf-direction= 且只打印返回的 ref，297 ms 正常。
+
+* 3. 证据链
+
+** 3.1 对照实验（单变量）
+
+| 变体 | 打印内容 | 退出码 | 耗时 | 结果 |
+|---|---|---|---|---|
+| =base= | 只打印 ref =(etaf-host 1 26)= | 0 | 292 ms | 正常 |
+| =props= | 打印 =(etaf--keys-props rt ref)= | 255 | 26055 ms | =Memory exhausted=（3 GB 上限吃光） |
+| =props-circle= | 同上 + =(setq print-circle t)= | 0 | 329 ms | 正常，含 =#15#= 回引 |
+| =desc= | 完整 =--desc= 四字段（:ref/:classes/:props/:label） | 255 | 25501 ms | 同上，打印到 =:on-press= 后爆 |
+| =dir= | 只跑 =etaf-direction 'down= ×2 + 打印返回 ref | 0 | 297 ms | 正常：=(etaf-host 1 26)= → =(etaf-host 1 29)= → =(etaf-host 1 32)= |
+| =orig= | 复跑原探针 | 255 | 25809 ms | 前两条 PROBE 成功，第 3 条起无输出 |
+
+补充 =orig= 变体的前三条输出（原文）：
+
+#+begin_src text
+PROBE expanded-default: ("group/mysql")
+PROBE focused-at-start: nil
+Error: ... Memory exhausted ...
+#+end_src
+
+说明：=expanded-default= 与 =focused-at-start= 能成功，是因为前者打印的是普通列表、后者是 =nil=；第 3 条 =focused-after-focus-region= 开始打印 props 即爆。
+
+** 3.2 逐 key 定位
+
+对 props 的 21 个 key 逐个打印 =(type-of v)=。前 20 个（=:class= =:ref= =:role= =:disabled= =:tab-index= =:aria-label= =:aria-selected= =:help-echo= =:pointer= =:color= =:background-color= =:hover-style= =:border= =:border-radius= =:padding= =:font-size= =:font-weight= =:use= 等）全部瞬时正常；唯一炸点是 =:on-press=，其 =type-of= 为 =byte-code-function=，紧接着打印该值即 =Memory exhausted=。
+
+** 3.3 最小复现（不依赖 ebasecamp）
+
+纯 cons 环 *不会* OOM（推翻「环导致不终止」的直觉）：
+
+#+begin_src elisp
+(let ((a (list 1 2))) (setcdr (cdr a) a) (message "%S" a))
+#+end_src
+
+=print-circle= 为 =nil= → 退出码 0、59 ms、输出 =(1 2 1 2 . #2)=（Emacs 自带截断）；=print-circle= 为 =t= → 输出 =#1=(1 2 . #1#)=。
+
+共享 DAG 才会爆（与 props 同型机制）：
+
+#+begin_src elisp
+(let ((x (list 1))) (dotimes (_ 26) (setq x (list x x))) (message "%S" x))
+#+end_src
+
+=print-circle= 为 =nil= → 退出码 0、17618 ms、输出 402,653,186 字节（2^26 项）；=print-circle= 为 =t= → 64 ms、276 字节。
+
+注意：这里「退出码 0」不代表安全 —— 3 GB 上限下该构造仍能完成，只是极慢且产出 400 MB 文本；props 的对象图比这个构造更大，因此在 26 s 处撞上 3 GB 上限。
+
+** 3.4 为什么 474 个 ERT 用例全绿
+
+=test/ebasecamp-ui-tests.el:3684=（=j-k-move-focus-not-selection=）与 =:3710=（=h-l-toggle-tree-expansion=）只用 =ebasecamp-ui-test--focused-ref= 比较 =(etaf-host N M)= 这类普通列表，从不打印 props 或 ebox 节点。=--focused-ref= 的 docstring 已经警告「节点带 parent 指针（圆形结构），不要 =equal=」。即： *既有防线一直有效，是探针绕开了它*。
+
+* 4. 机制解释
+
+- =print-circle= 为 =nil= 时，Emacs 的 printer 只对 *环* 做截断（输出形如 =. #2=），对 *共享但不构成环* 的子结构 *完全不去重*：同一 cons 被两处引用就完整打印两遍。引用层数每加一层，输出规模翻倍。
+- =print-level= / =print-length= 是独立的两道闸：前者限制嵌套深度、后者限制每层元素个数。任一为非 =nil= 都能把输出压回可控规模。
+- =:on-press= 是 =byte-code-function=，打印它必然展开其闭包环境；环境里挂着 etaf runtime 与 ebox 节点（节点带 parent 指针，且大量节点共享同一子树），于是命中上面的指数路径。
+- 补充：=etaf--keys-props=（=etaf/lisp/etaf-keys.el:255=）的 docstring 明确写着 "without copying"，即返回的是 runtime 内部的 *活对象* 而非快照 —— 它本来就不适合被整体打印。
+
+* 5. 排除的假设（含被推翻的）
+
+| 假设                                      | 判定            | 依据                                              |
+|------------------------------------------+----------------+--------------------------------------------------|
+| H1 祖先链与 =:parent= 成环导致无限遍历         | ✗ 推翻          | =dir= 变体 297 ms 正常，只跑方向链路不炸               |
+| H2 focus → regions note-focus → 重渲染自激 | ✗ 推翻          | =base= 变体 292 ms 正常，同序列同界面构建              |
+| H3 探针对派生结构做 =%S= 打印                 | ✓ 成立（触发点） | 只改打印内容即从 292 ms 变 26 s + 内存耗尽           |
+| H4 native-comp 重编译放大                  | ✗ 无关          | =base= 变体 292 ms，编译产物相同                      |
+| H5 「环让 printer 不终止」                 | ✗ 推翻          | 纯环 59 ms 自带截断（=. #2=）                       |
+| H6 共享 DAG 无去重导致指数展开               | ✓ 成立          | 实测 2^26 项 / 402 MB，加 =print-circle= 降到 276 字节 |
+
+* 6. 现场证据的两处偏差（如实记录）
+
+** 6.1 dmesg 中没有 oom-kill 记录
+
+=grep -icE 'oom-kill|Killed process|out of memory'= 结果为 *0*。实测到的是内存压力现场：
+
+#+begin_src text
+Under memory pressure, flushing caches.        （17:32:16 起，共 11 条，持续到 17:37:37）
+kworker/0:0: page allocation failure: order:6, mode:0xdc0(GFP_KERNEL|__GFP_ZERO)   （17:37:22）
+active_anon:3742774 inactive_anon:839551 ... free:33181 free_pcp:5605
+Node 0 active_anon:14971096kB inactive_anon:3358204kB
+Free swap  = 0kB          Total swap = 8388608kB
+#+end_src
+
+=active_anon= 约 14.3 GiB、swap 全满、剩余约 130 MB 是「内存耗尽」的直接证据，但 *不能据此断言是 oom-killer 击杀* （记录可能被 WSL 环形缓冲覆盖，也可能终态是分配失败）。本条不改写用户的观察，只标注证据缺口。
+
+** 6.2 =ulimit -v= 为 unlimited
+
+=ulimit -v= 为 =unlimited=（hard 亦为 =unlimited=）—— 这是能吃到 14.3 GiB 的直接条件；加上 =ulimit -v 3000000= 后同一路径 26 s 报 =Memory exhausted=（exit 255）即收敛。
+
+** 6.3 时间线
+
+| 时间 | 事件 |
+|---|---|
+| 17:28:11 | 探针脚本落盘 |
+| 17:28:13 | 第一次运行创建 =/tmp/ebasecamp-ui-cache-0wdRm9=、=/tmp/ebasecamp-ui-test-am0hc1= |
+| 17:32:16 起 | 内存压力（=Under memory pressure= 共 11 条，持续到 17:37:37） |
+| 17:37:22 | =page allocation failure: order:6= |
+| 17:37:46 | 第二次运行创建 =/tmp/ebasecamp-ui-cache-XDH1oN=、=/tmp/ebasecamp-ui-test-a2hf7y= |
+
+残留的临时目录说明 =unwind-protect= 未执行完 → 进程被硬杀。仓库根的 =ebasecamp-ui-cache-y9qz1E=（17:09:56）与 =test-nativecomp-cache-ep6LXi=（17:09:35）早于本次事件，不属于本次。
+
+* 7. 复现步骤与安全护栏
+
+每条命令都必须带护栏 —— 原始运行没有任何内存上限。模板：
+
+#+begin_src text
+cd /home/thomas/Workspace/ebasecamp && bash -c 'ulimit -v 3000000; \
+  /usr/bin/timeout -s KILL 60 emacs -Q --batch -L . -L lisp \
+    -L "$HOME/thomas-emacs/.local/straight/build-31.1/etaf" \
+    -L "$HOME/thomas-emacs/.local/straight/build-31.1/etaf-ui" \
+    -L "$HOME/thomas-emacs/.local/straight/build-31.1/ebox" \
+    -L "$HOME/thomas-emacs/.local/straight/build-31.1/ecss" \
+    --eval "(setq load-prefer-newer t)" \
+    -l test/ebasecamp-ui-tests.el -l /tmp/probe.el \
+    > /tmp/probe.log 2>&1'
+#+end_src
+
+说明：
+
+- 3 GB 虚拟内存足够 Emacs 启动（实测无需提到 4 GB；更大夹具是否仍需更多，未验证）。
+- 输出重定向到文件，不要接 =grep= / =head= —— 管道缓冲会让「内存耗尽前最后几条输出」丢失（见第 1 节）。
+- 用 =timeout -s KILL= 而不是默认 TERM，避免 Emacs 忽略信号继续跑。
+
+* 8. 规避方案（探针写法模板）
+
+安全全量打印（必须同时设三个变量）：
+
+#+begin_src elisp
+(let ((print-circle t) (print-level 4) (print-length 20))
+  (message "PROBE props: %S" props))
+#+end_src
+
+只看结构不看值（最推荐）：
+
+#+begin_src elisp
+(cl-loop for (k v) on props by #'cddr
+         collect (cons k (type-of v)))
+#+end_src
+
+只打印可信的窄字段：ref（=(etaf-host N M)= 普通列表）、=:aria-label=、=(type-of v)=。
+
+规则： *任何 etaf/ebox 结构（props / ebox node / closure 环境）都不得裸 =%S= 打印*。
+
+* 9. 影响面与后续建议
+
+- 代码层面：零缺陷。=base= / =dir= 两个变体证明界面构建与方向链路正常；474 用例全绿未被影响。
+- 尚存风险：任何人在调试期打印 etaf 内部结构都会重踩；=etaf--keys-props= 是内部函数（=--= 命名），返回活对象且 docstring 声明 without copying。
+- 建议（尚未执行）：
+  1. 探针模板固化到本报告第 8 节并为团队引用；
+  2. 在 =openspec/tech-debt.md= 增加一条「调试期禁止裸打印 etaf props/节点」；
+  3. 可选：向 etaf 上游提 docstring 级安全提示（优先级低）。
+- 未解点（诚实的 open question）：dmesg 无 oom-kill 记录，杀死者未确证。候选：内核 oom-killer 但记录被环形缓冲覆盖 / 分配失败引导的进程终止 / WSL 侧内存压力处理 —— 三者均 *未验证*。
+
+* 10. 附录
+
+签名文件清单（都是临时文件，不入仓库）：
+
+#+begin_src text
+/tmp/ebc-oom-probe/probe.el
+/tmp/ebc-oom-probe/step-*.log
+/tmp/ebc-oom-probe/min-*.log
+/tmp/ebc-oom-probe/dag-*.log
+/tmp/ebc-oom-probe/orig-probe.log
+/tmp/ebc-dmesg.txt
+#+end_src
+
+复核方法：本报告全部数字来自上述临时日志；若需复核，请按第 7 节的护栏重跑对应变体（=base= / =props= / =props-circle= / =desc= / =dir= / =orig=）。
