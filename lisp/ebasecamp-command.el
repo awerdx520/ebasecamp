@@ -455,7 +455,7 @@ WARNINGS 为字符串列表：ROOT 为 nil 而声明是相对路径时无法判�
           (unless (file-exists-p file)
             (push (list :kind kind :name name :file file :base file) missing)))
          ((null root)
-          (push (format "项目 %s 无 :root，无法校验顶层 %s `%s' 的 file `%s'"
+          (push (format "项目 %s 无 :root，无法校验顶层 %s `%s' 的 file `%s'（运行时将按生成物所在目录解析）"
                         (ebasecamp-project-name object) kind name file)
                 warnings))
          (t
@@ -543,7 +543,9 @@ root（不从 shared 配置的 `:project' 反推）。
 BRANCHES 为原分支列表，PREFLIGHT 为 `ebasecamp-command--preflight' 的返回值；
 校验失败的分支带 `:failed t'（含 `:exit' 与 `:stderr'），其余分支标
 `:skipped t'（一律未执行）。AUTO 表示 shared 批次是否为跨 scope 依赖自动补齐。
-字段与成功路径一致，便于 `ebasecamp-ui--report-result' 统一渲染。"
+字段与成功路径一致，便于 `ebasecamp-ui--report-result' 统一渲染：
+`:preflight-warnings' 直接取 PREFLIGHT 的同源字段（**不重新计算**），因此
+失败时也能在提示里注明「有 N 条声明没能校验」。"
   (let* ((failure (plist-get preflight :failure))
          (failed-index (plist-get failure :index))
          (failed (plist-get failure :result))
@@ -562,7 +564,8 @@ BRANCHES 为原分支列表，PREFLIGHT 为 `ebasecamp-command--preflight' 的�
           :ok nil
           :results results
           :auto-started-shared (and auto t)
-          :order nil)))
+          :order nil
+          :preflight-warnings (plist-get preflight :preflight-warnings))))
 
 (defun ebasecamp-command--dispatch (action object name branches
                                           sequential auto-shared on-complete

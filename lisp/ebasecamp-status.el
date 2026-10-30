@@ -158,7 +158,14 @@ docker 在容器无健康检查时输出 \"none\"，它不是一种健康状态�
       (sort entries #'ebasecamp-status--entry-lessp))))
 
 (defun ebasecamp-status-group-records (records project group)
-  "从 RECORDS 中取出属于 PROJECT 项目 GROUP 组的状态记录（保持原顺序）。"
+  "从 RECORDS 中取出属于 PROJECT 项目 GROUP 组的状态记录（保持原顺序）。
+
+**不含 scope 语义**：只按 `:project' 与 `:group' 精确双键过滤，`:scope' 不参与
+判定。shared 容器的 `ebasecamp.project' 标签记的是**发起项目**而非本配置的
+项目（D8），因此 shared 组不能用本函数取记录 —— 匹配 shared 请用
+`ebasecamp-data--instance-status'（`:scope' 为 \"shared\" 时按组名 + 服务名命中、
+忽略项目名；索引由 `ebasecamp-data--instance-indexes' 建立），或直接用上层装配
+入口 `ebasecamp-data-group-instances'。"
   (cl-remove-if-not (lambda (record)
                       (and (equal (plist-get record :project) project)
                            (equal (plist-get record :group) group)))

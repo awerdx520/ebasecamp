@@ -1372,16 +1372,23 @@ ROLLBACK 是「撤掉本次新增 / 删除」的无参函数；它自己失败�
             ")\n")))
 
 (defun ebasecamp-config-write--check-root (project root)
-  "校验 ROOT 是项目 PROJECT 的根目录，返回 ROOT。
+  "校验 ROOT 是项目 PROJECT 的根目录，返回 ROOT 去掉首尾空白后的结果。
 **nil 是合法状态**（无根目录项目：不参与目录定位、不作路径基准、导出须显式选
-路径，见 AGENTS 不变量 16）；非 nil 时必须是去掉首尾空白后仍非空的字符串——
-空串与纯空白仍拒绝，否则「键存在但值为空」会与「键不存在」两种形态并存。
+路径，见 AGENTS 不变量 16），此时原样返回 nil（不参与 trim）。非 nil 时必须是
+去掉首尾空白后仍非空的字符串——空串与纯空白仍拒绝，否则「键存在但值为空」会与
+「键不存在」两种形态并存。
+
+**返回值是 trim 后的路径，调用方应把它写回自己的 `root' 变量**（形如
+`(setq root (ebasecamp-config-write--check-root project root))'），否则带空白的
+原值会原样落盘。调用点必须保留 `(when root ...)' 外层判空：nil 分支不得进
+trim，也不得因 trim 把 nil 变成空串。
+
 清单只保存引用（相对路径可原样保留），因此只做形状检查：不解析、不展开 `~'、
 不访问文件系统。"
   (unless (or (null root)
               (and (stringp root) (not (string-empty-p (string-trim root)))))
     (user-error "项目 %s 的根目录必须是非空字符串或 nil，得到 %S" project root))
-  root)
+  (when root (string-trim root)))
 
 (defun ebasecamp-config-write--plist-remove (plist key)
   "返回从 PLIST 去掉 KEY 之后的**新** plist，其余键保持原有顺序。
@@ -1410,7 +1417,8 @@ NAME 必须是合法实体名（`[a-z0-9_-]+'）；TITLE 省略时取项目名�
 成功返回写后的加载结果（`plist-get' 取 `:errors' 为 nil 表示无新增错误）。"
   (let* ((project (ebasecamp-config-write--entity-name name "项目名")))
     (when root
-      (ebasecamp-config-write--check-root project root))
+      ;; 回写 trim 后的值：后续落盘用的是这个变量，不回写就落原值
+      (setq root (ebasecamp-config-write--check-root project root)))
     (when (and title (not (stringp title)))
       (user-error "项目 %s 的标题必须是字符串，得到 %S" project title))
     (let ((file (ebasecamp-config-project-file project)))
@@ -1451,7 +1459,9 @@ CLEAR-ROOT 与 ROOT **互斥**：同时非 nil 即 `user-error'，不静默偏�
       (user-error "项目 %s 的根目录参数互斥：ROOT 与 CLEAR-ROOT 不能同时给出（%S / %S）"
                   project root clear-root))
     (when root
-      (ebasecamp-config-write--check-root project root))
+      ;; 回写 trim 后的值：后续 `plist-put' 用的是这个变量。
+      ;; clear-root 分支 root 为 nil（互斥校验已挡），不会进这里，也不受影响。
+      (setq root (ebasecamp-config-write--check-root project root)))
     (unless (file-exists-p file)
       (user-error "没有项目 %s（文件 %s 不存在）" project file))
     (ebasecamp-manifest--write-transaction

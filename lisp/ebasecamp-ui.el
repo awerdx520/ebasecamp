@@ -53,7 +53,9 @@
 ;; - `etaf-on-mounted' → `ebasecamp-status-start'，回调里调
 ;;   `ebasecamp-ui-refresh'（传入 `ebasecamp-status-last-records'，避免轮询
 ;;   一次刷新跑两次 `docker ps'）；
-;; - `etaf-on-unmounted' → `ebasecamp-status-stop' + 取消提示定时器；
+;; - `etaf-on-unmounted' → `ebasecamp-ui--teardown-session'（幂等收尾：卸载主题
+;;   钩子 + 停轮询 + 取消提示定时器 + 会话置 nil；与 `ebasecamp-ui-close' 共用，
+;;   因此 buffer 被直接 `kill-buffer' 时同样收尾）；
 ;; - 树的选择：`:on-select' 把组名写进 `selected-group'，`:on-toggle' 把新的
 ;;   key 列表写进 `expanded'（展开状态由会话持有，重渲染后保持）；
 ;; - 服务勾选的 key 形如 "组名/服务名"（`ebasecamp-ui--instance-key'）：
@@ -226,18 +228,24 @@ splitter 的 `:ratio' 收的就是这个 ref，`etaf-ui--reactive-value' 的追�
                       ratio))
     (ebasecamp-ui--current-split-ratio)))
 
-(defun ebasecamp-ui--save-ui-state ()
-  "把当前左栏宽度占比写入 `ebasecamp-ui--ui-state-file'，返回路径（失败 nil）。
+(defun ebasecamp-ui--save-ui-state (&optional session)
+  "把左栏宽度占比写入 `ebasecamp-ui--ui-state-file'，返回路径（失败 nil）。
+SESSION 显式给出时按它取占比；省略时读当前全局会话（拖动回调走这条路径，
+行为不变）。**`ebasecamp-ui-close' 必须传快照**：幂等 teardown 已把全局
+`ebasecamp-ui--session' 置 nil，不传快照就会落盘默认宽度 0.26（「拖到一半直接
+关闭 → 宽度丢失」）。
 目录不存在时 `make-directory' 递归创建；先写同目录 `make-temp-file' 生成的唯一
 临时文件，再 `rename-file' 原子覆盖目标 —— 避免写一半留下损坏文件（那会让下次
 打开回退默认）。内容只有 `(:split-ratio FLOAT)'：不含密钥、不含清单内容。
 写盘失败只 `message' 不 signal：本函数在 `ebasecamp-ui-close' 与拖动回调里
 调用，缓存目录不可写不应阻断关闭界面。"
   (let ((file (ebasecamp-ui--ui-state-file))
-        ;; `--current-split-ratio' 恒返回数字：会话在时取 ref 值（由
-        ;; `--load-ui-state' / `--set-split-ratio' 写入，均已钳制），无会话时
-        ;; 返回钳制后的 defcustom 默认值或默认常量，因此不需要再 `or' 兜底。
-        (ratio (ebasecamp-ui--current-split-ratio)))
+        ;; 两条取值路径都恒返回数字：SESSION 分支的 ref 值由 `--load-ui-state'
+        ;; / `--set-split-ratio' 写入（均已钳制）；无 SESSION 时
+        ;; `--current-split-ratio' 返回 ref 值或钳制后的默认值，因此不需要再 `or'。
+        (ratio (if session
+                   (etaf-value (ebasecamp-ui-session-split-ratio session))
+                 (ebasecamp-ui--current-split-ratio))))
     (condition-case err
         (let* ((directory (file-name-directory file))
                (temp nil))
@@ -654,6 +662,31 @@ PROJECT 为项目名 symbol（也接受项目对象，内部归一为名字 —�
 `ebasecamp-ui-refresh' 在 buffer 已被外部 kill 后仍可用。"
   (or ebasecamp-ui--session
       (setq ebasecamp-ui--session (ebasecamp-ui--new-session))))
+
+(defun ebasecamp-ui--teardown-session ()
+  "幂等收尾当前界面会话，返回 nil。
+`ebasecamp-ui-close'（正常关闭）与 `etaf-on-unmounted'（组件被销毁，含
+buffer 被 `kill-buffer' 直杀）共用本函数，避免两份逻辑各自漂移。
+
+**幂等门只看全局 `ebasecamp-ui--session'**：为 nil 时直接返回。`close' 先调
+本函数（置 nil），随后 `etaf-unmount' 触发的 `etaf-on-unmounted' 回调、以及直杀
+时 etaf 的 buffer-local `kill-buffer-hook'（`etaf--runtime-buffer-killed'）引发的
+同一条回调，都会落到这里并被门短路 —— 不重复 `remove-hook'、不重复 `cancel-timer'。
+
+收尾**只判全局会话**：`when-let*' 把全局 `ebasecamp-ui--session' 的值绑到局部
+`session'，随后才把全局置 nil —— `etaf-on-unmounted' 的回调闭包体是
+`(ebasecamp-ui--teardown-session)'（B5 已把 `:setup' 的 `let' 改为 `progn'，
+闭包不再捕获渲染期局部变量，而是进函数时重新读全局）。置 nil 只是解绑全局变量，
+`when-let*' 拿到的那个会话对象本身仍存活，故 `--cancel-notice-timer' 不会读空引用。
+
+依次做：卸载主题钩子 → 停轮询 → 取消提示定时器 → 全局会话置 nil。定时器必须
+**先取局部变量再清全局**，否则 `--cancel-notice-timer' 拿不到会话对象。"
+  (when-let* ((session ebasecamp-ui--session))
+    (ebasecamp-ui--theme-hooks-remove)
+    (ebasecamp-status-stop)
+    (ebasecamp-ui--cancel-notice-timer session)
+    (setq ebasecamp-ui--session nil))
+  nil)
 
 ;;; 渲染数据（state）
 
@@ -1238,14 +1271,30 @@ GROUP-NAME 为组名（段内 key 的组部分）。列 `:key' 用关键字，�
     (cl-find-if (lambda (line) (not (string-empty-p line)))
                 (mapcar #'string-trim (split-string text "\n")))))
 
+(defun ebasecamp-ui--with-preflight-warning-note (detail warnings)
+  "在 DETAIL 末尾追加「（N 条预校验警告）」，返回新的 detail。
+WARNINGS 为 `:preflight-warnings'（字符串列表，见
+`ebasecamp-command--preflight'；nil 或空列表时不追加，DETAIL 原样返回）。
+DETAIL 为非空字符串时以空格拼接 —— 失败分支的 DETAIL 是 stderr 原文，直接
+concatenate 会把计数黏在最后一行末尾。纯函数。"
+  (let ((count (if (consp warnings) (length warnings) 0)))
+    (if (zerop count)
+        detail
+      (let ((note (format "（%d 条预校验警告）" count)))
+        (if (and (stringp detail) (not (string-empty-p detail)))
+            (concat detail " " note)
+          note)))))
+
 (defun ebasecamp-ui--report-result (session label result)
   "把批次结果 RESULT 写成 SESSION 的 notice，LABEL 为动作中文名。返回 nil。
 成功 → 绿色完成提示（`:auto-started-shared' 为真时额外说明；
-`:preflight-warnings' 非空时在 detail 末尾追加「（N 条预校验警告）」——
+`:preflight-warnings' 非空时在 message 末尾追加「（N 条预校验警告）」——
 预校验警告不改变成功与否，只是一条「有东西没能校验」的提示）；
 失败 → 从 `:results' 取失败分支的 stderr：含 permission denied 时给 docker
 组提示，否则把 stderr 首行作为 message、原文作为 detail；无 stderr（例如
-批次被跳过）时说明「未完成」。"
+批次被跳过）时说明「未完成」。三个失败分支的 **detail** 同样按
+`:preflight-warnings' 追加计数（message 保持只有 stderr 首行），否则预校验
+失败路径会丢掉「有条声明没能校验」这条线索。"
   (if (plist-get result :ok)
       (let ((warnings (plist-get result :preflight-warnings)))
         (ebasecamp-ui--set-notice
@@ -1258,20 +1307,23 @@ GROUP-NAME 为组名（段内 key 的组部分）。列 `:key' 用关键字，�
                    ""))))
     (let* ((failed (ebasecamp-ui--failed-branch (plist-get result :results)))
            (stderr (or (and failed (plist-get failed :stderr)) ""))
-           (first (ebasecamp-ui--first-line stderr)))
+           (first (ebasecamp-ui--first-line stderr))
+           (warnings (plist-get result :preflight-warnings)))
       (cond
        ((string-match-p "permission denied" (downcase stderr))
         (ebasecamp-ui--set-notice
          session 'error "无权访问 Docker"
          "请将当前用户加入 docker 组并重新登录，或检查 /var/run/docker.sock 权限"
-         stderr))
+         (ebasecamp-ui--with-preflight-warning-note stderr warnings)))
        (first
-        (ebasecamp-ui--set-notice session 'error (format "%s失败" label)
-                                  first stderr))
+        (ebasecamp-ui--set-notice
+         session 'error (format "%s失败" label) first
+         (ebasecamp-ui--with-preflight-warning-note stderr warnings)))
        (t
         (ebasecamp-ui--set-notice
          session 'error (format "%s未完成" label)
-         "部分批次被跳过（没有可展示的错误输出），请查看命令行输出")))))
+         "部分批次被跳过（没有可展示的错误输出），请查看命令行输出"
+         (ebasecamp-ui--with-preflight-warning-note nil warnings))))))
   nil)
 
 (defun ebasecamp-ui--on-complete (session action)
@@ -2815,7 +2867,13 @@ evil 的 `f'（char motion）在界面内失效 —— 界面内 `f' 是跳转�
 (etaf-define-component ebasecamp-ui-app ()
   "渲染 ebasecamp 主界面：顶栏（标题 + 统计 + 刷新）、组树、右栏配置段。"
   :setup
-  (let ((session (ebasecamp-ui-session)))
+  ;; `:setup' 只接受**一个** form（宏把它插到 `let' 的 body 位置），因此多步
+  ;; 必须自己包 `progn'。
+  (progn
+    ;; 调用有副作用：无会话时创建（`etaf-mount' 直接挂本组件也能用）。
+    ;; 收尾不再捕获渲染期局部 session —— `--teardown-session' 进函数时重读全局
+    ;; 会话（`when-let*' 绑到局部后再置全局 nil），见该函数 docstring。
+    (ebasecamp-ui-session)
     ;; 主题必须在这里 provide（`:setup' 阶段），不能在 `:render' 里 ——
     ;; `etaf-provide' 有 `etaf--assert-not-rendering' 守卫，render 期调用会
     ;; signal `etaf-render-side-effect-error (provide-context)'（探针实测）。
@@ -2829,10 +2887,12 @@ evil 的 `f'（char motion）在界面内失效 —— 界面内 `f' 是跳转�
           ;; 轮询刚跑过 `docker ps'：把结果连同「已提供」标记传下去，
           ;; 避免一次刷新采集两次（空表也算已采集）。
           (ebasecamp-ui-refresh (ebasecamp-status-last-records) t)))))
+    ;; 组件被销毁就收尾：正常关闭走 `etaf-unmount'，buffer 被直接 `kill-buffer'
+    ;; 时 etaf 的 buffer-local `kill-buffer-hook' 也会 unmount —— 两条路径都到此。
+    ;; 幂等门保证 `close' 之后不重复执行。
     (etaf-on-unmounted
      (lambda ()
-       (ebasecamp-status-stop)
-       (ebasecamp-ui--cancel-notice-timer session)))
+       (ebasecamp-ui--teardown-session)))
     nil)
   :render
   (let* ((session (ebasecamp-ui-session))
@@ -3156,22 +3216,21 @@ state 的 running / total 统计由 `ebasecamp-ui--build-state' 经
         state))))
 
 (defun ebasecamp-ui-close ()
-  "关闭主界面：卸载运行时（触发 unmounted 收尾）、kill buffer、停轮询、
-取消提示定时器、卸载主题钩子、销毁会话。返回 nil。
-关闭前把左栏宽度占比落盘一次（拖动结束时已存过，这里保证「拖到一半直接关闭」
-也记住；写盘失败不阻断关闭，见 `ebasecamp-ui--save-ui-state'）。"
+  "关闭主界面，返回 nil。
+顺序写死（ADR-0011）：**取会话快照 → 幂等 teardown → 用快照落盘 → 卸载运行时
+→ kill buffer**。不可调换：`--teardown-session' 会把全局 `ebasecamp-ui--session'
+置 nil，`--save-ui-state' 必须拿到快照，否则「拖到一半直接关闭」会落盘默认宽度
+0.26。`etaf-unmount' 触发的 `etaf-on-unmounted' 回调再次进入 teardown，由幂等门
+短路。写盘失败不阻断关闭（见 `ebasecamp-ui--save-ui-state'）。"
   (interactive)
-  (ebasecamp-ui--theme-hooks-remove)
-  (when ebasecamp-ui--session
-    (ebasecamp-ui--save-ui-state))
-  (when-let* ((buffer (get-buffer ebasecamp-ui-buffer-name)))
-    (when-let* ((runtime (etaf-runtime-for-buffer buffer)))
-      (etaf-unmount runtime))
-    (kill-buffer buffer))
-  (ebasecamp-status-stop)
-  (when-let* ((session ebasecamp-ui--session))
-    (ebasecamp-ui--cancel-notice-timer session)
-    (setq ebasecamp-ui--session nil))
+  (let ((session ebasecamp-ui--session))
+    (ebasecamp-ui--teardown-session)
+    (when session
+      (ebasecamp-ui--save-ui-state session))
+    (when-let* ((buffer (get-buffer ebasecamp-ui-buffer-name)))
+      (when-let* ((runtime (etaf-runtime-for-buffer buffer)))
+        (etaf-unmount runtime))
+      (kill-buffer buffer)))
   nil)
 
 ;;; 主模式（buffer 身份与键位）

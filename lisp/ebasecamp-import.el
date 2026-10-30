@@ -410,12 +410,85 @@ compose 的 env_file 合法形态为字符串 / 字符串列表 / {path, require
   (push (apply #'format format-string args)
         ebasecamp-import--last-warnings))
 
-(defun ebasecamp-import--top-level-declarations (object key)
+(defun ebasecamp-import--project-name-from-directory (directory)
+  "把目录名 DIRECTORY 规范化为 compose 项目名；非字符串时返回 nil。
+规范化规则按 2026-10-30 实测（目录名 `EbcProbe2' → `ebcprobe2'、
+`Ebc.Probe_3' → `ebcprobe_3'）：转小写，然后去掉 `[a-z0-9_-]' 之外的字符。"
+  (let ((text (and (stringp directory) (downcase directory))))
+    (when text
+      (let ((normalized (replace-regexp-in-string "[^a-z0-9_-]" "" text)))
+        (and (not (string-empty-p normalized)) normalized)))))
+
+(defun ebasecamp-import--derived-name-prefixes (object file)
+  "返回识别「compose 派生 name」的前缀候选列表（0 或 1 项，非空串）。
+候选**互斥**，按探测结论收敛为**单项**（2026-10-30 实测，docker 29.9.0，四个 flag
+全带；原始记录见 `ebasecamp-import--top-level-declarations' 的注释）：
+- OBJECT 顶层 `name' 存在 → 派生前缀**恒为顶层 `name''，FILE 的父目录名不参与；
+- 否则 FILE 非 nil → 只用父目录名经 compose 规范化后的结果（无顶层 name 时的
+  项目名来源）；
+- 两者都取不到 → nil（调用方据此不删任何 `name'，宁留勿删）。
+故本函数**不得**把两者并集：并集会让「有顶层 name + 用户显式写
+`<目录名>_<键>'」被误判为派生值删除（v0.7 code-review major）。
+纯函数，不读全局状态。"
+  (let ((prefix (or (ebasecamp-import--string-field object "name")
+                    (and file
+                         (ebasecamp-import--project-name-from-directory
+                          (file-name-nondirectory
+                           (directory-file-name
+                            (file-name-directory (expand-file-name file)))))))))
+    (and prefix (list prefix))))
+
+(defun ebasecamp-import--derived-declaration-name-p (name suffix prefixes)
+  "NAME 是否为 SUFFIX 的 compose 派生 name（PREFIXES 中任一项命中即为真）。
+派生格式 `<前缀>_<条目键>'；NAME 非字符串或 PREFIXES 为空时返回 nil。
+PREFIXES 为候选列表，按 `ebasecamp-import--derived-name-prefixes' 的互斥结论
+现恒为 0 或 1 项（保留 `cl-some' 是防御性写法，不表示多候选取并集）。
+纯函数，不依赖任何全局状态。"
+  (and (stringp name)
+       (cl-some (lambda (prefix)
+                  (equal name (format "%s_%s" prefix suffix)))
+                prefixes)))
+
+(defun ebasecamp-import--strip-derived-declaration-names (declarations prefixes)
+  "删除 DECLARATIONS 中「等于派生 name」的 `name' 键，返回新列表（不修改入参）。
+DECLARATIONS 形如 ((\"条目键\" . ALIST) ...)，ALIST 为字符串键 alist；派生格式
+`<前缀>_<条目键>'，条目键即每个条目的 car（如 `web_cfg'，不是段名 `configs'）。
+判定见 `ebasecamp-import--derived-declaration-name-p'，未命中时该条目原样保留
+（宁留勿删）。"
+  (mapcar
+   (lambda (entry)
+     (let ((name (and (consp entry) (cdr (assoc "name" (cdr entry))))))
+       (if (ebasecamp-import--derived-declaration-name-p name (car entry) prefixes)
+           (cons (car entry)
+                 (cl-remove "name" (copy-tree (cdr entry))
+                            :key #'car :test #'equal))
+         (copy-tree entry))))
+   declarations))
+
+(defun ebasecamp-import--top-level-declarations (object key &optional file)
   "取 OBJECT 顶层 KEY（configs / secrets）段的原样结构。
 JSON 对象已被 `--json->sexp' 转成字符串键 alist（嵌套层同样），因此返回值可直接
-进项目 `:file-configs' / `:file-secrets' 槽；缺失或形态不对时返回 nil。"
+进项目 `:file-configs' / `:file-secrets' 槽；缺失或形态不对时返回 nil。
+
+FILE 可选（源 compose 文件路径），仅用于推导「父目录名」前缀候选。
+
+`docker compose config --format json' 会为顶层 configs / secrets 条目**派生注入
+`name' 字段**，形如 `<项目名>_<键>'。它是 compose 的生成物而非用户意图
+（不变量 6：清单只保存用户意图），因此这里删掉「等于派生值」的 `name'，
+其余 `name' 原样保留。
+前缀来源实测（2026-10-30，docker 29.9.0，四个 flag 全带）：
+  显式 `name: probename' + 条目 app_cfg → \"name\": \"probename_app_cfg\"
+  无顶层 name、目录 EbcProbe2 + app_cfg → \"name\": \"ebcprobe2_app_cfg\"
+  无顶层 name、目录 Ebc.Probe_3 + app_cfg → \"name\": \"ebcprobe_3_app_cfg\"
+即前缀恒为 compose 项目名 = 顶层 `name'（有则用之）否则规范化后的父目录名 ——
+两者**互斥**（有顶层 `name' 时目录名不参与派生），故候选收敛为**单项**，
+不并存两个（`ebasecamp-import--derived-name-prefixes'）。
+折衷（已记录）：用户显式写的 `name' 恰好等于派生值时同样被删除
+（`--no-interpolate' 的 JSON 无法区分二者），该行为由 ERT 固化。"
   (let ((value (ebasecamp-import--field object key)))
-    (and (consp value) (proper-list-p value) value)))
+    (when (and (consp value) (proper-list-p value))
+      (ebasecamp-import--strip-derived-declaration-names
+       value (ebasecamp-import--derived-name-prefixes object file)))))
 
 ;;; 项目名推断
 
@@ -500,8 +573,8 @@ JSON 非法、缺 services、服务字段无法映射时 signal `ebasecamp-impor
                            :service-overrides service-plists))
        :shared-network t
        :export-file nil
-       :file-configs (ebasecamp-import--top-level-declarations object "configs")
-       :file-secrets (ebasecamp-import--top-level-declarations object "secrets")))))
+       :file-configs (ebasecamp-import--top-level-declarations object "configs" file)
+       :file-secrets (ebasecamp-import--top-level-declarations object "secrets" file)))))
 
 (defun ebasecamp-import-parse (file)
   "读取 compose 文件 FILE 并映射为 `ebasecamp-project' 结构。
