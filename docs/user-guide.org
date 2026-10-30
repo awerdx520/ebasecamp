@@ -182,7 +182,7 @@ M-x ebasecamp                        打开管理界面
 - *副作用*：docker 因此会读取 =<root>/.env= （compose 默认行为），其中的变量参与生成物解析。插件既不读取也不改写该文件；
 - shared 生成物用 *触发本次操作的那个项目* 的 =:root= —— shared 配置的 =:project= 只是渲染上下文，不参与推导。
 
-*项目没写 =:root= 会怎样*：不注入该 flag，退回「按生成物所在目录解析」的旧行为（v0.5.1 及之前）。此时顶层 =configs= / =secrets= 的 *相对* =file:= 无法判定 —— 预校验只给一条警告「项目 X 无 :root，无法校验顶层 config `app_cfg' 的 file `./conf/app.conf'」，*不阻塞启动*，成功提示末尾追加「（N 条预校验警告）」；真正的文件缺失要到容器创建阶段才以 =bind source path does not exist= 暴露。*绝对路径* 的 =file:= 不依赖 =:root= ，始终可判定。
+*项目没写 =:root= 会怎样*：不注入该 flag，退回「按生成物所在目录解析」的旧行为（v0.5.1 及之前）。此时顶层 =configs= / =secrets= 的 *相对* =file:= 无法判定 —— 预校验只给一条警告「项目 X 无 :root，无法校验顶层 config `app_cfg' 的 file `./conf/app.conf'（运行时将按生成物所在目录解析）」，*不阻塞启动*，成功提示的 message 末尾、失败提示的 detail 末尾追加「（N 条预校验警告）」；真正的文件缺失要到容器创建阶段才以 =bind source path does not exist= 暴露。*绝对路径* 的 =file:= 不依赖 =:root= ，始终可判定。
 
 ** 服务字段表
 
@@ -364,7 +364,7 @@ M-x ebasecamp                        打开管理界面
   - =f= 只搬焦点，*不改选中组、不切换勾选*：它是浏览动作。跳转期间会暂停 3 秒的状态轮询、跳完恢复，避免刷新重渲染把提示弄乱。
   - 界面内 =f= 是跳转，*不是 evil 的 char motion* —— 根 Host 的键层优先，evil 的 =f= 在界面里收不到键。
 - *=j= / =k= 移动焦点*。上下移动焦点（树节点 → 段内按钮 → 服务行 → 勾选框），*选中组不变*；换组仍用 =n= / =p= 。所以 =j= / =k= 可以在服务表里上下移动而不把右栏切走。
-- *=h= / =l= 折叠与展开*。在树内 =h= 收起当前组、=l= 展开；已经收起时 =h= / 已经展开时 =l= 会落回焦点左移 / 右移，所以展开态按 =l= 会把焦点外溢到右栏。
+- *=h= / =l= 折叠与展开*。在左树内 =h= 只折叠（最左列无处可移），收起态 =l= 展开、展开态 =l= 才落回焦点右移，所以展开态按 =l= 会把焦点外溢到右栏；从右栏进入树时 =h= 才会移动焦点。
 - *=1= / =2= / =3= 跳区域*（见上文）：跨区域跳转，与 =j= / =k= 的区域内移动互补。
 
 ** 勾选服务
@@ -392,7 +392,7 @@ M-x ebasecamp                        打开管理界面
 - 没勾选任何服务时会给出「未选中服务」提示，不会静默成功；
 - =启动选中= 之前做端口冲突检测：选中集合内宿主端口重复、或宿主端口已被占用，都会 *拒绝启动* 并给出摘要；探测不可用类失败只提示、不阻塞；
 - =启动选中= / =重启选中= 派发前还会做一次 *compose 预校验*：本次要用的生成物（shared 与 per-project 都算）逐个 =config -q= ，任一不合法就 *不启动任何容器* 、连 external network 都不建，并在提示区显示 stderr 首行的可读错误（例如 =service "api" refers to undefined config web_cfg: invalid compose project= ）；
-- 预校验 *还检查顶层 =configs= / =secrets= 的 =file:= 是否存在*（=config -q= 不覆盖这一层）：按项目 =:root= 逐条判存在性，缺任一条就中止、给出可读错误（见下节「启动失败怎么排查」）；项目没写 =:root= 时只给警告、不阻塞，成功提示末尾追加「（N 条预校验警告）」；
+- 预校验 *还检查顶层 =configs= / =secrets= 的 =file:= 是否存在*（=config -q= 不覆盖这一层）：按项目 =:root= 逐条判存在性，缺任一条就中止、给出可读错误（见下节「启动失败怎么排查」）；项目没写 =:root= 时只给警告、不阻塞，成功提示的 message 末尾、失败提示的 detail 末尾追加「（N 条预校验警告）」；
 - =停止选中= 与 =D= （销毁环境）不做预校验，生成物暂时不合法时仍可先把服务停掉；
 - 命令执行期间段内按钮禁用，会话级 busy 为真，重复派发会被拒绝；
 - =停止选中= 与 =重启选中= 不补齐 shared 批次，只有 =启动选中= 才补齐。
@@ -402,7 +402,7 @@ M-x ebasecamp                        打开管理界面
 | 提示 | 原因 | 处理 |
 |------+------+------|
 | 顶层 config `xxx` 的 file `./conf/app.conf` 不存在（基准：/home/me/proj） | 清单里顶层 =configs= / =secrets= 声明的相对 =file:= 在项目 =:root= 下找不到；预校验直接中止，*一个容器都没启动* | ① 把文件放到项目 root 下的对应位置；② 或改清单里的相对路径（=:file-configs= / =file-secrets=）；③ 或删掉该顶层 config 定义（服务级对它的引用也要一并去掉）；④ 若路径本就相对别处，改成绝对路径也可 |
-| 项目 X 无 :root，无法校验顶层 config `xxx` 的 file `./conf/app.conf` | 项目没写 =:root= ，相对路径无基准。这是 *警告不是失败* | 给项目补 =:root=（推荐）；或在成功提示的「（N 条预校验警告）」背后接受「这条没校验」，注意后续容器创建可能报 =bind source path does not exist= |
+| 项目 X 无 :root，无法校验顶层 config `xxx` 的 file `./conf/app.conf`（运行时将按生成物所在目录解析） | 项目没写 =:root= ，相对路径无基准。这是 *警告不是失败* | 给项目补 =:root=（推荐）；或接受「（N 条预校验警告）」这条计数（成功提示出现在 message 末尾、失败提示出现在 detail 末尾），承认「这条没校验」，注意后续容器创建可能报 =bind source path does not exist= |
 | service "xxx" refers to undefined config / secret … | 生成物里服务引用了顶层 config / secret，但顶层段没输出 | 老清单（v0.5.1 之前导入的）重新导入一次原 compose；或手写 =:file-configs= / =:file-secrets= |
 | bind source path does not exist: … | 相对 =volumes= 源（以 =.= 开头）在 =:root= 下不存在 —— 这一层 *不做* 预校验，所以推迟到容器创建阶段 | 检查 =:root= 下该路径是否存在；必要时改为绝对路径或命名卷 |
 | permission denied while trying to connect to the Docker daemon socket | 当前用户不在 =docker= 组 | 加入 =docker= 组并重新登录（界面里会单独提示这条） |
@@ -647,11 +647,11 @@ M-x ebasecamp-export-compose     或界面底栏「导出 compose」
 | 老清单需重新导入一次 | v0.5.1 之前导入的清单缺 =:file-configs= / =:file-secrets= ，引用顶层 config 的服务启动会报 =refers to undefined config= ；对原 compose 重新导入即可补齐，插件不自动改清单。两点注意：①*重导入会 =--force= 覆盖界面对该项目的编辑*（导入是「按 compose 文件重建项目定义」，不是合并），依赖界面里加过的覆盖 / 端口时必须先备份清单；②inline 多行 =content:= 的顶层 config 已可保真往返，无需改 =file:= 形态；但 v0.5.1 之前导入的清单仍需重导入一次才能补齐 =:file-configs= |
 | 同名组只能在一个文件里定义 | 同名组出现在多个文件时加载层报错「组 X 已定义」，*后加载的文件整体回滚* —— 其中项目不会出现在界面；界面写操作遇到同名组直接拒绝并列出文件 |
 | 导出的路径基准不由插件改写 | 导出到 *项目 =:root= 之外* 的目录时，导出物里顶层 =configs.file= 的相对路径会失效（导出物的基准是导出目标所在目录）。改法：导出到项目 root 下，或手写绝对路径。v0.5.3 起这种情形会 *提示一次*：「导出目录 … 不是项目 root …：生成物里的相对路径（env_file / bind 挂载）在部署时按导出目录解析，请确认相关文件随生成物一同部署。」提示只提示 —— 不改导出结果、不影响成败，也 *不会* 把校验基准换成项目 root（换基准等于「校验过、部署炸」） |
-| 项目 =:root= 可选（留空 = 无根目录项目） | 三条降级：①*界面不按目录定位* —— 站在该项目目录里 =M-x ebasecamp= 不会自动选中它的配置；②*不作路径基准* —— 派发不带 =--project-directory=，相对 =file:= 的预校验 *只给警告*（成功提示末尾「（N 条预校验警告）」），*不是启动失败*，真正的缺失要到容器创建阶段才有 =bind source path does not exist=；③*导出必须显式选路径* —— 无 =:root= 也无 =:export-file= 时交互式弹 =read-file-name=，非交互调用仍报错。界面「改项目」把根目录留空即 *清空* =:root=（会先弹确认，清单里该键真正消失，不会留 =:root nil=） |
+| 项目 =:root= 可选（留空 = 无根目录项目） | 三条降级：①*界面不按目录定位* —— 站在该项目目录里 =M-x ebasecamp= 不会自动选中它的配置；②*不作路径基准* —— 派发不带 =--project-directory=，相对 =file:= 的预校验 *只给警告*（成功提示的 message 末尾、失败提示的 detail 末尾「（N 条预校验警告）」），*不是启动失败*，真正的缺失要到容器创建阶段才有 =bind source path does not exist=；③*导出必须显式选路径* —— 无 =:root= 也无 =:export-file= 时交互式弹 =read-file-name=，非交互调用仍报错。界面「改项目」把根目录留空即 *清空* =:root=（会先弹确认，清单里该键真正消失，不会留 =:root nil=） |
 | 无 =:root= 但写了 =:export-file= | =:export-file= 是相对路径时按 *=default-directory=（导出调用时的当前目录）* 展开，而不是项目 root —— 这是既有语义（没有 root 就没有别的基准可用），v0.5.3 未改；需要稳定落点时写绝对路径或在界面里当场选 |
 | 相对 =volumes= 源不做存在性检查 | 预校验只覆盖顶层 =configs= / =secrets= 的 =file:= ；以 =.= 开头的 bind 源缺失要到容器创建阶段才报 =bind source path does not exist= |
 | =M=（移动配置）不迁移旧 =:groups= 引用 | 跨组移动不产生新的「同项目同组」关联，不做迁移；目标项目若仍用旧写法引用该组，由「原位接管」兼容 |
-| 预校验警告只显示条数 | 成功提示末尾的「（N 条预校验警告）」只是计数，界面不逐条列出；具体消息在 =ebasecamp-command-run= 返回值的 =:preflight-warnings=（batch 下可自行取） |
+| 预校验警告只显示条数 | 提示里的「（N 条预校验警告）」只是计数（成功提示在 message 末尾、失败提示在 detail 末尾），界面不逐条列出；具体消息在 =ebasecamp-command-run= 返回值的 =:preflight-warnings= （失败路径同样带该键；batch 下可自行取） |
 
 * 清单自检
 

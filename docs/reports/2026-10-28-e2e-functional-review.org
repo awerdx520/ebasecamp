@@ -1,0 +1,191 @@
+#+title: ebasecamp v0.6 全插件端到端功能审查报告
+#+subtitle: 承诺 → 实现 → 可观测行为 的三方对齐
+#+date: 2026-10-28
+#+options: toc:t
+
+* 摘要
+
+结论：*没有发现「功能整体不可用」级别的缺陷*。基线 `make check` 481/481 全绿；八个功能面中 F1/F2/F3/F4/F6/F7 通过端到端验证（含真实 `docker compose config`、真实容器、真实按键宏），F8 通过 4 项 + 1 项已登记缺陷复现，F5 发现 1 条分级阻塞（可降级）与 3 条 minor。
+
+问题总账：blocking 1 / major 2 / minor 8 / 已知 7 / nit 1。最值得先修的三条：
+
+1. *段级键 `s`/`x`/`r` 在「焦点不在右栏」时无反应且无提示* —— `Readme.org` 写的是「=point= 落在某个配置段内时额外生效」，实现是 *焦点优先*（架构文档有记载，Readme 没有）。按 `f` 跳到某个组后焦点留在左树，此时在右栏按 `s` 完全无效。
+2. *导入会把 compose 归一化注入的 =name:= 写进清单* —— `docker compose config` 给顶层 =configs=/=secrets= 补的 `name: <源目录名>_<键>` 被忠实持久化，等于用环境相关的名字把 compose 对象名 pin 死。
+3. *预校验失败路径丢失 =:preflight-warnings=* —— `:root` 为 nil 且某分支校验失败时，用户拿不到「相对 =file:= 无法校验」的提示。
+
+* 1. 范围、判据与方法
+
+- 判据来源（按优先级）：`AGENTS.md` 16 条不变量 → `docs/architecture.org` 分层/物化/写盘事务/派发/预校验/布局主题 → `Readme.org` 用户可见承诺 → ADR-0001~0010 → `openspec/tech-debt.md` 45 条。
+- 方法：11 个一次性 batch 探针 + 1 次只读代码深审。所有探针 `emacs -Q --batch`（不加载用户 init），临时清单/缓存目录隔离，`unwind-protect` 清理，`ulimit -v 3000000` + `timeout -s KILL`，输出重定向到文件后读。
+- 真实链路：4 次真实 `docker compose config`（只读）、1 个真实容器（`alpine:3`，带全套标签，跑完即删）、真实 `execute-kbd-macro` 18+ 次按键。
+- 边界：*不改实现代码*；不把真实 docker 用例写进 `test/*-tests.el`（`test/README.md` 第 3 条）；不碰真实 `~/.config/ebasecamp` 与 `~/.cache/ebasecamp`。
+
+* 2. 基线与环境
+
+| 项 | 实测 |
+|---|---|
+| Emacs | 32.0.50（`Makefile` 默认 `STRAIGHT_BUILD=build-31.1`，版本名与实际不一致但可用） |
+| Docker / Compose | 29.9.2 / 5.6.1（技术债记的是 29.9.1 / 5.6.0，主版本一致） |
+| check-parens | OK (26 files) |
+| compile | 零 warning 零 error（13 个 `.elc` 本轮重建佐证） |
+| test | `Ran 481 tests, 481 results as expected, 0 unexpected` |
+
+环境事实（新增，值得记录）：本机 `TMPDIR=/home/thomas/thomas-emacs`，任何 `make-temp-file` 默认会写进 thomas-emacs 仓库目录 —— 探针必须显式绑 `temporary-file-directory` 到 `/tmp/`。
+
+* 3. 结果概览
+
+| 面 | 内容 | 批次 | 结论 |
+|---|---|---|---|
+| F1 | 清单加载与物化 | T1（8 场景） | *全部 PASS* |
+| F2 | 渲染与生成物 | T2（7 断言） | *全部 PASS* |
+| F3 | 预校验与派发 | T3（6 组） | PASS，另发现 2 条问题 |
+| F4 | 状态采集与聚合 | T4（5 断言，真实容器） | *全部 PASS* |
+| F5 | 界面渲染与键位 | T5a（7）+ T5b（11） | 6+11 PASS、1 口径问题，发现 1 blocking + 3 minor |
+| F6 | 清单写盘事务 | T6（9 项） | 8 PASS + 1 已知（#42 复现） |
+| F7 | 导入导出往返 | T7（5 项） | 4 PASS + 1 已知（#41），发现 1 major |
+| F8 | 生命周期/主题/定位 | T8（5 项） | 4 PASS + 1 已知（#29 复现） |
+
+* 4. 问题清单
+
+** 4.1 blocking（1 条，建议降级 major）
+
+*B1 段级键按「焦点」而非「point」解析，与 Readme 措辞不符，且失效时无任何提示*
+- 现象：界面内先按 `f` 跳到某个 *组*（焦点留在左树），再在右栏服务行上按 `s`/`x`/`r` → *不派发、无 notice、无 message*。探针必须 `(ebox-focus nil)` 清焦点后才恢复正常。
+- 机制：根 Host `:key-scope 'local` 使 `etaf--keys-chain` 在任何焦点存在时*从焦点起算*。`docs/architecture.org`「焦点优先于 point」一节有记载。
+- 文档冲突：`Readme.org` 段级键位节写「*point* 落在某个配置段内时额外生效」与「*point* 在左栏或顶栏时按这几个键无反应」—— 两处都是 point 语义。
+- 证据：T5a.5 首次运行 `binding-s=nil`、派发 0 次；`(ebox-focus nil)` 后立即 `action=start project=proj-a`。
+- 建议：①`Readme.org` 段级键位改为「*焦点*所在配置段生效（无焦点时按 point 兜底）」②`docs/troubleshooting.org` 加一条「按 `s` 没反应：先按 `2` 或点击右栏」③可选：焦点在树内而 point 在段内时给一次 `message` 提示。
+- 分级说明：按「就高不就低」记 blocking；若确认主流程（点击右栏 / 按 `2`）不受影响，可降为 major。
+
+** 4.2 major（2 条）
+
+*M1 导入把 compose 归一化注入的 =name:= 持久化到清单*
+- 现象：`docker compose config --format json` 会给顶层 `configs`/`secrets` 补 `name: <源目录名>_<键>`（T7 实测 `name: work_review_conf` / `work_db_pass`，`work` 来自源 compose 所在目录名）。导入层忠实写入 `:file-configs` / `:file-secrets`，导出又原样输出。
+- 影响：用一个*与环境相关*的名字把 compose 对象名 pin 死；而导出项目名是 `ebc-<project>`，两者不一致，跨项目可能撞名；同时清单不再是「只记录用户意图」的事实源。
+- 证据：T7 导出 JSON 交叉复核（python 独立读取）复现。
+- 建议：导入时若 `name` 等于 compose 默认派生值（`<project>_<key>`）则丢弃，只保留用户显式声明的 `name`；需在 `ebasecamp-import-parse-json` 加判定 + 往返 ERT。技术债待登记。
+
+*M2 预校验失败路径丢失 =:preflight-warnings=*
+- 现象：`ebasecamp-command--preflight-report` 返回的 plist *不含* `:preflight-warnings`，只有成功路径经 `--dispatch` 透传。
+- 影响：项目 `:root` 为 nil（相对 `file:` 无法校验）且某分支 `check-compose` 失败时，用户只看到错误、拿不到「相对 `file:` 无法校验」的提示 —— 容易误判成配置写错。
+- 证据：T3.D（成功路径 warnings=1 正常透传）vs T3.E（失败路径 report 无该键）。
+- 建议：`--preflight-report` 补该键并在失败分支透传；UI 失败提示追加「（N 条预校验警告）」；补 ERT。
+
+** 4.3 minor（8 条）
+
+1. *root=nil 的 warning 文案不足*：只说「无法校验」，没说明「运行时将按生成物所在 cache 目录解析」，用户可能以为只是少校验一次（T3.C）。
+2. *=--button-key-hints= 渲染索引零消费*：`ebasecamp-ui--footer-view` 硬编码 `"I"/"o"/"D"`、`--instance-header` 硬编码 `"s"/"x"/"r"`，键名在事实源与渲染层*两处独立维护*；`--button-key-hints` 只被测试引用（code-reviewer 问题 1）。这是技术债 #45 的增强证据。
+3. *`?` 帮助面是搜索式 catalog 且需翻页*：21 条根级键要 `C-v` 逐页才对得完，既有 `help-surface-mentions-keys` 只断言首屏 4 条，覆盖偏弱（T5b.9 用翻页验证 21/21 + 5/5 通过）。
+4. *`:extra` 吸收 compose 归一化噪音*：导入的 ports 额外项含 `("mode" . "ingress")`（compose 派生字段，非用户输入）被写进清单，与「清单只保存用户意图」有张力（T7）。
+5. *`h` 在左树内永不移动焦点*：Readme 写「到边界才落回焦点左移 / 右移」，但左树是最左列，`left` 边界无处可移；`--move-focus` docstring 已写明返回 nil（T5a.2）。
+6. *`ebasecamp-status-group-records` 零调用且名字误导*：签名 `(records project group)` 精确双键过滤、*无 scope 语义*；`lisp/` 内零调用，只有定义与测试引用。后续若有人用它渲染 shared 组会静默漏记录（T4.4b）。
+7. *Readme 命令表漏列 1 条命令*：实现 `commandp` 为真的非私有 `ebasecamp*` 命令 **17 个**，Readme「命令表」写「共 16 个」且表内 16 条，漏 `ebasecamp-ui-avy-jump`（T9）。
+8. *`:root` 为 nil 的三条降级中，「导出须显式选路径」只在交互路径验证过*：非交互路径 `signal` 行为由既有用例覆盖，本次未重复（记录为覆盖边界，非缺陷）。
+
+** 4.4 已知（7 条，实测复现或状态更新）
+
+| 编号 | 实测结论 |
+|---|---|
+| #29 | *复现*：`kill-buffer` 直杀后主题钩子 1/1 残留、`session` 非 nil；但*轮询已被 etaf 的 `kill-buffer-hook`（unmounted → status-stop）顺带兜住* —— 需补的只有钩子移除与 session 销毁两项（T8.B） |
+| #30 | 探针已覆盖并通过：同名前缀（`myapp` vs `myapp2`）、symlink、尾斜杠、`a/deep` 优先于 `a`、大小写敏感。*建议固化为 ERT*（T8.E） |
+| #35 | *延伸证据*：导出到项目 `:root` 之外时，导出预校验基准是导出目录，若未在导出目录镜像 `db.env`/`db_pass.txt`/`src/` 会失败 —— 与不变量 14/15 的字面措辞存在张力（设计取舍，ADR-0008 否决项②）（T7） |
+| #38 | 探针已覆盖并通过：`E` 改配置的跨文件迁移写盘（组文件出现新 `:project`、项目文件 `:groups` 消失、零备份残留）。*建议固化为 ERT*（T6.8） |
+| #41 | *复现*：`container_name` 导入 → 导出后原样保留，现状未变（T7.4） |
+| #42 | *复现*：`add-project` 传 `"  /srv/app  "` 落盘原样保留（未 trim）（T6.9） |
+| #44 | 本次只验证了 *降级路径*（打桩 `avy-available-p` → nil，走 `completing-read`）；真实 avy 交互仍未验（T5a.3） |
+
+** 4.5 nit（1 条）
+
+- `ebasecamp-config-write-add-project` / `-remove-project` 走「等价差集回滚」而非 `ebasecamp-manifest--write-transaction`，与 `AGENTS.md` 不变量 14 的「一律走事务」字面有出入（设计有意，建议在措辞上补一句「新增 / 删除走等价差集路径」）。
+
+* 5. 不变量逐条覆盖（AGENTS.md 16 条）
+
+| # | 不变量 | 结论 | 证据 |
+|---|---|---|---|
+| 1 | compose 项目名 `ebc-shared` / `ebc-<project>` | 通过 | T2.2 |
+| 2 | 五项容器标签 | 通过 | T2.3、T4.2 |
+| 3 | external network `ebasecamp` | 通过 | T2.4 |
+| 4 | 生成物位置 | 通过 | T2（cache 下两份） |
+| 5 | 读取 compose 三 flag | 通过 | T7.1/T7.2/T7.3、code-reviewer J |
+| 6 | 只存 `${VAR}` 与相对路径 | 通过 | T7.3 哨兵未命中 |
+| 7 | `docker ps --no-trunc` | 通过 | T4.2（ID 64 位） |
+| 8 | `config -q` 退出码 + stderr 双判据 | 通过 | T2.1（故意制造 1 条 warning，退出码仍 0） |
+| 9 | 物化键名 `:service-overrides` | 通过 | T1.1、code-reviewer A |
+| 10 | 同项目同组唯一引用 + 原位接管 | 通过 | T1.3、T1.6 |
+| 11 | shared 至多 1 份配置 | 通过 | T1.4 |
+| 12 | UI 只读 + `:key-scope 'local` | 通过（附 B1） | T5b.10、code-reviewer D |
+| 13 | UI 样式不硬编码色值 | 通过 | code-reviewer E（字面量仅在 palette / defcustom） |
+| 14 | 预校验与派发同 `--project-directory` | 通过（导出路径为设计例外，见 #35） | T3.A/T3.B/T3.D |
+| 15 | `:root` 可选的三条降级 | 通过 | T3.C |
+| 16 | `:root` 可选：写盘 / 界面 / 导出放开 + `clear-root` 键真删 | 通过 | T6.5、T3.C、T8.E |
+
+* 6. 假设复盘
+
+| 假设 | 来源 | 结论 |
+|---|---|---|
+| A1 481/481 基线成立 | 假设? | *成立*（T0） |
+| A2 端到端缺口集中在真实 docker / 真实键层 / 写盘回滚 / 定位边界 | 假设? | *部分成立*：真实 docker 与真实键层确有发现（B1/M1/M2）；*写盘与定位探针全绿*，说明这两块的 ERT 已足够 |
+| A3 batch 下 etaf 可渲染并接受按键宏 | 事实✓ | *成立*（T5a/T5b 真实按键成功），但需先 `ebasecamp-ui-open` 与注意 `ebox-focus` 残留 |
+| A4 临时 HOME / 临时清单目录可完全隔离 | 事实✓ | *成立*，但发现 `TMPDIR` 指向 thomas-emacs 的坑（必须显式绑 `temporary-file-directory`） |
+| A5 本机 Compose 5.6.0 / Docker 29.9.1 | 假设? | *部分推翻*：实际 5.6.1 / 29.9.2（主版本一致，不影响结论） |
+| A6 起临时容器可安全验证状态采集 | 假设? | *成立*：`alpine:3` 起停 <1 分钟，清理复查为空（`docker inspect` 报 no such object） |
+| A7「绿但错」主因是弱断言 | 假设? | *部分推翻*：B1（文档口径 vs 实现机制）、M1（导入噪音持久化）、M2（失败路径信息丢失）都不是弱断言，而是*文档-实现漂移*与*错误路径信息丢失* |
+
+T4 另推翻 3 条任务级假设：`ebasecamp-status-group-records` 无 scope 语义（在 data 层）、`ebasecamp-status-running-p` 是轮询定时器状态而非容器 running、本机无 `alpine:latest`（用 `alpine:3`）。
+
+* 7. 需实测条目的结论
+
+1. batch 按键可靠性：*可用*，前置是 `ebasecamp-ui-open` 落到 selected window；坑是 `ebox-focus` 残留会让段级键失效（即 B1）。
+2. 3 GB 内存上限：*够用*，11 个批次无一 OOM；护栏仍保留 `print-circle` + `print-level` + `print-length`。
+3. `M` 第二段失败的确定性打桩点：*存在*。`cl-letf` 打桩 `ebasecamp-manifest--write-transaction` 第 2 次调用 `(error …)` 即可，未破坏第一段（T6.4）。
+4. fixture 是否含 shared 样本：未依赖 fixture，改用真实容器样本证明 shared 匹配（T4.4）。
+
+* 8. 建议固化的 ERT 清单（未落盘，属另立计划）
+
+1. `#29`：`kill-buffer` 直杀后的钩子移除与会话销毁（轮询已由 etaf 兜住，只需断言另两项）。
+2. `#30`：项目定位边界五输入（同名前缀 / symlink / 尾斜杠 / 最长 root / 大小写）。
+3. `#38`：`E` 改配置的跨文件迁移写盘。
+4. `#42`：`add-project` 的 root trim（修完后）。
+5. *Readme 命令表 ↔ `commandp` 集合*（读表格 + `mapatoms` 比对），把「命令清册」从品味升级为不变量。
+6. *键位表 ↔ `?` 帮助全覆盖*（当前只断言首屏 4 条，需翻页或直接比对帮助数据）。
+7. *失败路径 `:preflight-warnings` 透传*（M2 修完后）。
+8. *段级键的焦点语义*（B1 定稿后，按最终语义固化）。
+
+* 9. 护栏与复现方法
+
+所有探针模板（复现本次结论的最小形式）：
+
+#+begin_src text
+cd /home/thomas/Workspace/ebasecamp && bash -c 'ulimit -v 3000000; \
+  timeout -s KILL 300 emacs -Q --batch -L . -L lisp \
+    -L "$HOME/thomas-emacs/.local/straight/build-31.1/etaf" \
+    -L "$HOME/thomas-emacs/.local/straight/build-31.1/etaf-ui" \
+    -L "$HOME/thomas-emacs/.local/straight/build-31.1/ebox" \
+    -L "$HOME/thomas-emacs/.local/straight/build-31.1/ecss" \
+    --eval "(setq load-prefer-newer t)" \
+    -l /tmp/ebcreview/T<N>/probe.el > /tmp/ebcreview/T<N>/probe.log 2>&1'
+#+end_src
+
+三条硬规则（源自 =docs/reports/2026-10-26-etaf-props-print-oom.org=）：
+
+1. 任何 `%S` / `prin1` / `prin1-to-string` / `pp` / `pp-to-string` / `princ` 打列表都必须包 `(let ((print-circle t) (print-level 4) (print-length 20)) …)`；禁止打印 etaf props、ebox 节点、闭包、`byte-code-function`。
+2. 输出重定向到文件，*不要*接 `| grep` / `| head`（管道缓冲会丢爆前最后输出）。
+3. 探针内显式 `(setq temporary-file-directory "/tmp/")`（本机 `TMPDIR` 指向 thomas-emacs 仓库）。
+
+* 10. 附录：探针与证据位置
+
+| 批次 | 探针 | 行数 | 关键产物 |
+|---|---|---|---|
+| T0 | 无（`make check`） | — | `/tmp/ebcreview/T0/{check,env}.log` |
+| T1 | `/tmp/ebcreview/T1/probe.el` | 357 | 8 场景 RESULT |
+| T2 | `/tmp/ebcreview/T2/probe.el` | 563 | 两份生成物 + 4 份 JSON |
+| T3 | `/tmp/ebcreview/T3/probe.el` | 512 | argv 捕获 + 6 组 RESULT |
+| T4 | `/tmp/ebcreview/T4/probe.el` | 277 | `ps.jsonl` 真实 docker 输出 |
+| T5a | `/tmp/ebcreview/T5a/probe.el` | 464 | 7 条 RESULT |
+| T5b | `/tmp/ebcreview/T5b/probe.el` | 852 | 11 条 RESULT |
+| T6 | `/tmp/ebcreview/T6/probe.el` | 676 | 9 条 RESULT |
+| T7 | `/tmp/ebcreview/T7/probe.el` | 300 | 源/导出 compose + JSON |
+| T8 | `/tmp/ebcreview/T8/probe.el` | 417 | 5 条 RESULT |
+| T9 | `/tmp/ebcreview/T9/cmds.el` | 84 | 命令表差集 |
+
+临时文件均为一次性产物，未入仓库。仓库本次审查期间*零实现改动*（`make check` 生成的 `.elc` 已被 `.gitignore` 忽略）。

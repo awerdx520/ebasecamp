@@ -1,0 +1,138 @@
+#+title: ADR-0011 界面会话收尾：幂等 teardown 与顺序写死的关闭路径
+#+date: 2026-10-30
+#+status: 已接受（Accepted）
+
+* 背景
+
+到 v0.6 为止，界面会话的收尾只有 *一条半* 路径：
+
+- =ebasecamp-ui-close= 是完整的一条 —— 被 =q= / =g= 重绑后调用（ADR-0003 决策 1），也走 =etaf-unmount= + =kill-buffer= ；
+- =etaf-on-unmounted= 回调里只有 =ebasecamp-status-stop= 这半条（停轮询），钩子与会话都不动。
+
+于是「正常关闭」与「buffer 被直杀」两条路径的处理量 *不对称* 。直杀（用户 =C-x k= 、程序删 buffer、别的包清理窗口）完全绕过 =ebasecamp-ui-close= ，后果三条：
+
+1. *主题钩子残留* ： =enable-theme-functions= / =disable-theme-functions= 上仍挂着 =ebasecamp-ui--theme-hook= ，用户换主题时它会对已死的 buffer / 会话跑一遍 =ebasecamp-ui--refresh-theme= 。无效工作，极端情况报错。
+2. *全局会话不置 nil* ： =ebasecamp-ui-session= 见到 =ebasecamp-ui--session= 非 nil 就直接返回，于是下次 =ebasecamp-ui-open= *复用旧会话* 、跳过 =--new-session= 里那次性的「按 =default-directory= 定位项目」。用户表现为「重新打开界面却没定位到当前项目」—— 没有任何提示，纯粹静默降级。
+3. *提示定时器可能存活* ： =--cancel-notice-timer= 只在 =close= 里调，直杀后 notice 的定时器没有取消入口。
+
+2026-10-28 端到端审查实测复现： =kill-buffer= 直杀后主题钩子 1/1 残留、 =ebasecamp-ui--session= 非 nil；轮询则被 etaf 的 buffer-local =kill-buffer-hook= 顺带兜住了（见下文「依赖边界」），所以真正要补的只有 *钩子移除* 与 *会话销毁* 两项 —— 但补法不能是「在 =on-unmounted= 里再抄一遍」，那会立刻撞上第二个问题。
+
+*收尾挪进共用函数会暴露顺序陷阱* ：一旦 =close= 也调这个共用函数，函数体里的「会话置 nil」就会发生在 =--save-ui-state= *之前*—— 而 =--save-ui-state= 省略参数时读的就是全局会话（ =--current-split-ratio= 在无会话时返回钳制后的 *默认值 0.26* ）。结果是「拖动左栏到一半、直接按 =q= 关闭」的宽度 *静默回退* ，且不报错、下次打开才看出来。这个陷阱是本次实现真正容易踩错的地方，故在决策里写死顺序。
+
+* 决策
+
+** 1. 收尾收敛为幂等函数 =ebasecamp-ui--teardown-session=
+
+新增 =ebasecamp-ui--teardown-session= （ =lisp/ebasecamp-ui.el= ）， =ebasecamp-ui-close= 与 =etaf-on-unmounted= 回调 *共用同一个函数* ，不再各写一份。
+
+*幂等门只看全局 =ebasecamp-ui--session=* ：为 nil 时直接返回。这样 =close= 先调它（置 nil）之后， =etaf-unmount= 触发的 =etaf-on-unmounted= 回调、以及直杀时 etaf 的 buffer-local =kill-buffer-hook= 引发的同一条回调，都落到这里并被门短路 —— 不重复 =remove-hook= 、不重复 =cancel-timer= 。除全局会话外 *不引入第二把锁* （如 buffer-local 标志位），因为「会话是否存在」本身就是唯一事实，多一把锁就多一个可能与事实不一致的副本。
+
+序列固定为： =remove-hook= ×2（ =enable-theme-functions= / =disable-theme-functions= ）→ =ebasecamp-status-stop= → =--cancel-notice-timer session= → 全局置 nil。
+
+*为什么「先绑局部、再置 nil」* ：=when-let*= 把全局 =ebasecamp-ui--session= 的值绑到局部 =session= ，之后才 =setq= 全局 nil。置 nil 只是 *解绑全局变量* ， =when-let*= 拿到的那个会话对象本身仍然存活，所以最后一步 =--cancel-notice-timer= 不会读到空引用。反过来写（先置 nil 再取） =cancel-timer= 必然拿不到会话。这一点看起来像顺序偏好，实际是正确性约束。
+
+** 2. =:setup= 的 =let= 改 =progn=
+
+=etaf-define-component= 的 =:setup= 只接受 *一个* form（宏把它插到 =let= 的 body 位置），因此多步必须自己包 =progn= 。这不只是语法细节：
+
+原先在 =let= 里捕获渲染期局部 =session= 再交给回调闭包，一旦收尾函数改成「进函数时重读全局」， *闭包捕获的局部值与函数读到的全局值就是两个来源*—— 幂等门的判据是全局，回调读的却是捕获值，两边可能不一致（例如 =close= 已置 nil、闭包仍持有旧对象而跳过门）。改成 =progn= 后回调体是 =(ebasecamp-ui--teardown-session)= ，进入时重新读全局，与门的判据 *同一来源* 。
+
+** 3. =ebasecamp-ui-close= 顺序写死
+
+五步，不可调换：
+
+1. 取会话快照： =(let ((session ebasecamp-ui--session)) …)=
+2. 幂等 teardown： =ebasecamp-ui--teardown-session=
+3. 用 *快照* 落盘宽度： =(ebasecamp-ui--save-ui-state session)=
+4. 卸载运行时： =etaf-unmount=
+5. =kill-buffer=
+
+第 2 步与第 3 步的先后是 *成败点* （见决策 4）。第 4 步触发的 =etaf-on-unmounted= 会再次进入 teardown，由幂等门短路 —— 这是有意的重复进入，不是冗余调用。
+
+** 4. =--save-ui-state= 改 =(&optional session)=
+
+省略参数时读当前全局会话（拖动回调走这条路径，行为不变）；显式给出时按它取占比。 =close= 必须传快照。
+
+*这是本次实现的成败点* ：参数化本身很小，但它把「谁在什么时候读全局」这件事显式化了。若不参数化，唯一不踩陷阱的写法是「把 =--save-ui-state= 调到 teardown 之前」—— 那样 =etaf-unmount= 之前先落盘、顺序变得难以解释，且将来任何人在 =close= 里插一步就会重演。参数化后「快照」成为函数签名的一部分，编译器与评审都能看到依赖。写盘失败只 =message= 不 signal（缓存目录不可写不应阻断关闭），该行为未变。
+
+* 备选与否决理由
+
+** ① 在 =close= 里手动重复清理（不动 =on-unmounted= ）
+
+最小改动，但两份逻辑必然漂移：本次要补的两项（钩子、会话）在直杀路径上仍然缺失，等于 *没有修* ；而若两处都补，就是两份需要同步维护的序列（将来加「取消定时器」「清 overlay」时漏一处即静默失效）。收尾是一个 *状态迁移* ，不是两条命令，必须只有一处实现。
+
+** ② =on-unmounted= 只 stop 轮询（维持现状）
+
+这正是 v0.6 的现状，也是三条后果的直接成因。etaf 已经保证直杀会走到 =on-unmounted= —— 通道是现成的，缺的只是把收尾做全。
+
+** ③ 插件侧自挂 =kill-buffer-hook=
+
+看似更「直白」，实则 *重复覆盖* 同一条通道：etaf 已在 runtime buffer 上挂 buffer-local =kill-buffer-hook= 并在其中 unmount（进而派发 =on-unmounted= ）。再挂一个钩子会让同一次直杀 *两次* 进入清理（依赖幂等门兜住），且钩子生命周期本身要维护（ =add-hook= / =remove-hook= 成对、buffer 复用场景），收益为零、失败面变大。
+
+** ④ advisory 包 =kill-buffer=
+
+用 advice 拦全局 =kill-buffer= 再判断 buffer 是否是本插件的 runtime buffer，属于 *改框架行为换局部便利* ：影响同一 Emacs 内所有 =kill-buffer= 调用（含其它包与用户配置），排查成本远高于收益，且与 ADR-0010 否决 =etaf-set-direction-scheme= 的理由同类（为一个插件改全局状态）。
+
+* 后果
+
+** 正面
+
+- *直杀路径有收尾* ： =C-x k= / 程序删 buffer 后主题钩子清零、全局会话置 nil，下次 open 重新建会话并 *重新按目录定位* 。
+- *单一实现* ：收尾序列只有一处，加步骤不会再漏路径； =close= 与直杀的行为差异被压到「是否有快照可用于落盘宽度」这一点。
+- *顺序陷阱显式化* ： =--save-ui-state= 的参数把「宽度持久化依赖会话对象」写进签名，review 时可见。
+
+** 依赖边界（重要）
+
+直杀路径 *完全依赖* etaf 在 runtime buffer 上挂 buffer-local =kill-buffer-hook= 并在其中派发 =on-unmounted= （实现名为 =etaf--runtime-buffer-killed= ）。这是 *未写进 etaf Commentary 的隐式契约* —— Commentary 声明的是公开 API 契约（技术债 #2），而钩子挂载属于内部实现。因此：
+
+- 升级 =etaf= / =etaf-ui= 后 *必须回归* =ebasecamp-ui-test-kill-buffer-tears-down-session= ；
+- 若上游改掉这条通道，本 ADR 的正面后果 1 会 *静默失效* （收尾不发生、无报错），届时唯一可行的补救是回到否决项 ③（自挂 hook）—— 它不是坏方案，只是当前与 etaf 重复。
+
+** 负面
+
+- =--save-ui-state= 的「必传快照」是 *靠 docstring 与评审* 保证的隐式契约，不是类型强制：省略参数不会报错，只会落盘默认 0.26。已记入技术债 #52（评估是否让「无会话 + 无参数」直接 signal 或返回 nil 而 *不写盘* ）。
+- 收尾是 *静默设计* ：成功清理不产生任何消息，因此回归只能靠状态断言（钩子列表为空、全局会话为 nil），不能靠观察输出。
+
+** 可观测性
+
+静默是刻意的（关闭界面不该刷消息），代价是验证必须断言 *状态* 而非 *输出* ：
+
+| 断言点 | 直杀路径 | 正常关闭路径 |
+|---|---|---|
+| =enable-theme-functions= 不含 =--theme-hook= | ✓ | ✓ |
+| =disable-theme-functions= 不含 =--theme-hook= | ✓ | ✓ |
+| =ebasecamp-ui--session= 为 nil | ✓ | ✓ |
+| =ebasecamp-status-running-p= 为 nil | ✓（etaf 钩子顺带兜住） | ✓ |
+| =ui-state.el= 的 =:split-ratio= 等于关闭前的快照值 | 不适用（无快照，且直杀本就不落盘） | ✓ |
+
+* 验证证据
+
+- *ERT 双口径基线* （ =make check= 全绿： =compile= 零 warning、 =check-parens OK= ）：
+  - =make test= 输出 =Ran 495 tests, 493 results as expected, 0 unexpected, 2 skipped= （2 条真实 avy 用例在无 avy load-path 下 skip）；
+  - =make test-avy= 输出 =Ran 495 tests, 495 results as expected, 0 unexpected= 。
+  - 基线 481 → 495（+14，本 ADR 相关用例为 B5 的 +2）。
+- *两条守护用例（先红后绿）* ：
+  - =ebasecamp-ui-test-kill-buffer-tears-down-session= —— 建会话并挂上主题钩子 → =kill-buffer= 直杀 → 断言两个钩子列表均不含 =--theme-hook= 、全局会话为 nil。实现前红（钩子残留 1/1、会话非 nil），实现后绿。
+  - =ebasecamp-ui-test-close-persists-split-ratio-snapshot= —— 把宽度拖到非默认值 → =ebasecamp-ui-close= → 读 =ui-state.el= 断言落盘值 *等于拖动后的值* 。实现前（未传快照）红：落盘 0.26。
+- *2026-10-28 端到端审查探针* ： =kill-buffer= 直杀后钩子残留、会话非 nil 的原现象已复现；实现后同探针两项均清零。
+
+* 与既有 ADR 的关系
+
+- *补充 ADR-0003 决策 1 的收尾语义* ：ADR-0003 只规定 =q= / =g= 重绑为 =ebasecamp-ui-close= 这一 *入口* ，既没规定 =close= 内部做什么，也没覆盖直杀。本 ADR 补的正是这一层，不修改 ADR-0003 的任何决策。
+- *沿用 ADR-0004* ： =ui-state.el= （ =~/.cache/ebasecamp/ui-state.el= ）作为「宽度持久化的运行时缓存」定位不变；本 ADR 只改 *何时、用哪个会话对象* 落盘。
+- *勘误 ADR-0007 决策 3 末段的笔误* ：该段写「 =ebasecamp-ui--report-result= 成功分支在 *detail* 末尾追加『（N 条预校验警告）』」，实际是 *message* 末尾（detail 追加是 v0.7 才补上的失败分支行为，见技术债 #47）。ADR-0007 作为历史记录 *不回改* ，勘误以本节为准； =docs/architecture.org= 里的同一处错误已在 v0.7 修正。
+
+* 不变量
+
+*无新增不变量* 。
+
+- 不变量 12（UI buffer 只读 + 写操作经表单 / =e= 且走写盘事务）不受影响：收尾不写清单， =ui-state.el= 是运行时缓存、不经 =ebasecamp-manifest--write-transaction= （ADR-0004 已确立）。
+- 不变量 14（清单写盘必须经事务）不受影响：本 ADR 只碰会话与缓存文件。
+
+* 状态
+
+*已接受* （2026-10-30，0.7.0）。
+
+实现记录与逐批次实测（用例分摊、红 / 绿灯证据、探针结论、与计划的偏差）见 =openspec/completed/2026-10-28-v0.7-review-fixes.md= 的「批次记录」一节。测试基线 481 → 495。
+
+引用：ADR-0003（UI buffer 只读化与 etaf Host 键位 —— 本 ADR 补充其收尾语义）；ADR-0004（UI 布局、主题与导航 —— 沿用 =ui-state.el= 宽度持久化）；ADR-0007（旧 =:groups= 与 =--project-directory= —— 勘误其决策 3 末段笔误）。相关技术债：[[file:../../openspec/tech-debt.md][#29]]（收尾只覆盖 =close= ，已修复）、#52（ =--save-ui-state= 的「必传快照」是隐式契约）。

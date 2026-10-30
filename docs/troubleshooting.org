@@ -572,14 +572,14 @@ docker compose -f ~/.cache/ebasecamp/myapp/compose.yaml \
 - 该文件不由本项目提供（镜像自带、或由部署环境另放）→ 把该条目改成 =external: true= 或只写 =name:= ；没有 =file:= 的条目直接跳过检查。
 - 这份顶层声明根本不需要 → 删掉该条目；服务侧 =configs:= / =secrets:= 里对它的引用要一并删，否则 =config -q= 会报 =service "x" refers to undefined config= 。
 
-* 15. 成功提示末尾多出「（N 条预校验警告）」
+* 15. 提示末尾多出「（N 条预校验警告）」
 
 ** 现象
 
-启动成功，但 notice 末尾按计数追加「（N 条预校验警告）」；=ebasecamp-command-run= 的 on-complete 结果 plist 里 =:preflight-warnings= 是字符串列表，单条形如：
+启动成功（或预校验失败）时，notice 按计数追加「（N 条预校验警告）」（成功写在 message 末尾、失败写在 detail 末尾，失败时 message 仍只有 stderr 首行）；=ebasecamp-command-run= 的 on-complete 结果 plist 里 =:preflight-warnings= 是字符串列表（失败路径同样带该键），单条形如：
 
 #+begin_src text
-项目 myapp 无 :root，无法校验顶层 config `app_cfg' 的 file `./conf/app.conf'
+项目 myapp 无 :root，无法校验顶层 config `app_cfg' 的 file `./conf/app.conf'（运行时将按生成物所在目录解析）
 #+end_src
 
 警告 *不改变* =:ok= / =:failed= / =:exit= ，启动照常进行。
@@ -650,6 +650,34 @@ grep -n ':configs' ~/.config/ebasecamp/groups.el ~/.config/ebasecamp/projects/*.
 - 多余的那份是笔误 → =X= → 删配置，或 =E= 把它的 =:project= 改到正确项目。
 - 确实要在同一项目里跑同一组的两套参数 → *当前不支持* （服务名会撞）；绕法是为第二套 *复制一个组* （不同组名，各挂一份配置）。
 - 旧 =:groups= 那条 *不是* 冲突来源：它已被组侧配置接管；重建配置时界面会先问「是否同时删掉这条旧引用」，答 yes 即顺手清理（A-II 迁移），答 no 也能成功（下次再提示）。
+
+* 17. 按 =s= / =x= / =r= 没反应（焦点不在右栏）
+
+** 现象
+
+界面已经打开、右栏也能看到配置段，但按 =s= / =x= / =r= 一点反应都没有 —— 不报错、不动容器，提示区也不写任何东西；=a= / =A= （全选 / 全不选）同样无效。
+
+** 原因
+
+段级键 =s= / =x= / =r= / =a= / =A= 声明的宿主是「该配置段」，而按键查找 *先看焦点* 、没有焦点时才按 point 兜底。焦点不在右栏配置段时（在左树、顶栏或底栏），这几个键找不到段级键链，最终被根 Host 的 =:key-scope 'local= 吞掉 —— 未绑定的 printing key 一律「无反应」，不弹任何提示（机制细节见本手册第 12 条）。刚打开界面、按过 =1= 跳到左树、或鼠标点过左树之后都可能命中这个情形。
+
+** 排查命令
+
+在界面里求值，看当前键链落在哪一层：
+
+#+begin_src elisp
+(with-current-buffer "*ebasecamp*"
+  (list (ebasecamp-ui-state) (etaf--keys-binding [?s])))
+;; 段级键链生效时 [?s] 绑定到闭包；焦点 / point 不在段内时是 ignore
+#+end_src
+
+界面里直接按 =?= 更省事：帮助按当前键链列出根级 21 条，段内再加 5 条段级 —— 看不到段级那 5 条，就说明焦点不在右栏。
+
+** 修法
+
+- 按 =2= 跳到右栏（焦点落在第一个配置段上），或用鼠标点一下右栏的配置段，再按 =s= / =x= / =r= 。
+- 也可以 =TAB= 逐个停靠点跳过去，或用 =j= / =k= 在段内上下移动焦点。
+- 常用顺序：=n= / =p= 选组 → =2= 进右栏 → =t= 勾服务 → =s= 启动。
 
 * 相关文档
 

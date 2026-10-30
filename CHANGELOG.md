@@ -2,6 +2,32 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/) 与 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式。
 
+## [0.7.0] - 2026-10-30
+
+把 2026-10-28 端到端审查的分级清单落成代码与文档：4 条缺陷修复（其中 2 条 major）、5 处文档止血、14 条新 ERT。两条 major 属同一类 **静默降级** —— 预校验失败时把「有条声明没能校验」的警告计数整条吃掉，导入则把 compose *派生*出来的值当成用户意图写进清单；两者都不报错、都不改变成败，只是让线索丢失与清单被钉死在很久以后才暴露。关闭路径也一并补全：原先只有 `ebasecamp-ui-close` 一条，`C-x k` 直杀 buffer 会跳过收尾，现在收尾收敛为幂等 teardown（ADR-0011）。
+
+### 修复
+
+- **预校验失败路径丢 `:preflight-warnings`**（技术债 #47）：`ebasecamp-command--preflight-report` 返回的失败载荷原缺该键 —— 项目 `:root` 为 nil（相对 `file:` 只给警告不阻塞）且另一分支 `check-compose` 失败时，用户只看到错误原文，拿不到「有条声明没校验」这条线索。现在失败载荷与 `--preflight` 同源带上该键（**不重新计算**）；`ebasecamp-ui--report-result` 三个失败分支统一经新增的 `ebasecamp-ui--with-preflight-warning-note` 在 **detail** 末尾追加「（N 条预校验警告）」，**message 仍只含 stderr 首行**（失败主行保持可扫读，计数落详情）；成功分支仍在 message 末尾追加，语义未变。
+- **写盘层 root 首尾空白未 trim**（技术债 #42）：`ebasecamp-config-write--check-root` 只判非空却返回原值 —— 绕过界面直接调写盘层（脚本或交互式调用）会落盘 `:root " /srv/app "`，而这个值随后就是派发与预校验的 `--project-directory` 基准，带空白的路径不存在，预校验与启动一起失败。现在返回 `(string-trim root)`（nil 仍返回 nil、纯空白仍 `user-error`），`add-project` / `update-project` 两处改为 `(setq root (…))` 回写，落盘值即 trim 后的值。
+- **导入把 compose 派生注入的顶层 `name:` 持久化**（技术债 #46，major）：`docker compose config --format json` 会给顶层 `configs` / `secrets` 的每个条目补 `"name": "<项目名>_<键>"`，导入忠实写入 `:file-configs` / `:file-secrets` —— 用与环境相关的目录名把对象名 *钉死*（换目录重新派生就对不上），既违反不变量 6「清单只保存引用 / 用户意图」，也与导出项目名 `ebc-<project>` 不一致。现在 `ebasecamp-import--top-level-declarations` 加可选 `FILE` 参数，删除「等于派生值」的 `name`（其余 `name` 一律原样保留）；顺带补 root=nil 时的 warning 文案「（运行时将按生成物所在目录解析）」。
+- **`kill-buffer` 直杀界面后不清理主题钩子与会话**（技术债 #29）：收尾原先只写在 `ebasecamp-ui-close` 里，`C-x k` 或程序删 buffer 时主题钩子残留、全局会话不置 nil —— 下次 `ebasecamp-ui-open` 复用旧会话并**跳过项目定位**（按 `default-directory` 定位只在建会话时算一次）。现在抽出幂等的 `ebasecamp-ui--teardown-session`，`ebasecamp-ui-close` 与 `etaf-on-unmounted` 共用（见 ADR-0011）。
+
+### 变更
+
+- **`ebasecamp-ui-close` 执行顺序写死**（ADR-0011）：取会话快照 → 幂等 teardown → 用快照 `--save-ui-state` → `etaf-unmount` → `kill-buffer`。顺序不可调换：teardown 会把全局 `ebasecamp-ui--session` 置 nil，`--save-ui-state` 若不拿快照就会落盘默认宽度 0.26，「拖到一半直接关闭」的宽度静默回退。配套把 `--save-ui-state` 签名改为 `(&optional session)`（拖动回调不传参，行为不变）。
+- **导入的派生 `name` 候选收敛为互斥单项**（v0.7 code-review major）：前缀实测恒为 compose 项目名 —— 有顶层 `name` 就用它、否则用规范化后的父目录名，两者互斥。取并集会误删「有顶层 `name` + 用户显式写 `<目录名>_<键>`」这种合法组合，已补守护用例。匹配不上一律保留（宁留勿删）。
+- **`ebasecamp-status-group-records` docstring 补语义边界**：只按 `:project` + `:group` 精确双键过滤，**不含 scope 语义**；shared 容器的 `ebasecamp.project` 标签记的是发起项目而非配置的宿主，所以 shared 匹配要用 `ebasecamp-data--instance-status`。
+- **新增 `make test-avy`**（技术债 #44）：load-path 追加 `-L $(STRAIGHT_BUILD)/avy`；2 条真实 avy 用例由 `skip-unless` 控制 —— `make test` 下 skip、本目标下真实执行，两条路径各有稳定计数口径。`check` 未串入（原因见技术债 #50）。
+- **测试基线双口径 481 → 495（+14）**：`make test` = `Ran 495 tests, 493 results as expected, 0 unexpected, 2 skipped`；`make test-avy` = `Ran 495 tests, 495 results as expected, 0 unexpected`。新增用例分摊：B1 +1 / B2 +2 / B3 +1 / B4 +4（3 条功能 + 1 条 code-review 守护）/ B5 +2 / B6 +2 / B7 +2。
+- **文档修正**：命令表 16 → 17 条并补 `ebasecamp-ui-avy-jump`（同时升级为 ERT 机械守护，技术债 #48 关闭）；段级键 `s` / `x` / `r` 的表述改为「焦点所在段生效（无焦点时按 point 兜底）」；`h` / `l` 改为「左树内 `h` 只折叠」；`docs/troubleshooting.org` 新增第 17 条「按 `s` / `x` / `r` 没反应」；`AGENTS.md` 不变量 14 补「新增 / 删除项目走等价的差集回滚路径」。
+- **文档漂移收口**：文档里「预校验警告只在成功提示末尾追加」统一改为「成功提示的 message 末尾、失败提示的 detail 末尾」；并修正 `docs/architecture.org` 把透传链写成「成功分支在 detail 末尾追加」的事实错误。
+- **新增 `docs/adr/0011-session-teardown.org`**：记录会话收尾的幂等化、`close` 顺序与 `:setup` 的 `let` → `progn` 变更（含 etaf 直杀的依赖边界）。
+
+### 已知限制
+
+- 导入层无法区分「compose 派生出来的 `name`」与「用户显式写的、恰好等于派生值的 `name`」—— `--no-interpolate` 的 JSON 不带来源信息。后者同样会被删除，该折衷由 ERT `ebasecamp-import-test-drops-explicit-name-equal-to-derived` 固化，避免将来被当成缺陷「修」掉而破坏前者。
+
 ## [0.6.0] - 2026-10-26
 
 界面从「功能都在，但看不见也走不到」补齐到可发现、可达：按钮上直接显示键、vim 手感的方向导航、按一个键跳到任意可见的组 / 配置 / 服务行。三处改动都 *没有* 引入新的强制依赖（avy 是可选依赖，未装时自动降级）。
