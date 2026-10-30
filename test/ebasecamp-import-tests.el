@@ -804,6 +804,97 @@ compose 的服务级 `configs:' 引用若无顶层声明会让 `docker compose c
                      ("ext_key" . (("external" . t))))
                    (ebasecamp-project-file-secrets project)))))
 
+(defconst ebasecamp-import-test--derived-name-json
+  (concat "{\"name\":\"probe-app\","
+          "\"services\":{\"api\":{\"image\":\"myapp/api:dev\"}},"
+          "\"configs\":{\"web_cfg\":{\"file\":\"./web.conf\","
+          "\"name\":\"probe-app_web_cfg\"}},"
+          "\"secrets\":{\"db_pass\":{\"file\":\"./db_pass.txt\","
+          "\"name\":\"probe-app_db_pass\"}}}")
+  "compose config 为顶层 configs / secrets 派生注入 `name' 的实测形态。
+2026-10-30 实测（docker 29.9.0）：显式 `name: probename' 时条目 name 为
+`probename_app_cfg'，即 `<项目名>_<键>'。")
+
+(ert-deftest ebasecamp-import-test-drops-derived-declaration-names ()
+  "compose 派生注入的顶层 config / secret `name' 不写进清单（不变量 6）。
+派生格式为 `<前缀>_<键>'，前缀即 compose 项目名。2026-10-30 实测（docker 29.9.0，
+`config --no-interpolate --no-env-resolution --no-path-resolution --format json'）：
+- 显式顶层 `name: probename' → 条目 name 为 `probename_app_cfg'（前缀 = 顶层 name）；
+- 无顶层 name、目录名 `EbcProbe2' → `ebcprobe2_app_cfg'（前缀 = 目录名小写）；
+- 无顶层 name、目录名 `Ebc.Probe_3' → `ebcprobe_3_app_cfg'（`.` 去掉、`_` 保留）。
+故前缀候选**互斥**：有顶层 `name' 用顶层 `name'，否则用目录名（compose 规范化）。"
+  ;; 候选①：顶层 `name'
+  (let ((project (ebasecamp-import-parse-json
+                  ebasecamp-import-test--derived-name-json)))
+    (should (equal '(("web_cfg" . (("file" . "./web.conf"))))
+                   (ebasecamp-project-file-configs project)))
+    (should (equal '(("db_pass" . (("file" . "./db_pass.txt"))))
+                   (ebasecamp-project-file-secrets project))))
+  ;; 候选②：源文件父目录名（无顶层 name 时 compose 以目录名作项目名）
+  (let* ((json (concat "{\"services\":{\"api\":{\"image\":\"myapp/api:dev\"}},"
+                       "\"configs\":{\"web_cfg\":{\"file\":\"./web.conf\","
+                       "\"name\":\"ebcprobe2_web_cfg\"}}}"))
+         (project (ebasecamp-import-parse-json
+                   json "/tmp/ebcprobe2/docker-compose.yml")))
+    (should (equal '(("web_cfg" . (("file" . "./web.conf"))))
+                   (ebasecamp-project-file-configs project)))))
+
+(ert-deftest ebasecamp-import-test-keeps-explicit-declaration-name ()
+  "与派生格式无关的显式 `name' 必须保留（宁留勿删）。
+前缀候选只有「顶层 name」与「源文件父目录名」两类，`my-custom-name' /
+`db-pass-custom' 两者都匹配不上 → 判为用户显式意图，原样写进 :file-configs /
+:file-secrets。"
+  (let ((project
+         (ebasecamp-import-parse-json
+          (concat "{\"name\":\"probe-app\","
+                  "\"services\":{\"api\":{\"image\":\"myapp/api:dev\"}},"
+                  "\"configs\":{\"web_cfg\":{\"file\":\"./web.conf\","
+                  "\"name\":\"my-custom-name\"}},"
+                  "\"secrets\":{\"db_pass\":{\"file\":\"./db_pass.txt\","
+                  "\"name\":\"db-pass-custom\"}}}"))))
+    (should (equal '(("web_cfg" . (("file" . "./web.conf")
+                                   ("name" . "my-custom-name"))))
+                   (ebasecamp-project-file-configs project)))
+    (should (equal '(("db_pass" . (("file" . "./db_pass.txt")
+                                   ("name" . "db-pass-custom"))))
+                   (ebasecamp-project-file-secrets project)))))
+
+(ert-deftest ebasecamp-import-test-drops-explicit-name-equal-to-derived ()
+  "用户显式写的 `name' 恰好等于派生格式时同样被删除（已记录的折衷）。
+`docker compose config --no-interpolate' 的输出里，派生注入值与用户显式写的
+同名值**完全无法区分**（两者都是 `<项目名>_<键>' 字符串），本插件选择保守删除 →
+清单保持「只存用户意图」的净度，代价是这一种写法会丢失显式意图。该折衷在
+ADR / 决策日志中记录，用本用例固化行为，避免悬空。"
+  (let ((project
+         (ebasecamp-import-parse-json
+          (concat "{\"name\":\"probe-app\","
+                  "\"services\":{\"api\":{\"image\":\"myapp/api:dev\"}},"
+                  "\"configs\":{\"web_cfg\":{\"file\":\"./web.conf\","
+                  "\"name\":\"probe-app_web_cfg\"}}}"))))
+    (should (equal '(("web_cfg" . (("file" . "./web.conf"))))
+                   (ebasecamp-project-file-configs project)))))
+
+(ert-deftest ebasecamp-import-test-keeps-directory-name-prefix-with-top-level-name ()
+  "顶层 `name' 存在时，用户显式写的 `<目录名>_<键>' 形式 `name' 必须保留。
+这是 code-review（v0.7）major 修复的正面守护：派生前缀候选在探测结论下**互斥**
+—— 有顶层 `name' 时 compose 恒以它为项目名，源文件父目录名不参与派生，因此
+目录名候选不得与顶层 `name' 并集参与判定。否则用户显式写的
+`ebcprobe2_web_cfg'（形如「目录名 + 键」）会被误判为派生值删除 → 生成物里该
+config 被 compose 重新派生成 `probe-app_web_cfg'，与用户意图不同（违背不变量 6
+与「宁留勿删」）。
+构造：顶层 `name' 为 `probe-app'，源文件路径为 `/tmp/ebcprobe2/docker-compose.yml'
+（目录名按 `ebasecamp-import--project-name-from-directory' 规范化为 {ebcprobe2}）。"
+  (let ((project
+         (ebasecamp-import-parse-json
+          (concat "{\"name\":\"probe-app\","
+                  "\"services\":{\"api\":{\"image\":\"myapp/api:dev\"}},"
+                  "\"configs\":{\"web_cfg\":{\"file\":\"./web.conf\","
+                  "\"name\":\"ebcprobe2_web_cfg\"}}}")
+          "/tmp/ebcprobe2/docker-compose.yml")))
+    (should (equal '(("web_cfg" . (("file" . "./web.conf")
+                                   ("name" . "ebcprobe2_web_cfg"))))
+                   (ebasecamp-project-file-configs project)))))
+
 (ert-deftest ebasecamp-import-test-unknown-top-keys-warn ()
   "未知顶层键不阻断导入，但经 `ebasecamp-import-warnings' 报告；
 每次导入都重置上一次的 warnings。"

@@ -1343,6 +1343,97 @@ MARKER 是 form 开头的唯一片段（例如 `(db'）；找不到时 `ert-fail
                      (ebasecamp-config-write-test--configs-of 'db)))
       (should-not (ebasecamp-config-write-test--leftovers)))))
 
+;;; v0.7 批次 B6（#38）：界面 `E' 的跨文件迁移闭环
+;;
+;; `E' = `ebasecamp-ui--open-config-editor' → `ebasecamp-config-write-update-config-project'
+;; 传 `migrate-legacy' t。迁移方向是「组文件新增 `:project' + 项目文件删旧
+;; `:groups' 引用」，写盘层走 `--migrate-across-files'（两次事务 + 备份补偿）。
+;; 上一节（A-II）已覆盖 `add-config' 的跨文件迁移，本节补 `E' 这一条路径，
+;; 并额外断言**零备份残留**：跨文件路径会先拿 `:keep-backup'，两段都成功后
+;; 必须删掉备份，否则每次 `E' 都在清单目录里留下隐藏文件。
+;;
+;; 清单形态：组 db 的配置 `cfg' 原指项目 a（项目 a 由 `:configs' 关联、正常
+;; 物化），项目 demo 仍用旧写法 `:groups ((db))' 引用组 db。`E' 把 cfg 改指
+;; demo 后，demo 的旧引用被组侧配置接管并删除。
+
+(defconst ebasecamp-config-write-test--e-migration-groups
+  (concat
+   ";;; -*- lexical-binding: t; -*-\n"
+   ";;; groups.el --- `E' 跨文件迁移：组 db 的配置 cfg 指向项目 a\n"
+   "\n"
+   "(ebasecamp-define-group db\n"
+   "  :title \"db\"\n"
+   "  :scope per-project\n"
+   "  :services ((postgres :image \"postgres:16\"))\n"
+   "  :configs ((cfg :project a)))\n")
+  "`E' 跨文件迁移的组文件：配置 cfg 原本关联项目 a。")
+
+(defconst ebasecamp-config-write-test--e-migration-project-demo
+  (concat
+   ";;; -*- lexical-binding: t; -*-\n"
+   ";;; projects/demo.el --- 项目定义（旧写法仍引用组 db）\n"
+   "\n"
+   "(ebasecamp-define-project demo\n"
+   "  :title \"demo\"\n"
+   "  :root \"/tmp/ebc-demo\"\n"
+   "  :groups ((db)))\n")
+  "`E' 跨文件迁移的项目文件：`:groups' 只有组 db 这条旧引用。")
+
+(defun ebasecamp-config-write-test--write-e-migration-manifest ()
+  "写 `E' 迁移用的清单：groups.el + projects/a.el + projects/demo.el。
+项目 a 与 demo 分开建文件，保证「组定义」与「项目定义」确实跨文件（同文件会
+走一次事务路径，测不到备份补偿）。"
+  (ebasecamp-config-write-test--write-flat
+   (ebasecamp-config-write-test--groups-file)
+   ebasecamp-config-write-test--e-migration-groups)
+  (make-directory
+   (expand-file-name "projects/" ebasecamp-config-write-test--directory) t)
+  (ebasecamp-config-write-test--write-flat
+   (expand-file-name "projects/a.el" ebasecamp-config-write-test--directory)
+   (concat ";;; -*- lexical-binding: t; -*-\n"
+           "(ebasecamp-define-project a\n"
+           "  :title \"a\"\n"
+           "  :root \"/tmp/ebc-a\")\n"))
+  (ebasecamp-config-write-test--write-flat
+   (expand-file-name "projects/demo.el" ebasecamp-config-write-test--directory)
+   ebasecamp-config-write-test--e-migration-project-demo))
+
+(ert-deftest ebasecamp-config-write-test-e-migration-moves-group-ref-across-files ()
+  "`E'（`update-config-project' + `migrate-legacy' t）跨文件迁移：
+① 组文件出现新 `:project'；② 项目文件 `:groups' 消失；③ 零备份残留。
+
+`temporary-file-directory' 显式绑到 `/tmp/'：本机 `TMPDIR' 指向仓库根
+（2026-10-30 实测），不绑的话临时清单目录会落到工作树里。"
+  (let ((temporary-file-directory "/tmp/"))
+    (ebasecamp-config-write-test--with-directory
+      (ebasecamp-config-write-test--write-e-migration-manifest)
+      (should (null (plist-get (ebasecamp-config-load) :errors)))
+      (let* ((groups-file (ebasecamp-config-write-test--groups-file))
+             (projects-dir (expand-file-name "projects/"
+                                             ebasecamp-config-write-test--directory))
+             (project-file (expand-file-name "demo.el" projects-dir))
+             (result (ebasecamp-config-write-update-config-project 'db 'cfg 'demo t))
+             (groups-text (ebasecamp-config-write-test--read groups-file))
+             (project-text (ebasecamp-config-write-test--read project-file)))
+        (should (null (plist-get result :errors)))
+        ;; ① 组文件：配置 cfg 的 `:project' 改为 demo，配置本身与组都保留
+        (should (string-match-p "(cfg :project demo)" groups-text))
+        (should (string-match-p "(ebasecamp-define-group db" groups-text))
+        (should (eq 'demo (ebasecamp-model-config-project
+                           (ebasecamp-model-config 'db 'cfg))))
+        ;; ② 项目文件：旧 `:groups' 键整条消失，项目 form 其余键逐字节保留
+        (should-not (string-match-p ":groups" project-text))
+        (should (string-match-p "(ebasecamp-define-project demo" project-text))
+        (should (string-match-p ":root \"/tmp/ebc-demo\")" project-text))
+        ;; ③ 零备份残留：两次事务的备份都已删除（清单根与 projects/ 都查）
+        (should-not (ebasecamp-config-write-test--leftovers))
+        (should-not (directory-files
+                     projects-dir nil
+                     "\\(\\`\\.ebasecamp-\\|\\`\\.#\\|\\.bak\\'\\|~\\'\\)"))
+        ;; 重载零错误：组侧配置是唯一有效引用，不会报重复组引用
+        (should (null (plist-get (ebasecamp-config-load) :errors)))
+        (should (equal '(cfg) (ebasecamp-config-write-test--configs-of 'db)))))))
+
 ;;; v0.5.3 批次 1：项目 :root 可选（写盘层）
 
 (defconst ebasecamp-config-write-test--no-key-project
@@ -1485,6 +1576,59 @@ MARKER 是 form 开头的唯一片段（例如 `(db'）；找不到时 `ert-fail
          (ebasecamp-config-write-update-project 'app "应用" "/srv/app" t))
        "互斥")
       (should (equal hash (ebasecamp-config-write-test--hash file))))
+    (should-not (ebasecamp-config-write-test--leftovers))))
+
+;;; v0.7 批次 B3：#42 项目 :root 写入前 trim 并回写
+
+(defun ebasecamp-config-write-test--read-project (name)
+  "读回落盘项目 NAME 的定义 form 的属性 plist。
+不经 model 层，断言的是真实落盘内容（与 `--read-group' 对称）。"
+  (cddr (ebasecamp-config-write-test--read-form-at
+         (ebasecamp-config-write-test--read
+          (ebasecamp-config-write-test--project-file name))
+         (format "(ebasecamp-define-project %s" name))))
+
+(ert-deftest ebasecamp-config-write-test-add-project-trims-root ()
+  "新增项目带首尾空白 root：落盘 `:root' 已 trim；nil / 纯空白 / 正常值语义不变。"
+  (ebasecamp-config-write-test--with-directory
+    (ebasecamp-config-write-test--write-manifest
+     ebasecamp-config-write-test--config-groups)
+    (should (null (plist-get (ebasecamp-config-load) :errors)))
+    ;; ① 主断言：带空白 → 落盘 :root 已 trim（读回落盘文本 + model 槽）
+    (should (null (plist-get (ebasecamp-config-write-add-project
+                              'trimproj "空白" "  /srv/app  ")
+                             :errors)))
+    (should (equal "/srv/app"
+                   (plist-get (ebasecamp-config-write-test--read-project "trimproj")
+                              :root)))
+    (should (equal "/srv/app"
+                   (ebasecamp-project-root (ebasecamp-model-project 'trimproj))))
+    (should-not (string-match-p
+                 "  /srv/app  "
+                 (ebasecamp-config-write-test--read
+                  (ebasecamp-config-write-test--project-file "trimproj"))))
+    ;; ② nil → 不写 `:root' 键（不是 `:root nil'）
+    (should (null (plist-get (ebasecamp-config-write-add-project
+                              'nilrootproj "无根" nil)
+                             :errors)))
+    (should-not (plist-member
+                 (ebasecamp-config-write-test--read-project "nilrootproj")
+                 :root))
+    ;; ③ 纯空白 → user-error，且不产生文件
+    (ebasecamp-config-write-test--error-matching
+     (lambda () (ebasecamp-config-write-add-project 'blanktrim "空白" "   "))
+     "根目录")
+    (should-not (file-exists-p
+                 (ebasecamp-config-write-test--project-file "blanktrim")))
+    ;; ④ 正常值 → 落盘不变
+    (should (null (plist-get (ebasecamp-config-write-add-project
+                              'plainproj "正常" "/srv/app")
+                             :errors)))
+    (should (equal "/srv/app"
+                   (plist-get (ebasecamp-config-write-test--read-project "plainproj")
+                              :root)))
+    (should (equal "/srv/app"
+                   (ebasecamp-project-root (ebasecamp-model-project 'plainproj))))
     (should-not (ebasecamp-config-write-test--leftovers))))
 
 (provide 'ebasecamp-config-write-tests)

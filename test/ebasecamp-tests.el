@@ -141,5 +141,74 @@ RESULT 为返回值，MESSAGES 为调用期间产生的消息列表。"
         (should (eq 'stub-buffer (ebasecamp)))
         (should (= 1 calls))))))
 
+;;; 4. 文档守护：Readme 命令表 ↔ `commandp'
+
+(defun ebasecamp-test--readme-path ()
+  "返回仓库根 Readme.org 的绝对路径。
+`make test' 把仓库根放进 `load-path'，`locate-library' 命中的 `ebasecamp.el'
+（或残留的 `.elc'）就在仓库根，Readme.org 与其同级；若换成 straight 布局
+（`lisp/' 为子目录、库文件在子目录里）则退一级再找。两种布局都找不到就 FAIL。"
+  (let* ((lib (or (locate-library "ebasecamp")
+                  (ert-fail "找不到 ebasecamp 库，无法定位 Readme.org")))
+         (dir (file-name-directory lib))
+         (candidates (list (expand-file-name "Readme.org" dir)
+                           (expand-file-name "../Readme.org" dir))))
+    (or (cl-find-if #'file-exists-p candidates)
+        (ert-fail (format "在 %S 里都找不到 Readme.org" candidates)))))
+
+(defun ebasecamp-test--readme-command-names ()
+  "解析 Readme.org 的 *命令表段*，返回表内登记的命令名（字符串列表）。
+解析范围严格限定为「| 命令 | 说明 |」表头之后的那张表：先跳到表头，再跳过紧随
+的分隔行（`|--+--|'），随后连续读取以 `|' 起始的行直到表结束，只取形如
+`| =NAME= |' 的数据行。**禁止全文件扫描 `^| ='** —— 全文件该模式共 61 行
+（含属性表与 Makefile 表），会误判。表头 / 分隔行缺失时 ert-fail 并点名
+「Readme 命令表格式变化」，不静默通过。"
+  (let ((path (ebasecamp-test--readme-path))
+        names)
+    (with-temp-buffer
+      (insert-file-contents path)
+      (goto-char (point-min))
+      (unless (re-search-forward "^| 命令 | 说明 |$" nil t)
+        (ert-fail (format "Readme 命令表格式变化，请检查表头/分隔行/段边界：%s 里找不到「| 命令 | 说明 |」表头"
+                          path)))
+      (forward-line 1)
+      (unless (looking-at-p "^|[-+]")
+        (ert-fail "Readme 命令表格式变化，请检查表头/分隔行/段边界：表头下一行不是 `|--+--|' 分隔行"))
+      (while (progn (forward-line 1)
+                    (looking-at-p "^|"))
+        (when (looking-at "^| =\\([^=]+\\)= |")
+          (push (match-string-no-properties 1) names))))
+    (nreverse names)))
+
+(defun ebasecamp-test--public-command-names ()
+  "返回 `ebasecamp*' 的非私有命令名（排除含 `--' 的内部命令）。"
+  (let (acc)
+    (mapatoms (lambda (symbol)
+                (when (and (commandp symbol)
+                           (string-prefix-p "ebasecamp" (symbol-name symbol))
+                           (not (string-match-p "--" (symbol-name symbol))))
+                  (push (symbol-name symbol) acc))))
+    (nreverse acc)))
+
+(ert-deftest ebasecamp-test-readme-command-table-matches-commandp ()
+  "Readme 命令表登记的条数与集合必须与 `commandp' 实测一致（机械守护）。
+两类文档漂移都在这里红：新增命令却没写进表（条数不足 17），或表里留着不存在 /
+已删除的命令（集合差异）。"
+  (let* ((documented (ebasecamp-test--readme-command-names))
+         (actual (ebasecamp-test--public-command-names)))
+    ;; ① 数量门禁：新增 / 删除命令时 Readme 命令表必须同步（当前 17 条）。
+    (should (= 17 (length documented)))
+    ;; ② 集合同等：排序后比较，避免表内顺序敏感。
+    (let ((sorted-actual (sort (copy-sequence actual) #'string<))
+          (sorted-doc (sort (copy-sequence documented) #'string<)))
+      (unless (equal sorted-actual sorted-doc)
+        (ert-fail
+         (format
+          "Readme 命令表格式变化，请检查表头/分隔行/段边界：Readme 登记 %d 条、commandp 实测 %d 条；仅代码有 %S，仅 Readme 有 %S"
+          (length documented) (length actual)
+          (cl-set-difference actual documented :test #'equal)
+          (cl-set-difference documented actual :test #'equal))))
+      (should (equal sorted-actual sorted-doc)))))
+
 (provide 'ebasecamp-tests)
 ;;; ebasecamp-tests.el ends here

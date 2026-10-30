@@ -982,6 +982,38 @@ BODY 内变量 `root' 绑定该目录。"
         (should-not (cl-find-if (lambda (entry) (plist-get entry :failed))
                                 (plist-get result :results)))))))
 
+(ert-deftest ebasecamp-command-test-preflight-report-keeps-warnings ()
+  "预校验失败时 `--preflight-report' 仍透传 :preflight-warnings（技术债 #47）。
+失败与警告可以同时出现：项目 `:root' 为 nil 时相对 `file:' 只记 warning 不算
+缺失，若同一次预校验里 `check-compose' 又失败，失败结果 plist 必须带上与
+`ebasecamp-command--preflight' **同源**的 warning 列表（不是重新计算）。
+这里直接调用两个内部函数，保证比较的是同一输入的返回值。"
+  (ebasecamp-command-test--clean
+    (let* ((project (ebasecamp-command-test--file-config-project nil))
+           (split (ebasecamp-command-split-keys project '("db/mysql")))
+           (branches (delq nil (list (plist-get split :project)
+                                     (plist-get split :shared))))
+           (preflight nil)
+           (report nil))
+      (cl-letf (((symbol-function 'ebasecamp-compose-write)
+                 (lambda (&rest _)
+                   (expand-file-name "generated.yaml"
+                                     ebasecamp-cache-directory)))
+                ((symbol-function 'ebasecamp-docker-check-compose)
+                 (lambda (&rest _)
+                   (list :ok nil :exit 4 :stderr "invalid compose project"))))
+        (setq preflight (ebasecamp-command--preflight project branches))
+        (setq report (ebasecamp-command--preflight-report
+                      'start project branches preflight nil)))
+      ;; 前提：这次预校验确实失败，且确有 1 条「无 :root」warning
+      (should (plist-get preflight :failure))
+      (should (= 1 (length (plist-get preflight :preflight-warnings))))
+      (should-not (plist-get report :ok))
+      ;; 失败结果带 :preflight-warnings，值与 `--preflight' 的完全相同
+      (let ((warnings (plist-get report :preflight-warnings)))
+        (should (equal (plist-get preflight :preflight-warnings) warnings))
+        (should (string-match-p "无 :root" (or (car warnings) "")))))))
+
 (ert-deftest ebasecamp-command-test-run-skips-declarations-without-file ()
   "run：`external: true' / 只有 `name' 的声明 → 跳过，不报错、无 warning。"
   (ebasecamp-command-test--clean

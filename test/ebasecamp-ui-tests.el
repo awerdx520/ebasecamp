@@ -311,6 +311,68 @@
       (should-not ebasecamp-ui--session)
       (should-not (ebasecamp-ui-selected-keys)))))
 
+(ert-deftest ebasecamp-ui-test-kill-buffer-tears-down-session ()
+  "直接 `kill-buffer' 杀界面 buffer（不走 `ebasecamp-ui-close'）也必须收尾：
+主题钩子卸载、全局会话置 nil、轮询停止、提示定时器取消。
+etaf 在 mount 时给 buffer 挂 buffer-local `kill-buffer-hook'
+（`etaf--runtime-buffer-killed'，实测 2026-10-30），直杀时它会 unmount runtime
+并跑 `etaf-on-unmounted' 回调 —— 因此收尾逻辑挂在 `on-unmounted' 上即可覆盖
+直杀路径，无需另挂 `kill-buffer-hook'。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (ebasecamp-ui-open)
+      (should (memq 'ebasecamp-ui--theme-hook enable-theme-functions))
+      (should (memq 'ebasecamp-ui--theme-hook disable-theme-functions))
+      (should (ebasecamp-status-running-p))
+      (should ebasecamp-ui--session)
+      (let ((session ebasecamp-ui--session))
+        ;; 造一个自动清除定时器：直杀时它必须被取消（不留 timer-list 泄漏）
+        (ebasecamp-ui--set-notice session 'success "ok" "done")
+        (should (timerp (ebasecamp-ui-session-notice-timer session)))
+        ;; 直杀：不调用 `ebasecamp-ui-close'
+        (kill-buffer (get-buffer ebasecamp-ui-buffer-name))
+        (should-not (get-buffer ebasecamp-ui-buffer-name))
+        ;; ① 主题钩子计数归零（两条 hook 上都不再有成员）
+        (should-not (memq 'ebasecamp-ui--theme-hook enable-theme-functions))
+        (should-not (memq 'ebasecamp-ui--theme-hook disable-theme-functions))
+        ;; ② 全局会话置 nil
+        (should-not ebasecamp-ui--session)
+        ;; ③ 轮询已停（on-unmounted 的 `ebasecamp-status-stop' 生效）
+        (should-not (ebasecamp-status-running-p))
+        ;; ④ 提示定时器已取消
+        (should-not (ebasecamp-ui-session-notice-timer session))
+        ;; ⑤ 幂等：收尾后再调一次（`--with-ui' 收尾的 close 也走同一条路）
+        ;; 不报错、不改状态 —— 幂等门只看全局会话
+        (ebasecamp-ui--teardown-session)
+        (should-not ebasecamp-ui--session)
+        (should-not (memq 'ebasecamp-ui--theme-hook enable-theme-functions))))))
+
+(ert-deftest ebasecamp-ui-test-close-persists-split-ratio-snapshot ()
+  "正常 `ebasecamp-ui-close' 落盘的左栏宽度是**关闭前的值**，不是默认 0.26。
+守 `--save-ui-state' 的快照语义：幂等 teardown 会先把全局 `ebasecamp-ui--session'
+置 nil，若 close 此时用无参方式写盘就会回退默认 0.26（「拖到一半直接关闭 → 宽度
+丢失」），因此 close 必须用关闭前的 session 快照调用 `--save-ui-state'。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (ebasecamp-ui-test--with-ps nil
+      (ebasecamp-ui-open)
+      (ebasecamp-ui--set-split-ratio 0.42)
+      (should (equal 0.42 (ebasecamp-ui-test--split-ratio-current)))
+      (ebasecamp-ui-close)
+      ;; ① 主题钩子归零 ② 会话清空
+      (should-not (memq 'ebasecamp-ui--theme-hook enable-theme-functions))
+      (should-not (memq 'ebasecamp-ui--theme-hook disable-theme-functions))
+      (should-not ebasecamp-ui--session)
+      ;; ③ 落盘 ratio 等于快照值 0.42（不等于默认 0.26）
+      (let ((file (ebasecamp-ui--ui-state-file)))
+        (should (file-exists-p file))
+        (with-temp-buffer
+          (insert-file-contents file)
+          (goto-char (point-min))
+          (should (equal '(:split-ratio 0.42) (read (current-buffer))))))
+      (should (equal 0.42 (ebasecamp-ui--load-ui-state))))))
+
 ;;; 8. 会话与派发（函数层）
 
 (defun ebasecamp-ui-test--select (keys)
@@ -417,6 +479,45 @@
                  (plist-get notice :detail) "boom"))
         (should (ebasecamp-ui-test--contains-p
                  (plist-get notice :detail) "more detail"))))))
+
+(ert-deftest ebasecamp-ui-test-on-complete-failure-notice-preflight-warnings ()
+  "失败 → detail 末尾追加「（N 条预校验警告）」，message 仍只含 stderr 首行（#47）。
+预校验失败路径此前不带 `:preflight-warnings'，警告只能出现在成功提示里；本项
+钉住两层边界：计数进 **detail**（第五参数）、**不进** message（message 仍是
+stderr 首行，保持「一句话说清失败原因」的密度）。三种失败分支共用同一 detail
+计算，故顺带覆盖「无 stderr / 批次被跳过」的 `t' 分支（原本连 detail 都不传）。"
+  (ebasecamp-ui-test--with-ui
+    (ebasecamp-ui-test--manifest)
+    (let ((session (ebasecamp-ui-session))
+          (warning "项目 myapp 无 :root，无法校验顶层 config `app_cfg' 的 file"))
+      ;; ① 有 stderr 的失败分支：detail 追加计数，message 不含计数
+      (ebasecamp-ui-test--complete
+       session 'start
+       (append (ebasecamp-ui-test--failed-result "\nboom\nmore detail\n")
+               (list :preflight-warnings (list warning))))
+      (let ((notice (etaf-value (ebasecamp-ui-session-notice session))))
+        (should (eq 'error (plist-get notice :kind)))
+        (should (ebasecamp-ui-test--contains-p
+                 (plist-get notice :detail) "（1 条预校验警告）"))
+        (should (ebasecamp-ui-test--contains-p
+                 (plist-get notice :detail) "more detail"))
+        (should (equal "boom" (plist-get notice :message)))
+        (should-not (ebasecamp-ui-test--contains-p
+                     (plist-get notice :message) "预校验警告")))
+      ;; ② 无 stderr 的失败分支（批次被跳过）：detail 只有计数
+      (ebasecamp-ui-test--complete
+       session 'down
+       (list :action 'down :project 'myapp :ok nil
+             :results (list (list :scope 'project :exit nil :stderr ""
+                                  :skipped t))
+             :auto-started-shared nil
+             :preflight-warnings (list warning)))
+      (let ((notice (etaf-value (ebasecamp-ui-session-notice session))))
+        (should (equal "销毁未完成" (plist-get notice :title)))
+        (should (ebasecamp-ui-test--contains-p
+                 (plist-get notice :detail) "（1 条预校验警告）"))
+        (should-not (ebasecamp-ui-test--contains-p
+                     (plist-get notice :message) "预校验警告"))))))
 
 (ert-deftest ebasecamp-ui-test-on-complete-permission-denied ()
   "stderr 含 permission denied（大小写不敏感）→ 专门的权限提示。"
@@ -2977,6 +3078,92 @@ A 的组在组顺序里排第二（mysql 在前），因此「选第一个组」
                         (error err)))
           (should-not (ebasecamp-ui-test--selected-group)))))))
 
+;;; 批次 P2（v0.7 B6 #30）：项目定位的 5 类边界输入
+;;
+;; `ebasecamp-ui--project-for-directory' 此前只有「命中 / 未命中」两条覆盖
+;; （批次 P 的 `open-selects-project-group' / `open-falls-back-when-no-project'），
+;; 边界行为全靠实现自发保证。本节把 5 类边界固化为回归防线：
+;; ① 同名前缀（root `/x/app' 不得吃掉 `/x/app-old/sub'）；
+;; ② symlink（实现先 `file-truename'，故软链按**真名**命中）；
+;; ③ root 写成带尾斜杠的形态；
+;; ④ 嵌套 root 取**最长**者；
+;; ⑤ 大小写敏感（Linux 下 `/x/APP' 与 `/x/app' 是两个目录，不得互吃）。
+;;
+;; 临时目录一律建在 `temporary-file-directory'（`/tmp'）下并递归删除：v0.5.3
+;; 批次曾有临时目录落在仓库根的事故，断言也不再依赖 `default-directory'。
+;; 项目 `:root' 只能在运行时按临时目录写入（`ebasecamp-define-project' 是宏，
+;; ARGS 整体被 quote），因此沿用 `ebasecamp-project-root' 的 `setf' 写法。
+
+(defun ebasecamp-ui-test--project-name-for (dir)
+  "返回 DIR 命中的项目名 symbol；无命中返回 nil。"
+  (let ((project (ebasecamp-ui--project-for-directory dir)))
+    (and project (ebasecamp-project-name project))))
+
+(defmacro ebasecamp-ui-test--should-hit (label dir expected)
+  "断言 DIR 命中项目名 EXPECTED，失败信息带 LABEL。
+把 LABEL 一起放进 `equal' 的两侧，ERT 的失败输出因此能直接看出是哪一类边界。"
+  `(let ((got (ebasecamp-ui-test--project-name-for ,dir)))
+     (should (equal (cons ,label got) (cons ,label ,expected)))))
+
+(ert-deftest ebasecamp-ui-test-project-for-directory-boundaries ()
+  "项目定位的 5 类边界：同名前缀 / symlink / 尾斜杠 / 最长 root / 大小写敏感。
+判别力来源：每条断言都用**只差一处**的两份 root 做对照（`app` vs `app-old`、
+`app` vs `APP`、`nested` vs `nested/b`），把实现里某一处归一丢掉就会变红。
+
+`temporary-file-directory' 显式绑到 `/tmp/'：本机 `TMPDIR' 指向仓库根
+（2026-10-30 实测），不绑的话 `make-temp-file' 会把临时清单 / 缓存目录落到
+工作树里，`git status' 出现未跟踪目录。"
+  (let ((temporary-file-directory "/tmp/"))
+    (ebasecamp-ui-test--with-ui
+      (let* ((base (file-name-as-directory (make-temp-file "ebc-dirloc-" t)))
+             (app (expand-file-name "app/" base))
+             (app-old (expand-file-name "app-old/" base))
+             (tail (expand-file-name "tail/" base))
+             (nested (expand-file-name "nested/" base))
+             (inner (expand-file-name "b/" nested))
+             (upper (expand-file-name "APP/" base))
+             (link (expand-file-name "link" base)))
+        (unwind-protect
+            (progn
+              (make-directory (expand-file-name "sub/" app) t)
+              (make-directory (expand-file-name "sub/" app-old) t)
+              (make-directory (expand-file-name "sub/" tail) t)
+              (make-directory (expand-file-name "c/" inner) t)
+              (make-directory (expand-file-name "sub/" upper) t)
+              (make-symbolic-link app link)
+              (ebasecamp-define-project app :title "app" :groups nil)
+              (ebasecamp-define-project app-old :title "app-old" :groups nil)
+              (ebasecamp-define-project tail :title "tail" :groups nil)
+              (ebasecamp-define-project outer :title "outer" :groups nil)
+              (ebasecamp-define-project inner :title "inner" :groups nil)
+              (setf (ebasecamp-project-root (ebasecamp-model-project 'app))
+                    (directory-file-name app)
+                    (ebasecamp-project-root (ebasecamp-model-project 'app-old))
+                    (directory-file-name app-old)
+                    ;; ③ 故意保留尾斜杠：实现必须归一成 `file-name-as-directory'
+                    (ebasecamp-project-root (ebasecamp-model-project 'tail))
+                    tail
+                    (ebasecamp-project-root (ebasecamp-model-project 'outer))
+                    (directory-file-name nested)
+                    (ebasecamp-project-root (ebasecamp-model-project 'inner))
+                    (directory-file-name inner))
+              ;; ① 同名前缀：`app-old' 必须命中自己，而不是被 `app/' 前缀吃掉
+              (ebasecamp-ui-test--should-hit
+               "① 同名前缀" (expand-file-name "sub/" app-old) 'app-old)
+              ;; ② symlink：`link -> app'，按真名解析后命中 app（`file-truename'）
+              (ebasecamp-ui-test--should-hit
+               "② symlink 按真名" (expand-file-name "sub/" link) 'app)
+              ;; ③ root 带尾斜杠仍命中
+              (ebasecamp-ui-test--should-hit
+               "③ root 尾斜杠" (expand-file-name "sub/" tail) 'tail)
+              ;; ④ 嵌套 root：`nested/b/c' 必须命中更长的 `nested/b'
+              (ebasecamp-ui-test--should-hit
+               "④ 最长 root 优先" (expand-file-name "c/" inner) 'inner)
+              ;; ⑤ 大小写敏感：`APP/sub' 存在，但不得命中 root `app'
+              (ebasecamp-ui-test--should-hit
+               "⑤ 大小写敏感" (expand-file-name "sub/" upper) nil))
+          (ignore-errors (delete-directory base t)))))))
+
 ;;; 19. 清单写操作（W4：服务编辑 dialog + `E` / `M` / `X`）
 ;;
 ;; W0.3 实测的三条硬约束决定了这一节的断言形态：
@@ -4000,6 +4187,107 @@ start 收到原 tick-function；②原本未 running → 既不 stop 也不 star
             (should (ebasecamp-ui--jump-to "group/redis" position))
             (should (eq group-before (ebasecamp-ui-test--selected-group)))
             (should (equal keys-before (ebasecamp-ui-selected-keys)))))))))
+
+;;; 批次 B7（v0.7 计划 #44）：avy 的**真实**路径（`make test-avy'）
+;;
+;; 上面那组用例把 `--avy-available-p' 也一起打桩了，只证明「avy 分支被选中」这条
+;; 控制流，真实 avy 安装时的行为从未被验证。本组两条用例**不打桩
+;; `--avy-available-p'**，只在 `avy-process' 处截断 —— avy 的字母提示需要真实
+;; 窗口与用户按键，batch 下无法驱动；其余环节（候选收集 → 位置解析 → 跳转 →
+;; 焦点、轮询暂停 / 恢复）全部走真实实现。
+;;
+;; 与 #43（`f' 的候选依赖渲染顺序）无交集：`avy-process' 被桩成直接返回预定位
+;; 置，**候选的渲染顺序不参与任何断言**。
+;;
+;; `make test' 的 load-path 不含 avy（见 Makefile 的 `LOAD_PATH'），所以两条用例
+;; 都以 `skip-unless' 开头：`make test' 下 skip，`make test-avy'
+;; （追加 `-L $(STRAIGHT_BUILD)/avy'）下真实运行。判据用
+;; `(require 'avy nil t)' + `(fboundp 'avy-process)'，**不用**
+;; `--avy-available-p'：后者正是被测对象。
+;;
+;; `temporary-file-directory' 显式绑 `/tmp/'：本机它展开为仓库根（B6 实测），
+;; 不绑会在仓库里建临时目录。
+
+(ert-deftest ebasecamp-ui-test-f-real-avy-path-jumps-to-position ()
+  "avy 可用时 `f' 走真实 avy 分支：候选是真位置列表，选中者被真实跳转。
+`avy-process' 桩成「返回 group/redis 树条目的位置」，其余全部真实：
+`--avy-available-p'（`(require 'avy nil t)'）、`--avy-targets'、
+`--target-position'、`--jump-to'。断言：①传给 avy 的候选是非空整数位置列表且
+包含该位置；②返回落点 = 该位置；③point 落在该位置；④焦点进入左树。
+`avy-process' 一旦被桩掉，候选的渲染顺序就不参与任何断言 —— 与 #43 无交集。
+先 `ebasecamp-status-stop' 停轮询：本用例只验跳转机制，轮询恢复会立即 tick 并
+重渲染整棵树、可能搬动 point（轮询语义由下一条用例单独覆盖）。"
+  (skip-unless (and (require 'avy nil t) (fboundp 'avy-process)))
+  (let ((temporary-file-directory "/tmp/"))
+    (ebasecamp-ui-test--with-ui
+      (ebasecamp-ui-test--avy-manifest)
+      (ebasecamp-ui-test--with-ps nil
+        (let ((ebox-viewport-height 40))
+          (ebasecamp-ui-test--with-open-ui
+            (ebasecamp-status-stop)
+            (should (ebasecamp-ui--avy-available-p))
+            (let* ((target (ebasecamp-ui--tree-target-position "group/redis"))
+                   (candidates nil)
+                   (result nil))
+              (should (integer-or-marker-p target))
+              (ebasecamp-ui-test--stub
+                  avy-process
+                  (lambda (positions &optional _overlay-fn _cleanup-fn)
+                    (setq candidates positions)
+                    target)
+                (setq result (ebasecamp-ui-avy-jump)))
+              (should (= 5 (length candidates)))
+              (should (cl-every #'integer-or-marker-p candidates))
+              (should (memql target candidates))
+              (should (equal target result))
+              (should (= target (point)))
+              (should (ebasecamp-ui-test--focused-within-p
+                       'ebasecamp-ui-tree)))))))))
+
+(ert-deftest ebasecamp-ui-test-f-real-avy-path-pauses-polling ()
+  "avy 选择期间真实轮询被暂停，返回后按原 tick-function 恢复；跳转不留 overlay。
+界面打开后 `etaf-on-mounted' 已用真实 tick 启动轮询（本用例不额外打桩），
+avy 选择期间 `ebasecamp-status-running-p' 必须为 nil —— 3 秒一次的刷新会重渲染
+整棵树，让 avy 的 overlay 与落点一起失效；返回后定时器重建、
+`--tick-function' 复原为先前那个函数对象（`ebasecamp-status-stop' 会清空它，
+所以恢复必须把**保存的**值传回 `ebasecamp-status-start'）。
+overlay 断言用「跳转前后 `overlays-in' 数量一致」：跳转本身不得引入残留
+overlay（avy 的字母提示 overlay 由 avy 自己清理，桩掉 `avy-process' 后不会有
+avy overlay 产生）。"
+  (skip-unless (and (require 'avy nil t) (fboundp 'avy-process)))
+  (let ((temporary-file-directory "/tmp/"))
+    (ebasecamp-ui-test--with-ui
+      (ebasecamp-ui-test--avy-manifest)
+      (ebasecamp-ui-test--with-ps nil
+        (let ((ebox-viewport-height 40))
+          (ebasecamp-ui-test--with-open-ui
+            (let* ((target (ebasecamp-ui--tree-target-position "group/redis"))
+                   (tick-before ebasecamp-status--tick-function)
+                   (running-during 'unset)
+                   (overlays-before nil)
+                   (overlays-after nil)
+                   (result nil))
+              (should (integer-or-marker-p target))
+              (should (ebasecamp-status-running-p))
+              (should (functionp tick-before))
+              (setq overlays-before (overlays-in (point-min) (point-max)))
+              (ebasecamp-ui-test--stub
+                  avy-process
+                  (lambda (_positions &optional _overlay-fn _cleanup-fn)
+                    (setq running-during (ebasecamp-status-running-p))
+                    target)
+                (setq result (ebasecamp-ui-avy-jump)))
+              (setq overlays-after (overlays-in (point-min) (point-max)))
+              ;; ①选择期间已暂停（定时器被取消）
+              (should (eq nil running-during))
+              ;; ②跳转确实发生
+              (should (equal target result))
+              ;; ③结束后恢复：定时器重建、tick-function 是先前那个
+              (should (ebasecamp-status-running-p))
+              (should (eq tick-before ebasecamp-status--tick-function))
+              ;; ④无残留 overlay
+              (should (= (length overlays-before)
+                         (length overlays-after))))))))))
 
 (provide 'ebasecamp-ui-tests)
 ;;; ebasecamp-ui-tests.el ends here

@@ -7,7 +7,7 @@ EL_FILES   = $(strip $(wildcard *.el) $(wildcard lisp/*.el))
 TEST_FILES = $(strip $(wildcard test/*-tests.el))
 PARENS_FILES = $(strip $(EL_FILES) $(TEST_FILES))
 
-.PHONY: check check-parens compile test clean
+.PHONY: check check-parens compile test test-avy clean
 
 check: check-parens compile test
 
@@ -27,6 +27,13 @@ compile:
 test:
 	@if [ -z "$(TEST_FILES)" ]; then echo "test: 无测试文件，0 项通过"; exit 0; fi; \
 	$(EMACS) -Q --batch $(LOAD_PATH) \
+	  --eval '(setq load-prefer-newer t)' \
+	  -l ert $(patsubst %,-l %, $(TEST_FILES)) \
+	  --eval '(ert-run-tests-batch-and-exit t)'
+
+test-avy:
+	@if [ -z "$(TEST_FILES)" ]; then echo "test-avy: 无测试文件，0 项通过"; exit 0; fi; \
+	$(EMACS) -Q --batch $(LOAD_PATH) -L $(STRAIGHT_BUILD)/avy \
 	  --eval '(setq load-prefer-newer t)' \
 	  -l ert $(patsubst %,-l %, $(TEST_FILES)) \
 	  --eval '(ert-run-tests-batch-and-exit t)'
